@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, Video, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
+import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
 import type { AppState, SkillLabel, PlaylistItem } from './types';
 import { exportToXML, exportAllToZip } from './utils/exportUtils';
 import { GoogleDriveConnector } from './components/GoogleDriveConnector';
