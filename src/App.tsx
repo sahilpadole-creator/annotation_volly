@@ -14,8 +14,34 @@ const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
   '6': { label: 'attack', classId: 5 } // Combined attack/block
 };
 
+const LABEL_TO_SKILL: Record<string, { label: SkillLabel; classId: number }> = {
+  toss: { label: 'toss', classId: 0 },
+  serve: { label: 'serve', classId: 1 },
+  reception: { label: 'reception', classId: 2 },
+  receive: { label: 'reception', classId: 2 },
+  set: { label: 'set', classId: 3 },
+  dig: { label: 'dig', classId: 4 },
+  attack: { label: 'attack', classId: 5 },
+  block: { label: 'block', classId: 5 },
+  'attack/block': { label: 'attack', classId: 5 },
+};
+
+type PredictionLike = { frame?: number | string; label?: string; skill?: string; class_id?: number };
+type PredictionImportPayload = {
+  video_name?: string;
+  predictions?: PredictionLike[];
+  events?: PredictionLike[];
+  rally?: { start_frame?: number | null; end_frame?: number | null };
+  start_frame?: number;
+  end_frame?: number;
+};
+
+const INFERENCE_API_BASE = import.meta.env.VITE_INFERENCE_API_BASE || 'http://localhost:8000';
+
 function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
+  const [isRunningTouch, setIsRunningTouch] = useState(false);
+  const [isRunningSkill5, setIsRunningSkill5] = useState(false);
   
   const [state, setState] = useState<AppState>({
     playlist: [],
@@ -27,6 +53,165 @@ function App() {
   });
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const importPredictionsInputRef = useRef<HTMLInputElement>(null);
+
+  const parsePredictionLabel = (rawLabel: unknown): { label: SkillLabel; classId: number } | null => {
+    if (typeof rawLabel !== 'string') return null;
+    const normalized = rawLabel.trim().toLowerCase();
+    return LABEL_TO_SKILL[normalized] || null;
+  };
+
+  const parsePredictionsFile = (data: unknown): { events: AppState['events']; startFrame: number | null; endFrame: number | null } => {
+    const payload = data as PredictionImportPayload;
+    const candidates: PredictionLike[] = Array.isArray(payload?.predictions)
+      ? payload.predictions
+      : Array.isArray(payload?.events)
+        ? payload.events
+        : Array.isArray(data)
+          ? (data as PredictionLike[])
+          : [];
+
+    const importedEvents = candidates
+      .map((item) => {
+        const rawFrame = item?.frame;
+        const frame = typeof rawFrame === 'string' ? Number(rawFrame) : rawFrame;
+        if (typeof frame !== 'number' || Number.isNaN(frame)) return null;
+
+        const parsedFromLabel = parsePredictionLabel(item?.label ?? item?.skill);
+        if (parsedFromLabel) {
+          return {
+            frame: Math.round(frame),
+            skill: parsedFromLabel.label,
+            class_id: parsedFromLabel.classId,
+          };
+        }
+
+        const classId = item?.class_id;
+        if (typeof classId === 'number' && classId >= 0 && classId <= 5) {
+          const match = Object.values(SKILL_MAP).find((s) => s.classId === classId);
+          if (!match) return null;
+          return {
+            frame: Math.round(frame),
+            skill: match.label,
+            class_id: classId,
+          };
+        }
+        return null;
+      })
+      .filter((v): v is NonNullable<typeof v> => v !== null);
+
+    const sortedUniqueEvents = Array.from(
+      importedEvents
+        .reduce((acc, event) => acc.set(event.frame, event), new Map<number, (typeof importedEvents)[number]>())
+        .values()
+    ).sort((a, b) => a.frame - b.frame);
+
+    const startFrame = payload?.rally?.start_frame ?? payload?.start_frame ?? null;
+    const endFrame = payload?.rally?.end_frame ?? payload?.end_frame ?? null;
+
+    return {
+      events: sortedUniqueEvents,
+      startFrame: typeof startFrame === 'number' ? startFrame : null,
+      endFrame: typeof endFrame === 'number' ? endFrame : null,
+    };
+  };
+
+  const applyImportedPredictions = (parsed: PredictionImportPayload, sourceName: string) => {
+    const { events, startFrame, endFrame } = parsePredictionsFile(parsed);
+
+    if (events.length === 0) {
+      window.alert('No valid predictions found in JSON. Expected predictions: [{frame, label}]');
+      return false;
+    }
+
+    setState((prev) => {
+      const merged = new Map<number, AppState['events'][number]>();
+      prev.events.forEach((e) => merged.set(e.frame, e));
+      events.forEach((e) => merged.set(e.frame, e));
+      const mergedEvents = Array.from(merged.values()).sort((a, b) => a.frame - b.frame);
+
+      return {
+        ...prev,
+        events: mergedEvents,
+        rally: {
+          start_frame: startFrame ?? prev.rally.start_frame,
+          end_frame: endFrame ?? prev.rally.end_frame,
+        },
+      };
+    });
+
+    window.alert(`Imported ${events.length} predictions from ${sourceName}`);
+    return true;
+  };
+
+  const handleImportPredictions = async (file: File | null) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as PredictionImportPayload;
+      applyImportedPredictions(parsed, file.name);
+    } catch (err) {
+      console.error('Failed to import predictions', err);
+      window.alert('Failed to import predictions JSON. Please check the file format.');
+    }
+  };
+
+  const runTouchModel = async () => {
+    const item = state.playlist[state.currentPlaylistIndex];
+    if (!item?.file) {
+      window.alert('Touch inference currently supports local uploaded video files only.');
+      return;
+    }
+    setIsRunningTouch(true);
+    try {
+      const formData = new FormData();
+      formData.append('video', item.file);
+      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/touch`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || `Touch inference failed (${res.status})`);
+      }
+      const payload = await res.json();
+      const count = Array.isArray(payload?.touch_peaks) ? payload.touch_peaks.length : 0;
+      window.alert(`Touch inference complete. Peaks detected: ${count}`);
+    } catch (err) {
+      console.error('Touch inference failed', err);
+      window.alert(`Touch inference failed: ${(err as Error).message}`);
+    } finally {
+      setIsRunningTouch(false);
+    }
+  };
+
+  const runSkill5Model = async () => {
+    const item = state.playlist[state.currentPlaylistIndex];
+    if (!item?.file) {
+      window.alert('Skill inference currently supports local uploaded video files only.');
+      return;
+    }
+    setIsRunningSkill5(true);
+    try {
+      const formData = new FormData();
+      formData.append('video', item.file);
+      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/skill5`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || `Skill inference failed (${res.status})`);
+      }
+      const payload = await res.json();
+      applyImportedPredictions(payload, 'Skill5 Model');
+    } catch (err) {
+      console.error('Skill inference failed', err);
+      window.alert(`Skill inference failed: ${(err as Error).message}`);
+    } finally {
+      setIsRunningSkill5(false);
+    }
+  };
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -541,6 +726,44 @@ function App() {
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
+            <input
+              ref={importPredictionsInputRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files?.[0] || null;
+                void handleImportPredictions(file);
+                e.target.value = '';
+              }}
+            />
+            <button
+              className="btn outline"
+              style={{ flex: 1 }}
+              onClick={() => importPredictionsInputRef.current?.click()}
+            >
+              <Upload size={16} /> Import Predictions (JSON)
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+            <button
+              className="btn outline"
+              style={{ flex: 1 }}
+              onClick={() => { void runTouchModel(); }}
+              disabled={isRunningTouch || isRunningSkill5}
+            >
+              <Settings size={16} /> {isRunningTouch ? 'Running Touch...' : 'Run Touch Model'}
+            </button>
+            <button
+              className="btn outline"
+              style={{ flex: 1 }}
+              onClick={() => { void runSkill5Model(); }}
+              disabled={isRunningTouch || isRunningSkill5}
+            >
+              <Settings size={16} /> {isRunningSkill5 ? 'Running Skill5...' : 'Run 5-class Skill'}
+            </button>
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
             <button className="btn outline" style={{ flex: 1 }} onClick={() => {
               if (state.videoMetadata) exportToXML(state.videoMetadata, state.rally, state.events);
             }} disabled={!state.videoMetadata || warnings.some(w => w.type === 'error')}>
