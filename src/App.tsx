@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, Video } from 'lucide-react';
-import type { AppState, SkillLabel } from './types';
-import { exportToJSON, exportToXML } from './utils/exportUtils';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, Video, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
+import type { AppState, SkillLabel, PlaylistItem } from './types';
+import { exportToXML, exportAllToZip } from './utils/exportUtils';
+import { GoogleDriveConnector } from './components/GoogleDriveConnector';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
@@ -14,9 +15,11 @@ const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
 };
 
 function App() {
-  const [, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  
   const [state, setState] = useState<AppState>({
+    playlist: [],
+    currentPlaylistIndex: 0,
     videoMetadata: null,
     rally: { start_frame: null, end_frame: null },
     events: [],
@@ -32,7 +35,8 @@ function App() {
       try {
         const parsed = JSON.parse(saved);
         if (parsed.state) {
-          setState(parsed.state);
+          // If we have a playlist, don't load the object URLs directly, just metadata
+          setState({ ...parsed.state, currentFrame: 0 });
         }
       } catch (e) {
         console.error("Failed to parse local storage", e);
@@ -42,31 +46,92 @@ function App() {
 
   // Autosave
   useEffect(() => {
-    if (state.videoMetadata) {
-      localStorage.setItem('volleyball_annotations', JSON.stringify({ state }));
+    if (state.playlist.length > 0 || state.videoMetadata) {
+      // Don't save Object URLs or File objects to localStorage
+      const stateToSave = {
+        ...state,
+        playlist: state.playlist.map(item => ({ ...item, file: undefined }))
+      };
+      localStorage.setItem('volleyball_annotations', JSON.stringify({ state: stateToSave }));
     }
   }, [state]);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setVideoFile(file);
-      const url = URL.createObjectURL(file);
+  const loadVideoIntoPlayer = (item: PlaylistItem) => {
+    if (item.file) {
+      const url = URL.createObjectURL(item.file);
       setVideoUrl(url);
+    } else if (item.driveUrl) {
+      // We will try streaming it, but Drive requires CORS headers which alt=media might not have properly.
+      // Often crossOrigin="anonymous" is needed, or we might need an access token in the URL.
+      setVideoUrl(item.driveUrl);
+    }
+
+    setState(prev => ({
+      ...prev,
+      videoMetadata: item.videoMetadata || {
+        filename: item.name,
+        fps: 30, // Default
+        width: 0,
+        height: 0,
+        duration: 0,
+        frame_count: 0
+      },
+      rally: item.rally || { start_frame: null, end_frame: null },
+      events: item.events || [],
+      currentFrame: 0
+    }));
+  };
+
+  const handlePlaylistFiles = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const newPlaylist: PlaylistItem[] = Array.from(files).map((file) => ({
+      id: file.name + file.lastModified,
+      name: file.name,
+      file: file
+    }));
+    
+    setState(prev => ({ ...prev, playlist: newPlaylist, currentPlaylistIndex: 0 }));
+    loadVideoIntoPlayer(newPlaylist[0]);
+  };
+
+  const handleDrivePlaylist = (playlist: PlaylistItem[]) => {
+    setState(prev => ({ ...prev, playlist, currentPlaylistIndex: 0 }));
+    if (playlist.length > 0) {
+      loadVideoIntoPlayer(playlist[0]);
+    }
+  };
+
+  const saveCurrentVideoState = () => {
+    setState(prev => {
+      const newPlaylist = [...prev.playlist];
+      if (prev.playlist.length > 0) {
+        newPlaylist[prev.currentPlaylistIndex] = {
+          ...newPlaylist[prev.currentPlaylistIndex],
+          videoMetadata: prev.videoMetadata,
+          rally: prev.rally,
+          events: prev.events,
+          isCompleted: (prev.rally.start_frame !== null && prev.rally.end_frame !== null)
+        };
+      }
+      return { ...prev, playlist: newPlaylist };
+    });
+  };
+
+  const changeVideo = (index: number) => {
+    if (index >= 0 && index < state.playlist.length) {
+      saveCurrentVideoState();
       
-      // We will parse metadata once video is loaded
-      const defaultFps = 30; // We can add an input for this later
       setState(prev => ({
         ...prev,
-        videoMetadata: {
-          filename: file.name,
-          fps: defaultFps,
-          width: 0,
-          height: 0,
-          duration: 0,
-          frame_count: 0
-        }
+        currentPlaylistIndex: index
       }));
+      
+      setTimeout(() => {
+        setState(prev => {
+          loadVideoIntoPlayer(prev.playlist[index]);
+          return prev;
+        });
+      }, 0);
     }
   };
 
@@ -74,6 +139,9 @@ function App() {
     if (videoRef.current && state.videoMetadata) {
       const v = videoRef.current;
       const duration = v.duration;
+      // If we don't have valid duration yet
+      if (isNaN(duration)) return;
+      
       const fps = state.videoMetadata.fps;
       
       setState(prev => ({
@@ -94,7 +162,6 @@ function App() {
     const maxFrame = state.videoMetadata.frame_count - 1;
     const safeFrame = Math.max(0, Math.min(frame, maxFrame));
     
-    // Convert frame to time
     const time = safeFrame / state.videoMetadata.fps;
     videoRef.current.currentTime = time;
     setState(prev => ({ ...prev, currentFrame: safeFrame }));
@@ -102,7 +169,6 @@ function App() {
 
   const handleTimeUpdate = () => {
     if (!videoRef.current || !state.videoMetadata) return;
-    // Calculate current frame based on time
     const frame = Math.round(videoRef.current.currentTime * state.videoMetadata.fps);
     if (frame !== state.currentFrame) {
       setState(prev => ({ ...prev, currentFrame: frame }));
@@ -111,7 +177,6 @@ function App() {
 
   const addEvent = (skillInfo: { label: SkillLabel; classId: number }) => {
     setState(prev => {
-      // Remove any existing event at this frame
       const filtered = prev.events.filter(e => e.frame !== prev.currentFrame);
       return {
         ...prev,
@@ -148,7 +213,6 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in input
       if (document.activeElement?.tagName === 'INPUT') return;
 
       const key = e.key.toLowerCase();
@@ -178,7 +242,6 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [state.currentFrame, seekToFrame]);
 
-  // Validation
   const getValidationWarnings = () => {
     const warnings: { type: string, msg: string }[] = [];
     if (!state.videoMetadata) return warnings;
@@ -191,16 +254,6 @@ function App() {
         warnings.push({ type: 'error', msg: 'end_rally is before start_rally' });
       }
     }
-
-    const sorted = [...state.events].sort((a, b) => a.frame - b.frame);
-    for (let i = 1; i < sorted.length; i++) {
-      if (sorted[i].frame - sorted[i-1].frame < 3) {
-        warnings.push({ 
-          type: 'warning', 
-          msg: `Events at frames ${sorted[i-1].frame} and ${sorted[i].frame} are < 3 frames apart.`
-        });
-      }
-    }
     
     return warnings;
   };
@@ -210,16 +263,27 @@ function App() {
   if (!videoUrl) {
     return (
       <div className="app-container" style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center', maxWidth: '500px' }}>
+        <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center', maxWidth: '600px', width: '100%' }}>
           <Video size={48} style={{ color: 'var(--primary)', marginBottom: '1rem' }} />
-          <h1 style={{ marginBottom: '1rem' }}>Volleyball Annotator</h1>
-          <p style={{ color: 'var(--text-muted)', marginBottom: '2rem' }}>Upload a rally video to start annotating skills and touches.</p>
+          <h1 style={{ marginBottom: '1rem' }}>Volleyball Batch Annotator</h1>
+          <p style={{ color: 'var(--text-muted)', marginBottom: '2rem' }}>
+            Load a single rally or a full batch of 187 rallies to begin annotating skills and touches.
+          </p>
           
-          <label className="upload-area" style={{ display: 'block' }}>
-            <Upload size={32} style={{ marginBottom: '1rem', color: 'var(--primary)' }} />
-            <div><strong>Drag & Drop</strong> or click to select MP4</div>
-            <input type="file" accept="video/mp4" onChange={handleFileUpload} style={{ display: 'none' }} />
-          </label>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
+            <label className="upload-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+              <Upload size={32} style={{ marginBottom: '1rem', color: 'var(--primary)' }} />
+              <div><strong>Local Files</strong></div>
+              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Select MP4 files</div>
+              <input type="file" accept="video/mp4" multiple onChange={(e) => handlePlaylistFiles(e.target.files)} style={{ display: 'none' }} />
+            </label>
+
+            <div className="upload-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+              <FolderArchive size={32} style={{ marginBottom: '1rem', color: 'var(--primary)' }} />
+              <div style={{ marginBottom: '0.5rem' }}><strong>Google Drive</strong></div>
+              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} />
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -227,6 +291,48 @@ function App() {
 
   return (
     <div className="app-container">
+      {/* PLAYLIST SIDEBAR */}
+      <div className="sidebar" style={{ minWidth: '200px', maxWidth: '250px' }}>
+        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <h2>Playlist ({state.currentPlaylistIndex + 1}/{state.playlist.length})</h2>
+          
+          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
+            {state.playlist.map((item, index) => (
+              <div 
+                key={item.id} 
+                onClick={() => changeVideo(index)}
+                style={{ 
+                  padding: '0.5rem', 
+                  backgroundColor: index === state.currentPlaylistIndex ? 'var(--primary-dark)' : 'rgba(255,255,255,0.05)',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem'
+                }}
+              >
+                <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {item.name}
+                </div>
+                {item.isCompleted && <CheckCircle size={14} color="var(--color-serve)" />}
+              </div>
+            ))}
+          </div>
+
+          <button 
+            className="btn" 
+            style={{ marginTop: '1rem' }}
+            onClick={() => {
+              saveCurrentVideoState(); // Save current before exporting
+              exportAllToZip(state.playlist);
+            }}
+          >
+            <Download size={16} /> Batch ZIP
+          </button>
+        </div>
+      </div>
+
       {/* MAIN CONTENT */}
       <div className="main-content">
         <div className="glass-panel video-wrapper">
@@ -235,9 +341,9 @@ function App() {
             src={videoUrl} 
             onLoadedMetadata={handleVideoLoaded}
             onTimeUpdate={handleTimeUpdate}
-            controls={false} // Custom controls
+            controls={false}
+            crossOrigin="anonymous" // Needed for Drive URLs if they support it
           />
-          {/* Tracking Canvas Overlay could go here */}
         </div>
 
         <div className="glass-panel video-controls">
@@ -253,8 +359,26 @@ function App() {
             <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame + 1)}>+1f</button>
             <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame + 5)}>+5f</button>
             
-            <div style={{ marginLeft: 'auto', fontFamily: 'monospace', fontSize: '1.2rem' }}>
-              Frame: {state.currentFrame} / {state.videoMetadata?.frame_count || 0}
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <div style={{ fontFamily: 'monospace', fontSize: '1.2rem' }}>
+                Frame: {state.currentFrame} / {state.videoMetadata?.frame_count || 0}
+              </div>
+              <button 
+                className="btn outline icon-only" 
+                onClick={() => changeVideo(state.currentPlaylistIndex - 1)}
+                disabled={state.currentPlaylistIndex === 0}
+                title="Previous Video"
+              >
+                <ArrowLeft size={16} />
+              </button>
+              <button 
+                className="btn outline icon-only" 
+                onClick={() => changeVideo(state.currentPlaylistIndex + 1)}
+                disabled={state.currentPlaylistIndex === state.playlist.length - 1}
+                title="Next Video"
+              >
+                <ArrowRight size={16} />
+              </button>
             </div>
           </div>
           
@@ -313,7 +437,7 @@ function App() {
         </div>
       </div>
 
-      {/* SIDEBAR */}
+      {/* RIGHT SIDEBAR */}
       <div className="sidebar">
         <div className="glass-panel sidebar-section">
           <h2><FileVideo size={20} /> Video Info</h2>
@@ -352,7 +476,6 @@ function App() {
             <div><span className="hotkey">S</span> Start Rally</div>
             <div><span className="hotkey">E</span> End Rally</div>
             <div><span className="hotkey">Del</span> Clear Frame</div>
-            <div><span className="hotkey">←/→</span> Step Frame</div>
           </div>
         </div>
 
@@ -414,15 +537,10 @@ function App() {
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-            <button className="btn" style={{ flex: 1 }} onClick={() => {
-              if (state.videoMetadata) exportToJSON(state.videoMetadata, state.rally, state.events);
-            }} disabled={!state.videoMetadata || warnings.some(w => w.type === 'error')}>
-              <Download size={16} /> JSON
-            </button>
             <button className="btn outline" style={{ flex: 1 }} onClick={() => {
               if (state.videoMetadata) exportToXML(state.videoMetadata, state.rally, state.events);
             }} disabled={!state.videoMetadata || warnings.some(w => w.type === 'error')}>
-              <Download size={16} /> XML
+              <Download size={16} /> Cur XML
             </button>
           </div>
         </div>

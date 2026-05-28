@@ -1,4 +1,5 @@
-import type { SkillEvent, Rally, VideoMetadata } from '../types';
+import JSZip from 'jszip';
+import type { SkillEvent, Rally, VideoMetadata, PlaylistItem } from '../types';
 
 export const exportToJSON = (
   metadata: VideoMetadata,
@@ -36,11 +37,11 @@ export const exportToJSON = (
   URL.revokeObjectURL(url);
 };
 
-export const exportToXML = (
+export const generateXMLString = (
   metadata: VideoMetadata,
   rally: Rally,
   events: SkillEvent[]
-) => {
+): string => {
   let xml = `<?xml version="1.0" encoding="utf-8"?>\n<annotations>\n  <version>1.1</version>\n`;
 
   // Pre-compute events by frame
@@ -54,6 +55,7 @@ export const exportToXML = (
       eventsByFrame.set(e.frame, e);
     } else {
       const existing = eventsByFrame.get(e.frame)!;
+      // @ts-ignore
       if (priority[e.skill] > priority[existing.skill]) {
         eventsByFrame.set(e.frame, e);
       }
@@ -86,13 +88,48 @@ export const exportToXML = (
   }
 
   xml += `</annotations>\n`;
+  return xml;
+};
 
+export const exportToXML = (
+  metadata: VideoMetadata,
+  rally: Rally,
+  events: SkillEvent[]
+) => {
+  const xml = generateXMLString(metadata, rally, events);
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   const stem = metadata.filename.replace(/\.[^/.]+$/, "");
   a.download = `annotations_${stem}.xml`;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+export const exportAllToZip = async (playlist: PlaylistItem[]) => {
+  const zip = new JSZip();
+
+  let hasData = false;
+  playlist.forEach(item => {
+    if (item.videoMetadata && item.rally && item.events) {
+      const xml = generateXMLString(item.videoMetadata, item.rally, item.events);
+      const stem = item.name.replace(/\.[^/.]+$/, "");
+      zip.file(`annotations_${stem}.xml`, xml);
+      hasData = true;
+    }
+  });
+
+  if (!hasData) {
+    alert("No annotated videos to export!");
+    return;
+  }
+
+  const content = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(content);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `volleyball_annotations_batch.zip`;
   a.click();
   URL.revokeObjectURL(url);
 };

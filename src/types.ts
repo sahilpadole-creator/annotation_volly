@@ -20,7 +20,20 @@ export interface VideoMetadata {
   frame_count: number;
 }
 
+export interface PlaylistItem {
+  id: string;
+  name: string;
+  file?: File;
+  driveUrl?: string;
+  videoMetadata?: VideoMetadata | null;
+  rally?: Rally;
+  events?: SkillEvent[];
+  isCompleted?: boolean;
+}
+
 export interface AppState {
+  playlist: PlaylistItem[];
+  currentPlaylistIndex: number;
   videoMetadata: VideoMetadata | null;
   rally: Rally;
   events: SkillEvent[];
