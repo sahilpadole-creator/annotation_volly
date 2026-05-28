@@ -431,9 +431,6 @@ function App() {
     const warnings: { type: string, msg: string }[] = [];
     if (!state.videoMetadata) return warnings;
 
-    if (state.rally.start_frame === null) warnings.push({ type: 'error', msg: 'Missing start_rally' });
-    if (state.rally.end_frame === null) warnings.push({ type: 'error', msg: 'Missing end_rally' });
-    
     if (state.rally.start_frame !== null && state.rally.end_frame !== null) {
       if (state.rally.end_frame < state.rally.start_frame) {
         warnings.push({ type: 'error', msg: 'end_rally is before start_rally' });
@@ -668,7 +665,7 @@ function App() {
           </div>
         </div>
 
-        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <h2>Annotations</h2>
           
           {warnings.length > 0 && (

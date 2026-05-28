@@ -195,7 +195,9 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
             skill_checkpoint,
             "--output-json",
             str(skill_json),
-            "--five-class",
+            "--cleanup-tmp",
+            "--device",
+            os.getenv("SKILL_DEVICE", "cpu"),
         ]
         if skill_gt_xml:
             skill_cmd.extend(["--gt-xml", skill_gt_xml])
