@@ -262,25 +262,29 @@ function App() {
 
   if (!videoUrl) {
     return (
-      <div className="app-container" style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center', maxWidth: '600px', width: '100%' }}>
-          <Video size={48} style={{ color: 'var(--primary)', marginBottom: '1rem' }} />
-          <h1 style={{ marginBottom: '1rem' }}>Volleyball Batch Annotator</h1>
-          <p style={{ color: 'var(--text-muted)', marginBottom: '2rem' }}>
-            Load a single rally or a full batch of 187 rallies to begin annotating skills and touches.
+      <div className="landing-container">
+        <div className="landing-card">
+          <h1 className="landing-title">Volleyball Annotator Pro</h1>
+          <p className="landing-subtitle">
+            Advanced skill tracking and batch processing pipeline.<br/>
+            Load individual rallies or entire match datasets to begin.
           </p>
           
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
-            <label className="upload-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <Upload size={32} style={{ marginBottom: '1rem', color: 'var(--primary)' }} />
-              <div><strong>Local Files</strong></div>
-              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Select MP4 files</div>
+          <div className="landing-grid">
+            <label className="landing-option">
+              <div className="icon-wrapper">
+                <Upload size={32} />
+              </div>
+              <h3>Local Files</h3>
+              <p>Drag & drop MP4 files</p>
               <input type="file" accept="video/mp4" multiple onChange={(e) => handlePlaylistFiles(e.target.files)} style={{ display: 'none' }} />
             </label>
 
-            <div className="upload-area" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <FolderArchive size={32} style={{ marginBottom: '1rem', color: 'var(--primary)' }} />
-              <div style={{ marginBottom: '0.5rem' }}><strong>Google Drive</strong></div>
+            <div className="landing-option">
+              <div className="icon-wrapper">
+                <FolderArchive size={32} />
+              </div>
+              <h3 style={{ marginBottom: '1rem' }}>Google Drive</h3>
               <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} />
             </div>
           </div>

@@ -122,25 +122,28 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded }) => {
 
   if (!CLIENT_ID) {
     return (
-      <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', padding: '1rem', border: '1px dashed var(--border)', borderRadius: '8px' }}>
-        Google Drive integration requires VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_API_KEY in .env
+      <div style={{ color: '#ef4444', fontSize: '0.85rem', padding: '1rem', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '8px', textAlign: 'left', lineHeight: 1.4 }}>
+        <strong>Google Drive Disabled</strong><br/>
+        Create a <code style={{color: '#f8fafc', background: 'rgba(0,0,0,0.3)', padding: '2px 4px', borderRadius: '4px'}}>.env</code> file locally with your <br/>
+        <code>VITE_GOOGLE_CLIENT_ID</code> and <code>VITE_GOOGLE_API_KEY</code>.
       </div>
     );
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', width: '100%' }}>
       {error && <div style={{ color: 'red', fontSize: '0.8rem' }}>{error}</div>}
       
       {!token ? (
-        <button className="btn outline" onClick={() => login()} disabled={!isReady}>
+        <button className="btn outline" onClick={() => login()} disabled={!isReady} style={{ width: '100%' }}>
           Login with Google
         </button>
       ) : (
-        <button className="btn" onClick={openPicker} disabled={!isReady}>
+        <button className="btn" onClick={openPicker} disabled={!isReady} style={{ width: '100%' }}>
           Select Drive Folder/Videos
         </button>
       )}
     </div>
   );
 };
+
