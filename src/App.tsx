@@ -627,6 +627,18 @@ function App() {
       } else if (key === 'arrowright') {
         seekToFrame(state.currentFrame + 1);
         e.preventDefault();
+      } else if (key === ' ') {
+        if (videoRef.current) {
+          if (videoRef.current.paused) videoRef.current.play();
+          else videoRef.current.pause();
+        }
+        e.preventDefault();
+      } else if (key === '<' || key === ',') {
+        seekToFrame(state.currentFrame - 1);
+        e.preventDefault();
+      } else if (key === '>' || key === '.') {
+        seekToFrame(state.currentFrame + 1);
+        e.preventDefault();
       }
     };
 
