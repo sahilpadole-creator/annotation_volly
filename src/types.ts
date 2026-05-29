@@ -4,6 +4,7 @@ export interface SkillEvent {
   frame: number;
   skill: SkillLabel;
   class_id: number;
+  confidence?: number;
 }
 
 export interface Rally {
@@ -29,6 +30,7 @@ export interface PlaylistItem {
   rally?: Rally;
   events?: SkillEvent[];
   isCompleted?: boolean;
+  isSkillAlgorithmApplied?: boolean;
 }
 
 export interface AppState {

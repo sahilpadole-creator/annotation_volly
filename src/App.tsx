@@ -3,6 +3,7 @@ import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVid
 import type { AppState, SkillLabel, PlaylistItem } from './types';
 import { exportToXML, exportAllToZip } from './utils/exportUtils';
 import { GoogleDriveConnector } from './components/GoogleDriveConnector';
+import { parseZIPAnnotations } from './utils/importUtils';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
@@ -26,7 +27,7 @@ const LABEL_TO_SKILL: Record<string, { label: SkillLabel; classId: number }> = {
   'attack/block': { label: 'attack', classId: 5 },
 };
 
-type PredictionLike = { frame?: number | string; label?: string; skill?: string; class_id?: number };
+type PredictionLike = { frame?: number | string; label?: string; skill?: string; class_id?: number; confidence?: number };
 type PredictionImportPayload = {
   video_name?: string;
   predictions?: PredictionLike[];
@@ -42,6 +43,7 @@ function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [isRunningTouch, setIsRunningTouch] = useState(false);
   const [isRunningSkill5, setIsRunningSkill5] = useState(false);
+  const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0 });
   
   const [state, setState] = useState<AppState>({
     playlist: [],
@@ -54,6 +56,7 @@ function App() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const importPredictionsInputRef = useRef<HTMLInputElement>(null);
+  const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const parsePredictionLabel = (rawLabel: unknown): { label: SkillLabel; classId: number } | null => {
     if (typeof rawLabel !== 'string') return null;
@@ -83,6 +86,7 @@ function App() {
             frame: Math.round(frame),
             skill: parsedFromLabel.label,
             class_id: parsedFromLabel.classId,
+            confidence: item?.confidence ?? 1.0,
           };
         }
 
@@ -94,6 +98,7 @@ function App() {
             frame: Math.round(frame),
             skill: match.label,
             class_id: classId,
+            confidence: item?.confidence ?? 1.0,
           };
         }
         return null;
@@ -125,14 +130,32 @@ function App() {
     }
 
     setState((prev) => {
-      const merged = new Map<number, AppState['events'][number]>();
-      prev.events.forEach((e) => merged.set(e.frame, e));
-      events.forEach((e) => merged.set(e.frame, e));
-      const mergedEvents = Array.from(merged.values()).sort((a, b) => a.frame - b.frame);
+      const allEvents = [...prev.events, ...events].sort((a, b) => a.frame - b.frame);
+      
+      const WINDOW = 15;
+      const deduplicated: AppState['events'] = [];
+      
+      for (const ev of allEvents) {
+        if (deduplicated.length === 0) {
+          deduplicated.push(ev);
+          continue;
+        }
+        const last = deduplicated[deduplicated.length - 1];
+        
+        if (ev.skill === last.skill && Math.abs(ev.frame - last.frame) <= WINDOW) {
+          const confEv = ev.confidence ?? 1.0;
+          const confLast = last.confidence ?? 1.0;
+          if (confEv > confLast) {
+            deduplicated[deduplicated.length - 1] = ev;
+          }
+        } else {
+          deduplicated.push(ev);
+        }
+      }
 
       return {
         ...prev,
-        events: mergedEvents,
+        events: deduplicated,
         rally: {
           start_frame: startFrame ?? prev.rally.start_frame,
           end_frame: endFrame ?? prev.rally.end_frame,
@@ -155,6 +178,93 @@ function App() {
       window.alert('Failed to import predictions JSON. Please check the file format.');
     }
   };
+
+  const inferSingleVideo = async (file: File) => {
+    const formData = new FormData();
+    formData.append('video', file);
+    const res = await fetch(`${INFERENCE_API_BASE}/api/infer/skill5`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      throw new Error(`Inference failed (${res.status})`);
+    }
+    return await res.json();
+  };
+
+  useEffect(() => {
+    if (batchProgress.isRunning) {
+      const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && p.file);
+      if (nextIndex === -1) {
+        setBatchProgress(prev => ({ ...prev, isRunning: false }));
+        return;
+      }
+      
+      const processNext = async () => {
+        try {
+          const item = state.playlist[nextIndex];
+          const payload = await inferSingleVideo(item.file!);
+          const { events, startFrame, endFrame } = parsePredictionsFile(payload);
+          
+          setState(prev => {
+            const newPlaylist = [...prev.playlist];
+            newPlaylist[nextIndex] = {
+              ...newPlaylist[nextIndex],
+              events: events,
+              rally: {
+                start_frame: startFrame ?? newPlaylist[nextIndex].rally?.start_frame ?? null,
+                end_frame: endFrame ?? newPlaylist[nextIndex].rally?.end_frame ?? null
+              },
+              isSkillAlgorithmApplied: true
+            };
+            
+            if (prev.currentPlaylistIndex === nextIndex) {
+              return {
+                ...prev,
+                playlist: newPlaylist,
+                events: events,
+                rally: {
+                  start_frame: startFrame ?? prev.rally.start_frame,
+                  end_frame: endFrame ?? prev.rally.end_frame
+                }
+              };
+            }
+            
+            return { ...prev, playlist: newPlaylist };
+          });
+          
+          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
+        } catch (err) {
+          console.error('Batch inference failed for', state.playlist[nextIndex].name, err);
+          setState(prev => {
+            const newPlaylist = [...prev.playlist];
+            newPlaylist[nextIndex] = { ...newPlaylist[nextIndex], isSkillAlgorithmApplied: true };
+            return { ...prev, playlist: newPlaylist };
+          });
+          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
+        }
+      };
+      
+      processNext();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchProgress.isRunning, state.playlist]);
+
+  useEffect(() => {
+    if (!batchProgress.isRunning && batchProgress.total > 0 && batchProgress.completed === batchProgress.total && state.playlist.length > 0 && !videoUrl) {
+      const item = state.playlist[0];
+      if (item.file) {
+        setVideoUrl(URL.createObjectURL(item.file));
+      }
+      setState(prev => ({
+        ...prev,
+        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
+        rally: item.rally || { start_frame: null, end_frame: null },
+        events: item.events || [],
+        currentFrame: 0
+      }));
+    }
+  }, [batchProgress.isRunning, batchProgress.completed, batchProgress.total, state.playlist, videoUrl]);
 
   const runTouchModel = async () => {
     const item = state.playlist[state.currentPlaylistIndex];
@@ -267,16 +377,90 @@ function App() {
     }));
   };
 
-  const handlePlaylistFiles = (files: FileList | null) => {
+  const handlePlaylistFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const newPlaylist: PlaylistItem[] = Array.from(files).map((file) => ({
-      id: file.name + file.lastModified,
-      name: file.name,
-      file: file
-    }));
     
-    setState(prev => ({ ...prev, playlist: newPlaylist, currentPlaylistIndex: 0 }));
-    loadVideoIntoPlayer(newPlaylist[0]);
+    const fileArray = Array.from(files);
+    const videoFiles = fileArray.filter(f => f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mp4'));
+    const zipFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.zip'));
+    
+    let parsedAnnotations: Record<string, any> = {};
+    if (zipFiles.length > 0) {
+      try {
+        parsedAnnotations = await parseZIPAnnotations(zipFiles[0]);
+        console.log(`Loaded annotations for ${Object.keys(parsedAnnotations).length} videos from ZIP.`);
+      } catch (e) {
+        console.error("Error parsing ZIP", e);
+      }
+    }
+
+    const newPlaylistItems: PlaylistItem[] = [];
+
+    setState(prev => {
+      const newPlaylist: PlaylistItem[] = videoFiles.map(file => {
+        const existing = prev.playlist.find(p => p.name === file.name);
+        
+        let itemEvents = existing?.events || [];
+        let itemRally = existing?.rally || { start_frame: null, end_frame: null };
+        let isApplied = existing?.isSkillAlgorithmApplied || false;
+
+        const stem = file.name.replace(/\.[^/.]+$/, '');
+        if (parsedAnnotations[stem]) {
+          itemEvents = parsedAnnotations[stem].events;
+          itemRally = parsedAnnotations[stem].rally;
+          isApplied = true;
+        }
+
+        return {
+          id: file.name + file.lastModified,
+          name: file.name,
+          file: file,
+          events: itemEvents,
+          rally: itemRally,
+          isSkillAlgorithmApplied: isApplied,
+          videoMetadata: existing?.videoMetadata || null,
+          isCompleted: existing?.isCompleted || false
+        };
+      });
+      
+      newPlaylistItems.push(...newPlaylist);
+
+      const total = newPlaylist.length;
+      const completed = newPlaylist.filter(p => p.isSkillAlgorithmApplied).length;
+      
+      if (total > 0) {
+        setBatchProgress({
+          isRunning: completed < total,
+          completed,
+          total
+        });
+      }
+
+      return { ...prev, playlist: newPlaylist, currentPlaylistIndex: 0 };
+    });
+
+    setTimeout(() => {
+      if (newPlaylistItems.length > 0) {
+         const total = newPlaylistItems.length;
+         const completed = newPlaylistItems.filter(p => p.isSkillAlgorithmApplied).length;
+         
+         // Only transition to main screen immediately if NO processing is needed
+         if (completed === total) {
+           const item = newPlaylistItems[0];
+           if (item.file) {
+             const url = URL.createObjectURL(item.file);
+             setVideoUrl(url);
+           }
+           setState(prev => ({
+             ...prev,
+             videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
+             rally: item.rally || { start_frame: null, end_frame: null },
+             events: item.events || [],
+             currentFrame: 0
+           }));
+         }
+      }
+    }, 0);
   };
 
   const handleDrivePlaylist = (playlist: PlaylistItem[]) => {
@@ -351,6 +535,24 @@ function App() {
     videoRef.current.currentTime = time;
     setState(prev => ({ ...prev, currentFrame: safeFrame }));
   }, [state.videoMetadata]);
+
+  const startContinuousSeek = (delta: number) => {
+    // Initial jump
+    seekToFrame(state.currentFrame + delta);
+    
+    seekIntervalRef.current = setInterval(() => {
+      if (!videoRef.current || !state.videoMetadata) return;
+      const currentActualFrame = Math.round(videoRef.current.currentTime * state.videoMetadata.fps);
+      seekToFrame(currentActualFrame + delta);
+    }, 100);
+  };
+
+  const stopContinuousSeek = () => {
+    if (seekIntervalRef.current) {
+      clearInterval(seekIntervalRef.current);
+      seekIntervalRef.current = null;
+    }
+  };
 
   const handleTimeUpdate = () => {
     if (!videoRef.current || !state.videoMetadata) return;
@@ -443,6 +645,25 @@ function App() {
   const warnings = getValidationWarnings();
 
   if (!videoUrl) {
+    if (batchProgress.total > 0 && batchProgress.isRunning) {
+      return (
+        <div className="landing-container">
+          <div className="landing-card" style={{ maxWidth: '600px', width: '100%' }}>
+            <h1 className="landing-title">Applying Skill Algorithm...</h1>
+            <p className="landing-subtitle">
+              Processing video {batchProgress.completed + 1} of {batchProgress.total}
+            </p>
+            <div style={{ width: '100%', height: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '6px', overflow: 'hidden', marginTop: '2rem' }}>
+              <div style={{ width: `${(batchProgress.completed / batchProgress.total) * 100}%`, height: '100%', background: 'var(--primary)', transition: 'width 0.3s ease' }} />
+            </div>
+            <p style={{ textAlign: 'center', marginTop: '1rem', color: 'rgba(255,255,255,0.7)' }}>
+              {Math.round((batchProgress.completed / batchProgress.total) * 100)}% Complete
+            </p>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="landing-container">
         <div className="landing-card">
@@ -459,7 +680,7 @@ function App() {
               </div>
               <h3>Local Files</h3>
               <p>Drag & drop MP4 files</p>
-              <input type="file" accept="video/mp4" multiple onChange={(e) => handlePlaylistFiles(e.target.files)} style={{ display: 'none' }} />
+              <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
             </label>
 
             <div className="landing-option">
@@ -521,7 +742,7 @@ function App() {
 
       {/* MAIN CONTENT */}
       <div className="main-content">
-        <div className="glass-panel video-wrapper">
+        <div className="glass-panel video-wrapper" style={{ position: 'relative' }}>
           <video 
             ref={videoRef} 
             src={videoUrl} 
@@ -530,20 +751,76 @@ function App() {
             controls={false}
             crossOrigin="anonymous" // Needed for Drive URLs if they support it
           />
+          {(() => {
+            const activeEvent = state.events.find(e => e.frame === state.currentFrame);
+            if (activeEvent) {
+              return (
+                <div style={{
+                  position: 'absolute',
+                  top: '20px',
+                  left: '50%',
+                  transform: 'translateX(-50%)',
+                  padding: '8px 24px',
+                  borderRadius: '8px',
+                  fontSize: '2rem',
+                  fontWeight: 'bold',
+                  textTransform: 'uppercase',
+                  backgroundColor: `var(--color-${activeEvent.skill})`,
+                  color: '#fff',
+                  boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+                  zIndex: 10,
+                  pointerEvents: 'none',
+                  letterSpacing: '2px',
+                  textShadow: '0 2px 4px rgba(0,0,0,0.3)'
+                }}>
+                  {activeEvent.skill}
+                </div>
+              );
+            }
+            return null;
+          })()}
         </div>
 
         <div className="glass-panel video-controls">
           <div className="controls-row">
-            <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame - 5)}>-5f</button>
-            <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame - 1)}>-1f</button>
+            <button 
+              className="btn outline icon-only" 
+              onMouseDown={() => startContinuousSeek(-5)}
+              onMouseUp={stopContinuousSeek}
+              onMouseLeave={stopContinuousSeek}
+              onTouchStart={() => startContinuousSeek(-5)}
+              onTouchEnd={stopContinuousSeek}
+            >-5f</button>
+            <button 
+              className="btn outline icon-only" 
+              onMouseDown={() => startContinuousSeek(-1)}
+              onMouseUp={stopContinuousSeek}
+              onMouseLeave={stopContinuousSeek}
+              onTouchStart={() => startContinuousSeek(-1)}
+              onTouchEnd={stopContinuousSeek}
+            >-1f</button>
             <button className="btn" onClick={() => {
               if (videoRef.current?.paused) videoRef.current.play();
               else videoRef.current?.pause();
             }}>
               Play / Pause
             </button>
-            <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame + 1)}>+1f</button>
-            <button className="btn outline icon-only" onClick={() => seekToFrame(state.currentFrame + 5)}>+5f</button>
+            <button 
+              className="btn outline icon-only" 
+              onMouseDown={() => startContinuousSeek(1)}
+              onMouseUp={stopContinuousSeek}
+              onMouseLeave={stopContinuousSeek}
+              onTouchStart={() => startContinuousSeek(1)}
+              onTouchEnd={stopContinuousSeek}
+            >+1f</button>
+            <button 
+              className="btn outline icon-only" 
+              onMouseDown={() => startContinuousSeek(5)}
+              onMouseUp={stopContinuousSeek}
+              onMouseLeave={stopContinuousSeek}
+              onTouchStart={() => startContinuousSeek(5)}
+              onTouchEnd={stopContinuousSeek}
+            >+5f</button>
             
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '1rem' }}>
               <div style={{ fontFamily: 'monospace', fontSize: '1.2rem' }}>
