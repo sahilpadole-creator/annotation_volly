@@ -682,9 +682,13 @@ function App() {
             <h1 className="landing-title">Applying Skill Algorithm...</h1>
             <p className="landing-subtitle">
               Processing video {batchProgress.completed + 1} of {batchProgress.total}
-              {batchProgress.avgTimeSec > 0 && (
+              {batchProgress.avgTimeSec > 0 ? (
                 <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
                   ETA: {Math.round(batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed))} seconds
+                </span>
+              ) : (
+                <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
+                  Calculating ETA...
                 </span>
               )}
             </p>
@@ -693,7 +697,11 @@ function App() {
             </div>
             <p style={{ textAlign: 'center', marginTop: '1rem', color: 'rgba(255,255,255,0.7)' }}>
               {Math.round((batchProgress.completed / batchProgress.total) * 100)}% Complete
-              {batchProgress.lastFps > 0 && <span style={{ marginLeft: '15px', color: '#4ade80' }}>({batchProgress.lastFps} FPS)</span>}
+              {batchProgress.lastFps > 0 ? (
+                <span style={{ marginLeft: '15px', color: '#4ade80' }}>({batchProgress.lastFps} FPS)</span>
+              ) : (
+                <span style={{ marginLeft: '15px', color: '#4ade80' }}>(Calculating FPS...)</span>
+              )}
             </p>
           </div>
         </div>
