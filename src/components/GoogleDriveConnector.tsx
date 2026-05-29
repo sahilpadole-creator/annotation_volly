@@ -6,13 +6,14 @@ import type { PlaylistItem } from '../types';
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY || '';
 const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
-const SCOPES = 'https://www.googleapis.com/auth/drive.readonly';
+const SCOPES = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file';
 
 interface Props {
   onPlaylistLoaded: (playlist: PlaylistItem[]) => void;
+  onTokenReceived?: (token: string) => void;
 }
 
-export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded }) => {
+export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onTokenReceived }) => {
   const [isReady, setIsReady] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,6 +50,7 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded }) => {
   const login = useGoogleLogin({
     onSuccess: (tokenResponse) => {
       setToken(tokenResponse.access_token);
+      if (onTokenReceived) onTokenReceived(tokenResponse.access_token);
     },
     scope: SCOPES,
     onError: (error) => {

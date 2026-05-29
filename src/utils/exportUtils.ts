@@ -107,7 +107,7 @@ export const exportToXML = (
   URL.revokeObjectURL(url);
 };
 
-export const exportAllToZip = async (playlist: PlaylistItem[]) => {
+export const exportAllToZip = async (playlist: PlaylistItem[], download = true): Promise<Blob | null> => {
   const zip = new JSZip();
 
   let hasData = false;
@@ -127,14 +127,19 @@ export const exportAllToZip = async (playlist: PlaylistItem[]) => {
 
   if (!hasData) {
     alert("No annotated videos to export!");
-    return;
+    return null;
   }
 
   const content = await zip.generateAsync({ type: 'blob' });
-  const url = URL.createObjectURL(content);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `volleyball_annotations_batch.zip`;
-  a.click();
-  URL.revokeObjectURL(url);
+  
+  if (download) {
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `volleyball_annotations_batch.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  
+  return content;
 };

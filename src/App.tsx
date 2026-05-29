@@ -44,6 +44,7 @@ function App() {
   const [isRunningTouch, setIsRunningTouch] = useState(false);
   const [isRunningSkill5, setIsRunningSkill5] = useState(false);
   const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+  const googleTokenRef = useRef<string | null>(null);
   
   const [state, setState] = useState<AppState>({
     playlist: [],
@@ -203,7 +204,28 @@ function App() {
         // Automatically download the batch ZIP when finished!
         const annotated = state.playlist.filter(p => p.events && p.events.length > 0);
         if (annotated.length > 0) {
-          void exportAllToZip(annotated);
+          exportAllToZip(annotated, true).then(blob => {
+            if (blob && googleTokenRef.current) {
+              const metadata = { name: `volleyball_annotations_batch_${Date.now()}.zip`, mimeType: 'application/zip' };
+              const form = new FormData();
+              form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+              form.append('file', blob);
+
+              fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${googleTokenRef.current}` },
+                body: form
+              })
+              .then(res => {
+                if (res.ok) window.alert('Successfully uploaded batch annotations to Google Drive!');
+                else throw new Error('Upload failed');
+              })
+              .catch(err => {
+                console.error('Drive upload error:', err);
+                window.alert('Failed to upload to Google Drive. The file was still downloaded to your local machine.');
+              });
+            }
+          });
         }
         return;
       }
@@ -732,7 +754,8 @@ function App() {
                 <FolderArchive size={32} />
               </div>
               <h3 style={{ marginBottom: '1rem' }}>Google Drive</h3>
-              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} />
+              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Login to auto-upload the batch ZIP.</p>
+              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} onTokenReceived={(t) => { googleTokenRef.current = t; window.alert('Google Drive connected! Output will auto-upload.'); }} />
             </div>
           </div>
         </div>
