@@ -62,29 +62,37 @@ export const generateXMLString = (
     }
   });
 
-  for (let frame = 0; frame < metadata.frame_count; frame++) {
+  const framesToOutput = new Set<number>();
+  if (rally.start_frame !== null) framesToOutput.add(rally.start_frame);
+  if (rally.end_frame !== null) framesToOutput.add(rally.end_frame);
+  eventsByFrame.forEach((_, frame) => framesToOutput.add(frame));
+
+  const sortedFrames = Array.from(framesToOutput).sort((a, b) => a - b);
+
+  for (const frame of sortedFrames) {
     const isStartRally = rally.start_frame === frame;
     const isEndRally = rally.end_frame === frame;
     const event = eventsByFrame.get(frame);
 
-    if (isStartRally || isEndRally || event) {
-      const padFrame = frame.toString().padStart(6, '0');
-      xml += `  <image id="${frame}" name="frame_${padFrame}" width="${metadata.width}" height="${metadata.height}">\n`;
-      
-      if (isStartRally) {
-        xml += `    <tag label="start_rally" source="manual"></tag>\n`;
-      }
-      
-      if (event) {
-        xml += `    <tag label="${event.skill}" source="manual"></tag>\n`;
-      }
-      
-      if (isEndRally) {
-        xml += `    <tag label="end_rally" source="manual"></tag>\n`;
-      }
-      
-      xml += `  </image>\n`;
+    const padFrame = frame.toString().padStart(6, '0');
+    // Default to a 1920x1080 if width/height are 0
+    const w = metadata.width || 1920;
+    const h = metadata.height || 1080;
+    xml += `  <image id="${frame}" name="frame_${padFrame}" width="${w}" height="${h}">\n`;
+    
+    if (isStartRally) {
+      xml += `    <tag label="start_rally" source="manual"></tag>\n`;
     }
+    
+    if (event) {
+      xml += `    <tag label="${event.skill}" source="manual"></tag>\n`;
+    }
+    
+    if (isEndRally) {
+      xml += `    <tag label="end_rally" source="manual"></tag>\n`;
+    }
+    
+    xml += `  </image>\n`;
   }
 
   xml += `</annotations>\n`;
