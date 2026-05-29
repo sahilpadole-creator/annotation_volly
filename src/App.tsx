@@ -56,6 +56,7 @@ function App() {
   });
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [destinationFolderId, setDestinationFolderId] = useState<string | null>(null);
   const importPredictionsInputRef = useRef<HTMLInputElement>(null);
   const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -309,6 +310,31 @@ function App() {
                   });
                 }
               }).catch(console.error);
+
+            // Upload MP4 if it's a local file being processed into a destination drive folder
+            if (item.file && !item.driveUrl && item.driveFolderId) {
+              const videoMetadata: any = {
+                name: item.name,
+                parents: [item.driveFolderId]
+              };
+              const videoForm = new FormData();
+              videoForm.append('metadata', new Blob([JSON.stringify(videoMetadata)], { type: 'application/json' }));
+              videoForm.append('file', item.file);
+
+              fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${googleTokenRef.current}` },
+                body: videoForm
+              }).then(r => r.json()).then(data => {
+                if (data.id) {
+                  setState(prev => {
+                    const np = [...prev.playlist];
+                    np[nextIndex] = { ...np[nextIndex], driveUrl: `https://www.googleapis.com/drive/v3/files/${data.id}?alt=media` };
+                    return { ...prev, playlist: np };
+                  });
+                }
+              }).catch(console.error);
+            }
           }
           
           const fps = (payload as any).inference_fps || 0;
@@ -508,7 +534,8 @@ function App() {
           rally: itemRally,
           isSkillAlgorithmApplied: isApplied,
           videoMetadata: existing?.videoMetadata || null,
-          isCompleted: existing?.isCompleted || false
+          isCompleted: existing?.isCompleted || false,
+          driveFolderId: destinationFolderId || undefined
         };
       });
       
@@ -851,7 +878,7 @@ function App() {
               <div className="icon-wrapper">
                 <Upload size={32} />
               </div>
-              <h3>Local Files</h3>
+              <h3>1. Local Files (No Sync)</h3>
               <p>Drag & drop MP4 or ZIP files</p>
               <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
             </label>
@@ -860,9 +887,25 @@ function App() {
               <div className="icon-wrapper">
                 <FolderArchive size={32} />
               </div>
-              <h3 style={{ marginBottom: '1rem' }}>Google Drive</h3>
-              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Login to auto-upload the batch ZIP.</p>
-              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} onTokenReceived={(t) => { googleTokenRef.current = t; window.alert('Google Drive connected! Output will auto-upload.'); }} />
+              <h3 style={{ marginBottom: '1rem' }}>2. Process Local & Sync</h3>
+              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Upload local videos and XMLs to Google Drive automatically.</p>
+              {!destinationFolderId ? (
+                <GoogleDriveConnector mode="destination" onDestinationSelected={(id) => setDestinationFolderId(id)} onTokenReceived={(t) => { googleTokenRef.current = t; }} buttonText="Select Destination Folder" />
+              ) : (
+                <label className="btn" style={{ width: '100%', cursor: 'pointer', textAlign: 'center', display: 'block', backgroundColor: 'var(--primary)' }}>
+                  Now Select Local Videos
+                  <input type="file" accept="video/mp4" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
+                </label>
+              )}
+            </div>
+
+            <div className="landing-option">
+              <div className="icon-wrapper">
+                <FolderArchive size={32} />
+              </div>
+              <h3 style={{ marginBottom: '1rem' }}>3. Cloud Load</h3>
+              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Load and process from a Google Drive folder.</p>
+              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} onTokenReceived={(t) => { googleTokenRef.current = t; window.alert('Google Drive connected!'); }} buttonText="Select Cloud Folder" />
             </div>
           </div>
         </div>

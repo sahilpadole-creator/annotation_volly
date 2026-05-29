@@ -9,11 +9,14 @@ const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/r
 const SCOPES = 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file';
 
 interface Props {
-  onPlaylistLoaded: (playlist: PlaylistItem[]) => void;
+  onPlaylistLoaded?: (playlist: PlaylistItem[]) => void;
   onTokenReceived?: (token: string) => void;
+  mode?: 'source' | 'destination';
+  onDestinationSelected?: (folderId: string) => void;
+  buttonText?: string;
 }
 
-export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onTokenReceived }) => {
+export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onTokenReceived, mode = 'source', onDestinationSelected, buttonText }) => {
   const [isReady, setIsReady] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -65,12 +68,15 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
       .setIncludeFolders(true)
       .setSelectFolderEnabled(true);
 
-    const videoView = new (window as any).google.picker.DocsView((window as any).google.picker.ViewId.DOCS)
-      .setMimeTypes('video/mp4,video/quicktime,video/x-msvideo');
+    const pickerBuilder = new (window as any).google.picker.PickerBuilder().addView(view);
 
-    const picker = new (window as any).google.picker.PickerBuilder()
-      .addView(view)
-      .addView(videoView)
+    if (mode === 'source') {
+      const videoView = new (window as any).google.picker.DocsView((window as any).google.picker.ViewId.DOCS)
+        .setMimeTypes('video/mp4,video/quicktime,video/x-msvideo');
+      pickerBuilder.addView(videoView);
+    }
+
+    const picker = pickerBuilder
       .setOAuthToken(token)
       .setDeveloperKey(API_KEY)
       .setCallback((data: any) => pickerCallback(data))
@@ -84,8 +90,11 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
       const doc = data.docs[0];
       
       if (doc.mimeType === 'application/vnd.google-apps.folder') {
-        // Fetch videos inside the folder
-        await fetchFolderContents(doc.id);
+        if (mode === 'destination' && onDestinationSelected) {
+          onDestinationSelected(doc.id);
+        } else {
+          await fetchFolderContents(doc.id);
+        }
       } else {
         // Single or multiple video files selected
         const playlist: PlaylistItem[] = data.docs.map((d: any) => ({
@@ -93,7 +102,7 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
           name: d.name,
           driveUrl: `https://www.googleapis.com/drive/v3/files/${d.id}?alt=media`,
         }));
-        onPlaylistLoaded(playlist);
+        if (onPlaylistLoaded) onPlaylistLoaded(playlist);
       }
     }
   };
@@ -125,7 +134,7 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
         };
       });
       
-      onPlaylistLoaded(playlist);
+      if (onPlaylistLoaded) onPlaylistLoaded(playlist);
     } catch (err) {
       console.error('Error fetching folder', err);
       setError('Failed to fetch folder contents');
@@ -152,7 +161,7 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
         </button>
       ) : (
         <button className="btn" onClick={openPicker} disabled={!isReady} style={{ width: '100%' }}>
-          Select Drive Folder/Videos
+          {buttonText || 'Select Drive Folder/Videos'}
         </button>
       )}
     </div>
