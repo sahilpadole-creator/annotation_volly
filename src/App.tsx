@@ -344,19 +344,6 @@ function App() {
                 }
               }).catch(console.error);
 
-            // Upload MP4 if it's a local file being processed into a destination drive folder
-            if (item.file && !item.driveUrl && item.driveFolderId) {
-              uploadToDrive(googleTokenRef.current!, item.driveFolderId, item.name, item.file, undefined)
-                .then(videoId => {
-                  if (videoId) {
-                    setState(prev => {
-                      const np = [...prev.playlist];
-                      np[nextIndex] = { ...np[nextIndex], driveUrl: `https://www.googleapis.com/drive/v3/files/${videoId}?alt=media` };
-                      return { ...prev, playlist: np };
-                    });
-                  }
-                }).catch(console.error);
-            }
           }
           
           const fps = (payload as any).inference_fps || 0;
@@ -914,7 +901,7 @@ function App() {
                 <FolderArchive size={32} />
               </div>
               <h3 style={{ marginBottom: '1rem' }}>2. Process Local & Sync</h3>
-              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Upload local videos and XMLs to Google Drive automatically.</p>
+              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Process local videos and automatically upload only XMLs to Google Drive.</p>
               {!destinationFolderId ? (
                 <GoogleDriveConnector mode="destination" onDestinationSelected={(id) => setDestinationFolderId(id)} onTokenReceived={(t) => { googleTokenRef.current = t; }} buttonText="Select Destination Folder" />
               ) : (
