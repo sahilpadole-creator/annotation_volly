@@ -60,10 +60,11 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
   return { rally, events };
 };
 
-export const parseZIPAnnotations = async (zipFile: File): Promise<Record<string, ParsedAnnotations>> => {
+export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations: Record<string, ParsedAnnotations>, videos: File[] }> => {
   const zip = new JSZip();
   const loadedZip = await zip.loadAsync(zipFile);
-  const result: Record<string, ParsedAnnotations> = {};
+  const annotations: Record<string, ParsedAnnotations> = {};
+  const videos: File[] = [];
   
   for (const filename of Object.keys(loadedZip.files)) {
     const file = loadedZip.files[filename];
@@ -74,19 +75,24 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<Record<string,
       const xmlString = await file.async("string");
       try {
         const parsed = parseXMLAnnotations(xmlString);
-        // Extract stem from filename
-        // e.g. annotations_video1.xml -> video1
-        // video1.xml -> video1
         let stem = filename.replace(/\.xml$/i, '');
         if (stem.startsWith('annotations_')) {
           stem = stem.replace(/^annotations_/, '');
         }
-        result[stem] = parsed;
+        annotations[stem] = parsed;
       } catch (err) {
         console.error(`Failed to parse XML from ZIP: ${filename}`, err);
+      }
+    } else if (filename.toLowerCase().endsWith('.mp4') || filename.toLowerCase().endsWith('.mov') || filename.toLowerCase().endsWith('.avi')) {
+      try {
+        const blob = await file.async("blob");
+        const videoFile = new File([blob], filename, { type: 'video/mp4' });
+        videos.push(videoFile);
+      } catch (err) {
+        console.error(`Failed to extract video from ZIP: ${filename}`, err);
       }
     }
   }
   
-  return result;
+  return { annotations, videos };
 };

@@ -384,19 +384,25 @@ function App() {
     const zipFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.zip'));
     
     let parsedAnnotations: Record<string, any> = {};
+    let extractedVideos: File[] = [];
     if (zipFiles.length > 0) {
       try {
-        parsedAnnotations = await parseZIPAnnotations(zipFiles[0]);
+        const result = await parseZIPAnnotations(zipFiles[0]);
+        parsedAnnotations = result.annotations;
+        extractedVideos = result.videos;
         console.log(`Loaded annotations for ${Object.keys(parsedAnnotations).length} videos from ZIP.`);
+        console.log(`Extracted ${extractedVideos.length} videos from ZIP.`);
       } catch (e) {
         console.error("Error parsing ZIP", e);
       }
     }
 
+    const allVideoFiles = [...videoFiles, ...extractedVideos];
+
     const newPlaylistItems: PlaylistItem[] = [];
 
     setState(prev => {
-      const newPlaylist: PlaylistItem[] = videoFiles.map(file => {
+      const newPlaylist: PlaylistItem[] = allVideoFiles.map(file => {
         const existing = prev.playlist.find(p => p.name === file.name);
         
         let itemEvents = existing?.events || [];
