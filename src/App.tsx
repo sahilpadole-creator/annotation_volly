@@ -552,6 +552,7 @@ function App() {
       loadVideoIntoPlayer(playlist[0]);
     }
 
+    let finalPlaylist = playlist;
     if (googleTokenRef.current) {
       const updatedPlaylist = [...playlist];
       let hasUpdates = false;
@@ -581,16 +582,29 @@ function App() {
       }
 
       if (hasUpdates) {
-        setState(prev => ({ ...prev, playlist: updatedPlaylist }));
-        if (updatedPlaylist.length > 0) {
+        finalPlaylist = updatedPlaylist;
+        setState(prev => ({ ...prev, playlist: finalPlaylist }));
+        if (finalPlaylist.length > 0) {
           // reload the first one in case it was updated
           setState(prev => ({
             ...prev,
-            events: updatedPlaylist[0].events || [],
-            rally: updatedPlaylist[0].rally || { start_frame: null, end_frame: null }
+            events: finalPlaylist[0].events || [],
+            rally: finalPlaylist[0].rally || { start_frame: null, end_frame: null }
           }));
         }
       }
+    }
+
+    const total = finalPlaylist.length;
+    const completed = finalPlaylist.filter(p => p.isSkillAlgorithmApplied).length;
+    if (total > 0) {
+      setBatchProgress({
+        isRunning: completed < total,
+        completed,
+        total,
+        lastFps: 0,
+        avgTimeSec: 0
+      });
     }
   };
 
