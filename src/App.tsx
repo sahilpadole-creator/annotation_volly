@@ -431,9 +431,12 @@ function App() {
       const url = URL.createObjectURL(item.file);
       setVideoUrl(url);
     } else if (item.driveUrl) {
-      // We will try streaming it, but Drive requires CORS headers which alt=media might not have properly.
-      // Often crossOrigin="anonymous" is needed, or we might need an access token in the URL.
-      setVideoUrl(item.driveUrl);
+      if (googleTokenRef.current) {
+        // Appending the access token allows the <video> element to authenticate
+        setVideoUrl(`${item.driveUrl}&access_token=${googleTokenRef.current}`);
+      } else {
+        setVideoUrl(item.driveUrl);
+      }
     }
 
     setState(prev => ({
