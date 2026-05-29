@@ -201,6 +201,11 @@ function App() {
       const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && (p.file || p.driveUrl));
       if (nextIndex === -1) {
         setBatchProgress(prev => ({ ...prev, isRunning: false }));
+        // Load the first video now that batch is done
+        if (state.playlist.length > 0 && !videoUrl) {
+          loadVideoIntoPlayer(state.playlist[0]);
+        }
+        
         // Automatically download the batch ZIP when finished!
         const annotated = state.playlist.filter(p => p.events && p.events.length > 0);
         if (annotated.length > 0) {
@@ -551,9 +556,6 @@ function App() {
 
   const handleDrivePlaylist = async (playlist: PlaylistItem[]) => {
     setState(prev => ({ ...prev, playlist, currentPlaylistIndex: 0 }));
-    if (playlist.length > 0) {
-      loadVideoIntoPlayer(playlist[0]);
-    }
 
     let finalPlaylist = playlist;
     if (googleTokenRef.current) {
@@ -601,13 +603,17 @@ function App() {
     const total = finalPlaylist.length;
     const completed = finalPlaylist.filter(p => p.isSkillAlgorithmApplied).length;
     if (total > 0) {
-      setBatchProgress({
-        isRunning: completed < total,
-        completed,
-        total,
-        lastFps: 0,
-        avgTimeSec: 0
-      });
+      if (completed < total) {
+        setBatchProgress({
+          isRunning: true,
+          completed,
+          total,
+          lastFps: 0,
+          avgTimeSec: 0
+        });
+      } else {
+        loadVideoIntoPlayer(finalPlaylist[0]);
+      }
     }
   };
 
@@ -869,7 +875,20 @@ function App() {
       {/* PLAYLIST SIDEBAR */}
       <div className="sidebar" style={{ minWidth: '200px', maxWidth: '250px' }}>
         <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-          <h2>Playlist ({state.currentPlaylistIndex + 1}/{state.playlist.length})</h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h2>Playlist ({state.currentPlaylistIndex + 1}/{state.playlist.length})</h2>
+            <button 
+              className="btn outline icon-only" 
+              onClick={() => {
+                setState({ playlist: [], currentPlaylistIndex: 0, videoMetadata: null, rally: { start_frame: null, end_frame: null }, events: [], currentFrame: 0 });
+                setVideoUrl('');
+                setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+              }}
+              title="Return to Home"
+            >
+              Home
+            </button>
+          </div>
           
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
             {state.playlist.map((item, index) => (
