@@ -109,13 +109,24 @@ function App() {
       importedEvents
         .reduce((acc, event) => acc.set(event.frame, event), new Map<number, (typeof importedEvents)[number]>())
         .values()
-    ).sort((a, b) => a.frame - b.frame);
+    );
+
+    // Apply Greedy NMS (window = 10)
+    const nmsWindow = 10;
+    const sortedByConf = [...sortedUniqueEvents].sort((a, b) => (b.confidence ?? 1.0) - (a.confidence ?? 1.0));
+    const keptEvents: typeof sortedUniqueEvents = [];
+    for (const ev of sortedByConf) {
+      if (!keptEvents.some(k => Math.abs(k.frame - ev.frame) <= nmsWindow)) {
+        keptEvents.push(ev);
+      }
+    }
+    const finalEvents = keptEvents.sort((a, b) => a.frame - b.frame);
 
     const startFrame = payload?.rally?.start_frame ?? payload?.start_frame ?? null;
     const endFrame = payload?.rally?.end_frame ?? payload?.end_frame ?? null;
 
     return {
-      events: sortedUniqueEvents,
+      events: finalEvents,
       startFrame: typeof startFrame === 'number' ? startFrame : null,
       endFrame: typeof endFrame === 'number' ? endFrame : null,
     };
@@ -130,28 +141,20 @@ function App() {
     }
 
     setState((prev) => {
-      const allEvents = [...prev.events, ...events].sort((a, b) => a.frame - b.frame);
+      const allEvents = [...prev.events, ...events];
       
-      const WINDOW = 15;
-      const deduplicated: AppState['events'] = [];
+      // Apply Greedy NMS (window = 10)
+      const nmsWindow = 10;
+      const sortedByConf = [...allEvents].sort((a, b) => (b.confidence ?? 1.0) - (a.confidence ?? 1.0));
+      const keptEvents: AppState['events'] = [];
       
-      for (const ev of allEvents) {
-        if (deduplicated.length === 0) {
-          deduplicated.push(ev);
-          continue;
-        }
-        const last = deduplicated[deduplicated.length - 1];
-        
-        if (ev.skill === last.skill && Math.abs(ev.frame - last.frame) <= WINDOW) {
-          const confEv = ev.confidence ?? 1.0;
-          const confLast = last.confidence ?? 1.0;
-          if (confEv > confLast) {
-            deduplicated[deduplicated.length - 1] = ev;
-          }
-        } else {
-          deduplicated.push(ev);
+      for (const ev of sortedByConf) {
+        if (!keptEvents.some(k => Math.abs(k.frame - ev.frame) <= nmsWindow)) {
+          keptEvents.push(ev);
         }
       }
+      
+      const deduplicated = keptEvents.sort((a, b) => a.frame - b.frame);
 
       return {
         ...prev,
