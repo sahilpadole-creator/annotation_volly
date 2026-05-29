@@ -1291,8 +1291,13 @@ function App() {
             {googleTokenRef.current && (
               <button className="btn outline" style={{ flex: 1 }} onClick={() => {
                 const item = state.playlist[state.currentPlaylistIndex];
-                if (!item.videoMetadata || !item.rally || !item.events) return;
-                const xml = generateXMLString(item.videoMetadata, item.rally, item.events);
+                if (!state.videoMetadata) return;
+                
+                // Update the playlist snapshot so it's fresh
+                saveCurrentVideoState();
+
+                // Generate XML using the CURRENT active state, not the old playlist item
+                const xml = generateXMLString(state.videoMetadata, state.rally, state.events);
                 const xmlBlob = new Blob([xml], { type: 'application/xml' });
                 const metadata: any = { name: `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml` };
                 let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
