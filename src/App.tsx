@@ -203,6 +203,41 @@ function App() {
     return await res.json();
   };
 
+  const uploadToDrive = async (token: string, folderId: string | undefined, filename: string, blob: Blob, existingId?: string) => {
+    let fileId = existingId;
+    if (!fileId && folderId) {
+      try {
+        const searchUrl = `https://www.googleapis.com/drive/v3/files?q=name='${filename}' and '${folderId}' in parents and trashed=false&fields=files(id)`;
+        const res = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
+        const data = await res.json();
+        if (data.files && data.files.length > 0) {
+          fileId = data.files[0].id; // Use existing file instead of creating duplicate
+        }
+      } catch (err) {
+        console.error('Failed to search Drive for existing file:', err);
+      }
+    }
+
+    let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+    let method = 'POST';
+    const metadata: any = { name: filename };
+    
+    if (fileId) {
+      url = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`;
+      method = 'PATCH';
+    } else if (folderId) {
+      metadata.parents = [folderId];
+    }
+    
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    form.append('file', blob);
+
+    const uploadRes = await fetch(url, { method, headers: { Authorization: `Bearer ${token}` }, body: form });
+    const uploadData = await uploadRes.json();
+    return uploadData.id as string;
+  };
+
   useEffect(() => {
     if (batchProgress.isRunning && !processingRef.current) {
       processingRef.current = true;
@@ -294,29 +329,14 @@ function App() {
               events
             );
             const xmlBlob = new Blob([xml], { type: 'application/xml' });
-            const metadata: any = { name: `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml` };
-            
-            let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-            let method = 'POST';
+            const xmlFilename = `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml`;
 
-            if (item.driveXmlId) {
-              url = `https://www.googleapis.com/upload/drive/v3/files/${item.driveXmlId}?uploadType=multipart`;
-              method = 'PATCH';
-            } else if (item.driveFolderId) {
-              metadata.parents = [item.driveFolderId];
-            }
-            
-            const form = new FormData();
-            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-            form.append('file', xmlBlob);
-
-            fetch(url, { method, headers: { Authorization: `Bearer ${googleTokenRef.current}` }, body: form })
-              .then(r => r.json())
-              .then(data => {
-                if (data.id) {
+            uploadToDrive(googleTokenRef.current!, item.driveFolderId, xmlFilename, xmlBlob, item.driveXmlId)
+              .then(xmlId => {
+                if (xmlId) {
                   setState(prev => {
                     const np = [...prev.playlist];
-                    np[nextIndex] = { ...np[nextIndex], driveXmlId: data.id };
+                    np[nextIndex] = { ...np[nextIndex], driveXmlId: xmlId };
                     return { ...prev, playlist: np };
                   });
                 }
@@ -324,27 +344,16 @@ function App() {
 
             // Upload MP4 if it's a local file being processed into a destination drive folder
             if (item.file && !item.driveUrl && item.driveFolderId) {
-              const videoMetadata: any = {
-                name: item.name,
-                parents: [item.driveFolderId]
-              };
-              const videoForm = new FormData();
-              videoForm.append('metadata', new Blob([JSON.stringify(videoMetadata)], { type: 'application/json' }));
-              videoForm.append('file', item.file);
-
-              fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${googleTokenRef.current}` },
-                body: videoForm
-              }).then(r => r.json()).then(data => {
-                if (data.id) {
-                  setState(prev => {
-                    const np = [...prev.playlist];
-                    np[nextIndex] = { ...np[nextIndex], driveUrl: `https://www.googleapis.com/drive/v3/files/${data.id}?alt=media` };
-                    return { ...prev, playlist: np };
-                  });
-                }
-              }).catch(console.error);
+              uploadToDrive(googleTokenRef.current!, item.driveFolderId, item.name, item.file, undefined)
+                .then(videoId => {
+                  if (videoId) {
+                    setState(prev => {
+                      const np = [...prev.playlist];
+                      np[nextIndex] = { ...np[nextIndex], driveUrl: `https://www.googleapis.com/drive/v3/files/${videoId}?alt=media` };
+                      return { ...prev, playlist: np };
+                    });
+                  }
+                }).catch(console.error);
             }
           }
           
@@ -1299,25 +1308,14 @@ function App() {
                 // Generate XML using the CURRENT active state, not the old playlist item
                 const xml = generateXMLString(state.videoMetadata, state.rally, state.events);
                 const xmlBlob = new Blob([xml], { type: 'application/xml' });
-                const metadata: any = { name: `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml` };
-                let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-                let method = 'POST';
-                if (item.driveXmlId) {
-                  url = `https://www.googleapis.com/upload/drive/v3/files/${item.driveXmlId}?uploadType=multipart`;
-                  method = 'PATCH';
-                } else if (item.driveFolderId) {
-                  metadata.parents = [item.driveFolderId];
-                }
-                const form = new FormData();
-                form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-                form.append('file', xmlBlob);
-                fetch(url, { method, headers: { Authorization: `Bearer ${googleTokenRef.current}` }, body: form })
-                  .then(r => r.json())
-                  .then(data => {
-                    if (data.id) {
+                const xmlFilename = `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml`;
+
+                uploadToDrive(googleTokenRef.current!, item.driveFolderId, xmlFilename, xmlBlob, item.driveXmlId)
+                  .then(xmlId => {
+                    if (xmlId) {
                       setState(prev => {
                         const np = [...prev.playlist];
-                        np[state.currentPlaylistIndex] = { ...np[state.currentPlaylistIndex], driveXmlId: data.id };
+                        np[state.currentPlaylistIndex] = { ...np[state.currentPlaylistIndex], driveXmlId: xmlId };
                         return { ...prev, playlist: np };
                       });
                       window.alert('Saved to Google Drive!');
