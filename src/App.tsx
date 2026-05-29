@@ -236,12 +236,8 @@ function App() {
           setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
         } catch (err) {
           console.error('Batch inference failed for', state.playlist[nextIndex].name, err);
-          setState(prev => {
-            const newPlaylist = [...prev.playlist];
-            newPlaylist[nextIndex] = { ...newPlaylist[nextIndex], isSkillAlgorithmApplied: true };
-            return { ...prev, playlist: newPlaylist };
-          });
-          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
+          window.alert(`Failed to apply algorithm to ${state.playlist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
+          setBatchProgress(prev => ({ ...prev, isRunning: false }));
         }
       };
       
