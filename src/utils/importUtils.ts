@@ -76,8 +76,14 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
       try {
         const parsed = parseXMLAnnotations(xmlString);
         let stem = filename.replace(/\.xml$/i, '');
-        if (stem.startsWith('annotations_')) {
-          stem = stem.replace(/^annotations_/, '');
+        const lastSlash = stem.lastIndexOf('/');
+        if (lastSlash >= 0) {
+          const path = stem.substring(0, lastSlash + 1);
+          let base = stem.substring(lastSlash + 1);
+          if (base.startsWith('annotations_')) base = base.replace(/^annotations_/, '');
+          stem = path + base;
+        } else {
+          if (stem.startsWith('annotations_')) stem = stem.replace(/^annotations_/, '');
         }
         annotations[stem] = parsed;
       } catch (err) {
