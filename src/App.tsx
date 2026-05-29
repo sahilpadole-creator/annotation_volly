@@ -43,7 +43,7 @@ function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [isRunningTouch, setIsRunningTouch] = useState(false);
   const [isRunningSkill5, setIsRunningSkill5] = useState(false);
-  const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0 });
+  const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
   
   const [state, setState] = useState<AppState>({
     playlist: [],
@@ -200,6 +200,11 @@ function App() {
       const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && p.file);
       if (nextIndex === -1) {
         setBatchProgress(prev => ({ ...prev, isRunning: false }));
+        // Automatically download the batch ZIP when finished!
+        const annotated = state.playlist.filter(p => p.events && p.events.length > 0);
+        if (annotated.length > 0) {
+          void exportAllToZip(annotated);
+        }
         return;
       }
       
@@ -237,7 +242,12 @@ function App() {
           });
           
           const fps = (payload as any).inference_fps || 0;
-          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1, lastFps: fps }));
+          const inferenceTime = (payload as any).inference_time_sec || 0;
+          setBatchProgress(prev => {
+             const newCompleted = prev.completed + 1;
+             const newAvg = prev.avgTimeSec === 0 ? inferenceTime : ((prev.avgTimeSec * prev.completed) + inferenceTime) / newCompleted;
+             return { ...prev, completed: newCompleted, lastFps: fps, avgTimeSec: newAvg };
+          });
         } catch (err) {
           console.error('Batch inference failed for', state.playlist[nextIndex].name, err);
           window.alert(`Failed to apply algorithm to ${state.playlist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
@@ -439,7 +449,8 @@ function App() {
           isRunning: completed < total,
           completed,
           total,
-          lastFps: 0
+          lastFps: 0,
+          avgTimeSec: 0
         });
       }
 
@@ -671,6 +682,11 @@ function App() {
             <h1 className="landing-title">Applying Skill Algorithm...</h1>
             <p className="landing-subtitle">
               Processing video {batchProgress.completed + 1} of {batchProgress.total}
+              {batchProgress.avgTimeSec > 0 && (
+                <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
+                  ETA: {Math.round(batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed))} seconds
+                </span>
+              )}
             </p>
             <div style={{ width: '100%', height: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '6px', overflow: 'hidden', marginTop: '2rem' }}>
               <div style={{ width: `${(batchProgress.completed / batchProgress.total) * 100}%`, height: '100%', background: 'var(--primary)', transition: 'width 0.3s ease' }} />
