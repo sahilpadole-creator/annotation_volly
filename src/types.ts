@@ -5,6 +5,7 @@ export interface SkillEvent {
   skill: SkillLabel;
   class_id: number;
   confidence?: number;
+  source?: 'auto' | 'manual';
 }
 
 export interface Rally {

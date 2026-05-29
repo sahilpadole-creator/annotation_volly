@@ -85,7 +85,8 @@ export const generateXMLString = (
     }
     
     if (event) {
-      xml += `    <tag label="${event.skill}" source="manual"></tag>\n`;
+      const src = event.source || 'manual';
+      xml += `    <tag label="${event.skill}" source="${src}"></tag>\n`;
     }
     
     if (isEndRally) {

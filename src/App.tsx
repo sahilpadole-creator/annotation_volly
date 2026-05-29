@@ -95,6 +95,7 @@ function App() {
             skill: parsedFromLabel.label,
             class_id: parsedFromLabel.classId,
             confidence: item?.confidence ?? 1.0,
+            source: 'auto' as const
           };
         }
 
@@ -107,6 +108,7 @@ function App() {
             skill: match.label,
             class_id: classId,
             confidence: item?.confidence ?? 1.0,
+            source: 'auto' as const
           };
         }
         return null;
@@ -765,7 +767,7 @@ function App() {
       const filtered = prev.events.filter(e => e.frame !== prev.currentFrame);
       return {
         ...prev,
-        events: [...filtered, { frame: prev.currentFrame, skill: skillInfo.label, class_id: skillInfo.classId }]
+        events: [...filtered, { frame: prev.currentFrame, skill: skillInfo.label, class_id: skillInfo.classId, source: 'manual' as const }]
       };
     });
   };
