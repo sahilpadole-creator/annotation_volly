@@ -684,7 +684,7 @@ function App() {
               Processing video {batchProgress.completed + 1} of {batchProgress.total}
               {batchProgress.avgTimeSec > 0 ? (
                 <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
-                  ETA: {Math.round(batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed))} seconds
+                  ETA: {Math.floor((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) / 60)}m {Math.round((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) % 60)}s
                 </span>
               ) : (
                 <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
