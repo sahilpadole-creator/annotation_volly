@@ -684,7 +684,7 @@ function App() {
                 <Upload size={32} />
               </div>
               <h3>Local Files</h3>
-              <p>Drag & drop MP4 files</p>
+              <p>Drag & drop MP4 or ZIP files</p>
               <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
             </label>
 
