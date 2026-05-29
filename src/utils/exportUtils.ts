@@ -126,9 +126,6 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true):
       const stem = item.name.replace(/\.[^/.]+$/, "");
       zip.file(`annotations_${stem}.xml`, xml);
       
-      if (item.file) {
-        zip.file(item.file.name, item.file);
-      }
       
       hasData = true;
     }

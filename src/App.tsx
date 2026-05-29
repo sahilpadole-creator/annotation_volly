@@ -850,7 +850,7 @@ function App() {
           <div className="landing-card" style={{ maxWidth: '600px', width: '100%' }}>
             <h1 className="landing-title">Applying Skill Algorithm...</h1>
             <p className="landing-subtitle">
-              Processing video {batchProgress.completed + 1} of {batchProgress.total}
+              Processing video {Math.min(batchProgress.completed + 1, batchProgress.total)} of {batchProgress.total}
               {batchProgress.avgTimeSec > 0 ? (
                 <span style={{ display: 'block', marginTop: '0.5rem', fontSize: '0.9rem', color: 'rgba(255,255,255,0.6)' }}>
                   ETA: {Math.floor((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) / 60)}m {Math.round((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) % 60)}s
