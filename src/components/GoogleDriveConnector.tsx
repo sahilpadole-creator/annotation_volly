@@ -103,17 +103,27 @@ export const GoogleDriveConnector: React.FC<Props> = ({ onPlaylistLoaded, onToke
     try {
       const gapi = (window as any).gapi;
       const response = await gapi.client.drive.files.list({
-        q: `'${folderId}' in parents and (mimeType contains 'video/') and trashed = false`,
+        q: `'${folderId}' in parents and (mimeType contains 'video/' or mimeType = 'application/xml' or mimeType = 'text/xml' or name contains '.xml') and trashed = false`,
         fields: 'files(id, name, mimeType)',
         pageSize: 1000
       });
       
       const files = response.result.files || [];
-      const playlist: PlaylistItem[] = files.map((f: any) => ({
-        id: f.id,
-        name: f.name,
-        driveUrl: `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`,
-      }));
+      const videos = files.filter((f: any) => f.mimeType.startsWith('video/') || f.name.endsWith('.mp4') || f.name.endsWith('.mov') || f.name.endsWith('.avi'));
+      const xmls = files.filter((f: any) => f.mimeType === 'application/xml' || f.mimeType === 'text/xml' || f.name.endsWith('.xml'));
+
+      const playlist: PlaylistItem[] = videos.map((v: any) => {
+        const stem = v.name.replace(/\.[^/.]+$/, '');
+        const matchingXml = xmls.find((x: any) => x.name === `${stem}.xml` || x.name === `annotations_${stem}.xml`);
+        
+        return {
+          id: v.id,
+          name: v.name,
+          driveUrl: `https://www.googleapis.com/drive/v3/files/${v.id}?alt=media`,
+          driveFolderId: folderId,
+          driveXmlId: matchingXml ? matchingXml.id : undefined
+        };
+      });
       
       onPlaylistLoaded(playlist);
     } catch (err) {

@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
 import type { AppState, SkillLabel, PlaylistItem } from './types';
-import { exportToXML, exportAllToZip } from './utils/exportUtils';
+import { exportToXML, exportAllToZip, generateXMLString } from './utils/exportUtils';
 import { GoogleDriveConnector } from './components/GoogleDriveConnector';
-import { parseZIPAnnotations } from './utils/importUtils';
+import { parseZIPAnnotations, parseXMLAnnotations } from './utils/importUtils';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
@@ -198,7 +198,7 @@ function App() {
 
   useEffect(() => {
     if (batchProgress.isRunning) {
-      const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && p.file);
+      const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && (p.file || p.driveUrl));
       if (nextIndex === -1) {
         setBatchProgress(prev => ({ ...prev, isRunning: false }));
         // Automatically download the batch ZIP when finished!
@@ -233,35 +233,78 @@ function App() {
       const processNext = async () => {
         try {
           const item = state.playlist[nextIndex];
-          const payload = await inferSingleVideo(item.file!);
+          let fileToInfer = item.file;
+          
+          if (!fileToInfer && item.driveUrl) {
+            const res = await fetch(item.driveUrl, { headers: { Authorization: `Bearer ${googleTokenRef.current}` } });
+            const blob = await res.blob();
+            fileToInfer = new File([blob], item.name, { type: 'video/mp4' });
+          }
+          
+          const payload = await inferSingleVideo(fileToInfer!);
           const { events, startFrame, endFrame } = parsePredictionsFile(payload);
           
+          const updatedItem = {
+            ...item,
+            events: events,
+            rally: {
+              start_frame: startFrame ?? item.rally?.start_frame ?? null,
+              end_frame: endFrame ?? item.rally?.end_frame ?? null
+            },
+            isSkillAlgorithmApplied: true
+          };
+
           setState(prev => {
             const newPlaylist = [...prev.playlist];
-            newPlaylist[nextIndex] = {
-              ...newPlaylist[nextIndex],
-              events: events,
-              rally: {
-                start_frame: startFrame ?? newPlaylist[nextIndex].rally?.start_frame ?? null,
-                end_frame: endFrame ?? newPlaylist[nextIndex].rally?.end_frame ?? null
-              },
-              isSkillAlgorithmApplied: true
-            };
+            newPlaylist[nextIndex] = updatedItem;
             
             if (prev.currentPlaylistIndex === nextIndex) {
               return {
                 ...prev,
                 playlist: newPlaylist,
                 events: events,
-                rally: {
-                  start_frame: startFrame ?? prev.rally.start_frame,
-                  end_frame: endFrame ?? prev.rally.end_frame
-                }
+                rally: updatedItem.rally
               };
             }
-            
             return { ...prev, playlist: newPlaylist };
           });
+
+          // Upload individual XML back to Google Drive
+          if (googleTokenRef.current && (item.driveFolderId || item.driveXmlId)) {
+            const xml = generateXMLString(
+              item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
+              updatedItem.rally,
+              events
+            );
+            const xmlBlob = new Blob([xml], { type: 'application/xml' });
+            const metadata: any = { name: `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml` };
+            
+            let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+            let method = 'POST';
+
+            if (item.driveXmlId) {
+              url = `https://www.googleapis.com/upload/drive/v3/files/${item.driveXmlId}?uploadType=multipart`;
+              method = 'PATCH';
+            } else if (item.driveFolderId) {
+              metadata.parents = [item.driveFolderId];
+            }
+            
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+            form.append('file', xmlBlob);
+
+            fetch(url, { method, headers: { Authorization: `Bearer ${googleTokenRef.current}` }, body: form })
+              .then(r => r.json())
+              .then(data => {
+                if (data.id) {
+                  setState(prev => {
+                    const np = [...prev.playlist];
+                    np[nextIndex] = { ...np[nextIndex], driveXmlId: data.id };
+                    return { ...prev, playlist: np };
+                  });
+                }
+              }).catch(console.error);
+          }
           
           const fps = (payload as any).inference_fps || 0;
           const inferenceTime = (payload as any).inference_time_sec || 0;
@@ -503,10 +546,51 @@ function App() {
     }, 0);
   };
 
-  const handleDrivePlaylist = (playlist: PlaylistItem[]) => {
+  const handleDrivePlaylist = async (playlist: PlaylistItem[]) => {
     setState(prev => ({ ...prev, playlist, currentPlaylistIndex: 0 }));
     if (playlist.length > 0) {
       loadVideoIntoPlayer(playlist[0]);
+    }
+
+    if (googleTokenRef.current) {
+      const updatedPlaylist = [...playlist];
+      let hasUpdates = false;
+
+      for (let i = 0; i < updatedPlaylist.length; i++) {
+        const item = updatedPlaylist[i];
+        if (item.driveXmlId) {
+          try {
+            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${item.driveXmlId}?alt=media`, {
+              headers: { Authorization: `Bearer ${googleTokenRef.current}` }
+            });
+            if (res.ok) {
+              const xmlText = await res.text();
+              const parsed = parseXMLAnnotations(xmlText);
+              updatedPlaylist[i] = {
+                ...item,
+                events: parsed.events,
+                rally: parsed.rally,
+                isSkillAlgorithmApplied: true
+              };
+              hasUpdates = true;
+            }
+          } catch (e) {
+            console.error('Failed to fetch XML for', item.name, e);
+          }
+        }
+      }
+
+      if (hasUpdates) {
+        setState(prev => ({ ...prev, playlist: updatedPlaylist }));
+        if (updatedPlaylist.length > 0) {
+          // reload the first one in case it was updated
+          setState(prev => ({
+            ...prev,
+            events: updatedPlaylist[0].events || [],
+            rally: updatedPlaylist[0].rally || { start_frame: null, end_frame: null }
+          }));
+        }
+      }
     }
   };
 
@@ -1110,6 +1194,40 @@ function App() {
             }} disabled={!state.videoMetadata || warnings.some(w => w.type === 'error')}>
               <Download size={16} /> Cur XML
             </button>
+            {googleTokenRef.current && (
+              <button className="btn outline" style={{ flex: 1 }} onClick={() => {
+                const item = state.playlist[state.currentPlaylistIndex];
+                if (!item.videoMetadata || !item.rally || !item.events) return;
+                const xml = generateXMLString(item.videoMetadata, item.rally, item.events);
+                const xmlBlob = new Blob([xml], { type: 'application/xml' });
+                const metadata: any = { name: `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml` };
+                let url = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
+                let method = 'POST';
+                if (item.driveXmlId) {
+                  url = `https://www.googleapis.com/upload/drive/v3/files/${item.driveXmlId}?uploadType=multipart`;
+                  method = 'PATCH';
+                } else if (item.driveFolderId) {
+                  metadata.parents = [item.driveFolderId];
+                }
+                const form = new FormData();
+                form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+                form.append('file', xmlBlob);
+                fetch(url, { method, headers: { Authorization: `Bearer ${googleTokenRef.current}` }, body: form })
+                  .then(r => r.json())
+                  .then(data => {
+                    if (data.id) {
+                      setState(prev => {
+                        const np = [...prev.playlist];
+                        np[state.currentPlaylistIndex] = { ...np[state.currentPlaylistIndex], driveXmlId: data.id };
+                        return { ...prev, playlist: np };
+                      });
+                      window.alert('Saved to Google Drive!');
+                    }
+                  }).catch(e => { console.error(e); window.alert('Failed to save to Google Drive'); });
+              }}>
+                <FolderArchive size={16} /> Sync Drive
+              </button>
+            )}
           </div>
         </div>
 

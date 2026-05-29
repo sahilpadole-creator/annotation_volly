@@ -26,6 +26,8 @@ export interface PlaylistItem {
   name: string;
   file?: File;
   driveUrl?: string;
+  driveFolderId?: string;
+  driveXmlId?: string;
   videoMetadata?: VideoMetadata | null;
   rally?: Rally;
   events?: SkillEvent[];
