@@ -59,6 +59,12 @@ function App() {
   const [destinationFolderId, setDestinationFolderId] = useState<string | null>(null);
   const importPredictionsInputRef = useRef<HTMLInputElement>(null);
   const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const stateRef = useRef(state);
+  const processingRef = useRef(false);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   const parsePredictionLabel = (rawLabel: unknown): { label: SkillLabel; classId: number } | null => {
     if (typeof rawLabel !== 'string') return null;
@@ -198,47 +204,52 @@ function App() {
   };
 
   useEffect(() => {
-    if (batchProgress.isRunning) {
-      const nextIndex = state.playlist.findIndex(p => !p.isSkillAlgorithmApplied && (p.file || p.driveUrl));
-      if (nextIndex === -1) {
-        setBatchProgress(prev => ({ ...prev, isRunning: false }));
-        // Load the first video now that batch is done
-        if (state.playlist.length > 0 && !videoUrl) {
-          loadVideoIntoPlayer(state.playlist[0]);
-        }
-        
-        // Automatically download the batch ZIP when finished!
-        const annotated = state.playlist.filter(p => p.events && p.events.length > 0);
-        if (annotated.length > 0) {
-          exportAllToZip(annotated, true).then(blob => {
-            if (blob && googleTokenRef.current) {
-              const metadata = { name: `volleyball_annotations_batch_${Date.now()}.zip`, mimeType: 'application/zip' };
-              const form = new FormData();
-              form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-              form.append('file', blob);
+    if (batchProgress.isRunning && !processingRef.current) {
+      processingRef.current = true;
 
-              fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${googleTokenRef.current}` },
-                body: form
-              })
-              .then(res => {
-                if (res.ok) window.alert('Successfully uploaded batch annotations to Google Drive!');
-                else throw new Error('Upload failed');
-              })
-              .catch(err => {
-                console.error('Drive upload error:', err);
-                window.alert('Failed to upload to Google Drive. The file was still downloaded to your local machine.');
-              });
-            }
-          });
+      const processNextRecursive = async () => {
+        const currentPlaylist = stateRef.current.playlist;
+        const nextIndex = currentPlaylist.findIndex(p => !p.isSkillAlgorithmApplied && (p.file || p.driveUrl));
+        
+        if (nextIndex === -1) {
+          processingRef.current = false;
+          setBatchProgress(prev => ({ ...prev, isRunning: false }));
+          // Load the first video now that batch is done
+          if (currentPlaylist.length > 0 && !videoUrl) {
+            loadVideoIntoPlayer(currentPlaylist[0]);
+          }
+          
+          // Automatically download the batch ZIP when finished!
+          const annotated = currentPlaylist.filter(p => p.events && p.events.length > 0);
+          if (annotated.length > 0) {
+            exportAllToZip(annotated, true).then(blob => {
+              if (blob && googleTokenRef.current) {
+                const metadata = { name: `volleyball_annotations_batch_${Date.now()}.zip`, mimeType: 'application/zip' };
+                const form = new FormData();
+                form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+                form.append('file', blob);
+
+                fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${googleTokenRef.current}` },
+                  body: form
+                })
+                .then(res => {
+                  if (res.ok) window.alert('Successfully uploaded batch annotations to Google Drive!');
+                  else throw new Error('Upload failed');
+                })
+                .catch(err => {
+                  console.error('Drive upload error:', err);
+                  window.alert('Failed to upload to Google Drive. The file was still downloaded to your local machine.');
+                });
+              }
+            });
+          }
+          return;
         }
-        return;
-      }
       
-      const processNext = async () => {
         try {
-          const item = state.playlist[nextIndex];
+          const item = currentPlaylist[nextIndex];
           let fileToInfer = item.file;
           
           if (!fileToInfer && item.driveUrl) {
@@ -345,16 +356,20 @@ function App() {
              return { ...prev, completed: newCompleted, lastFps: fps, avgTimeSec: newAvg };
           });
         } catch (err) {
-          console.error('Batch inference failed for', state.playlist[nextIndex].name, err);
-          window.alert(`Failed to apply algorithm to ${state.playlist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
+          console.error('Batch inference failed for', currentPlaylist[nextIndex].name, err);
+          window.alert(`Failed to apply algorithm to ${currentPlaylist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
+          processingRef.current = false;
           setBatchProgress(prev => ({ ...prev, isRunning: false }));
+          return;
         }
+
+        setTimeout(processNextRecursive, 0);
       };
       
-      processNext();
+      processNextRecursive();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batchProgress.isRunning, state.playlist]);
+  }, [batchProgress.isRunning]);
 
   useEffect(() => {
     if (!batchProgress.isRunning && batchProgress.total > 0 && batchProgress.completed === batchProgress.total && state.playlist.length > 0 && !videoUrl) {
