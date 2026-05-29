@@ -12,10 +12,21 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
 app = FastAPI(title="Volleyball Annotator Inference API")
+
+def get_video_frame_count(path: str) -> int:
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return cnt
+    except Exception:
+        return 0
 
 
 def _cors_origins_from_env() -> list[str]:
@@ -183,6 +194,7 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
             "--batch-size",
             touch_batch_size,
         ]
+        start_time = time.time()
         _run(touch_cmd)
 
         skill_cmd = [
@@ -205,6 +217,11 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
         if skill_gt_xml:
             skill_cmd.extend(["--gt-xml", skill_gt_xml])
         _run(skill_cmd)
+        end_time = time.time()
+
+        duration = end_time - start_time
+        frame_count = get_video_frame_count(str(video_path))
+        fps = round(frame_count / duration, 2) if duration > 0 and frame_count > 0 else 0
 
         if not skill_json.is_file():
             raise HTTPException(status_code=500, detail="Skill inference completed but no JSON output was found.")
@@ -213,4 +230,7 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
         return {
             "video_name": video.filename or "input.mp4",
             "predictions": predictions,
+            "inference_fps": fps,
+            "inference_time_sec": round(duration, 2),
+            "frame_count": frame_count
         }

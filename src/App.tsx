@@ -43,7 +43,7 @@ function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [isRunningTouch, setIsRunningTouch] = useState(false);
   const [isRunningSkill5, setIsRunningSkill5] = useState(false);
-  const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0 });
+  const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0 });
   
   const [state, setState] = useState<AppState>({
     playlist: [],
@@ -236,7 +236,8 @@ function App() {
             return { ...prev, playlist: newPlaylist };
           });
           
-          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
+          const fps = (payload as any).inference_fps || 0;
+          setBatchProgress(prev => ({ ...prev, completed: prev.completed + 1, lastFps: fps }));
         } catch (err) {
           console.error('Batch inference failed for', state.playlist[nextIndex].name, err);
           window.alert(`Failed to apply algorithm to ${state.playlist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
@@ -437,7 +438,8 @@ function App() {
         setBatchProgress({
           isRunning: completed < total,
           completed,
-          total
+          total,
+          lastFps: 0
         });
       }
 
@@ -675,6 +677,7 @@ function App() {
             </div>
             <p style={{ textAlign: 'center', marginTop: '1rem', color: 'rgba(255,255,255,0.7)' }}>
               {Math.round((batchProgress.completed / batchProgress.total) * 100)}% Complete
+              {batchProgress.lastFps > 0 && <span style={{ marginLeft: '15px', color: '#4ade80' }}>({batchProgress.lastFps} FPS)</span>}
             </p>
           </div>
         </div>
