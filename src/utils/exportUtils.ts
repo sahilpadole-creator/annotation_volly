@@ -116,16 +116,20 @@ export const exportToXML = (
   URL.revokeObjectURL(url);
 };
 
-export const exportAllToZip = async (playlist: PlaylistItem[], download = true): Promise<Blob | null> => {
+export const exportAllToZip = async (playlist: PlaylistItem[], download = true, includeMp4 = false): Promise<Blob | null> => {
   const zip = new JSZip();
 
   let hasData = false;
   playlist.forEach(item => {
-    if (item.videoMetadata && item.rally && item.events) {
-      const xml = generateXMLString(item.videoMetadata, item.rally, item.events);
+    if (item.rally && item.events) {
+      const meta = item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 };
+      const xml = generateXMLString(meta, item.rally, item.events);
       const stem = item.name.replace(/\.[^/.]+$/, "");
       zip.file(`annotations_${stem}.xml`, xml);
       
+      if (includeMp4 && item.file) {
+        zip.file(item.file.name, item.file);
+      }
       
       hasData = true;
     }

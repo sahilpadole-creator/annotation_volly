@@ -44,6 +44,7 @@ function App() {
   const [isRunningTouch, setIsRunningTouch] = useState(false);
   const [isRunningSkill5, setIsRunningSkill5] = useState(false);
   const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+  const [includeMp4InZip, setIncludeMp4InZip] = useState(false);
   const googleTokenRef = useRef<string | null>(null);
   
   const [state, setState] = useState<AppState>({
@@ -257,9 +258,9 @@ function App() {
           }
           
           // Automatically download the batch ZIP when finished!
-          const annotated = currentPlaylist.filter(p => p.events && p.events.length > 0);
+          const annotated = currentPlaylist.filter(p => p.isSkillAlgorithmApplied);
           if (annotated.length > 0) {
-            exportAllToZip(annotated, true).then(blob => {
+            exportAllToZip(annotated, true, includeMp4InZip).then(blob => {
               if (blob && googleTokenRef.current) {
                 const metadata = { name: `volleyball_annotations_batch_${Date.now()}.zip`, mimeType: 'application/zip' };
                 const form = new FormData();
@@ -970,16 +971,26 @@ function App() {
             ))}
           </div>
 
-          <button 
-            className="btn" 
-            style={{ marginTop: '1rem' }}
-            onClick={() => {
-              saveCurrentVideoState(); // Save current before exporting
-              exportAllToZip(state.playlist);
-            }}
-          >
-            <Download size={16} /> Batch ZIP
-          </button>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', cursor: 'pointer', color: 'rgba(255,255,255,0.7)' }}>
+              <input 
+                type="checkbox" 
+                checked={includeMp4InZip} 
+                onChange={(e) => setIncludeMp4InZip(e.target.checked)} 
+                style={{ cursor: 'pointer' }}
+              />
+              Include MP4s in ZIP (May freeze browser for large batches)
+            </label>
+            <button 
+              className="btn" 
+              onClick={() => {
+                saveCurrentVideoState(); // Save current before exporting
+                exportAllToZip(state.playlist, true, includeMp4InZip);
+              }}
+            >
+              <Download size={16} /> Batch ZIP
+            </button>
+          </div>
         </div>
       </div>
 
