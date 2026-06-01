@@ -244,10 +244,11 @@ function App() {
   useEffect(() => {
     if (batchProgress.isRunning && !processingRef.current) {
       processingRef.current = true;
+      const processedIds = new Set<string>();
 
       const processNextRecursive = async () => {
         const currentPlaylist = stateRef.current.playlist;
-        const nextIndex = currentPlaylist.findIndex(p => !p.isSkillAlgorithmApplied && (p.file || p.driveUrl));
+        const nextIndex = currentPlaylist.findIndex(p => !p.isSkillAlgorithmApplied && !processedIds.has(p.id) && (p.file || p.driveUrl));
         
         if (nextIndex === -1) {
           processingRef.current = false;
@@ -288,6 +289,7 @@ function App() {
       
         try {
           const item = currentPlaylist[nextIndex];
+          processedIds.add(item.id);
           let fileToInfer = item.file;
           
           if (!fileToInfer && item.driveUrl) {
