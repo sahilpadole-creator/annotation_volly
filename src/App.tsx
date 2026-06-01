@@ -985,7 +985,19 @@ function App() {
               className="btn" 
               onClick={() => {
                 saveCurrentVideoState(); // Save current before exporting
-                exportAllToZip(state.playlist, true, includeMp4InZip);
+                
+                // Construct the updated playlist immediately to ensure the ZIP has the latest manual edits
+                // for the currently viewed video, because setState is asynchronous.
+                const updatedPlaylist = [...state.playlist];
+                if (updatedPlaylist[state.currentPlaylistIndex]) {
+                  updatedPlaylist[state.currentPlaylistIndex] = {
+                    ...updatedPlaylist[state.currentPlaylistIndex],
+                    rally: state.rally,
+                    events: state.events,
+                  };
+                }
+                
+                exportAllToZip(updatedPlaylist, true, includeMp4InZip);
               }}
             >
               <Download size={16} /> Batch ZIP
