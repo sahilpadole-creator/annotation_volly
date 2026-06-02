@@ -520,10 +520,16 @@ function App() {
         console.log(`Extracted ${extractedVideos.length} videos from ZIP.`);
       } catch (e) {
         console.error("Error parsing ZIP", e);
+        window.alert("Failed to read the ZIP file. It may be too large or corrupted.");
       }
     }
 
     const allVideoFiles = [...videoFiles, ...extractedVideos];
+
+    if (allVideoFiles.length === 0) {
+      window.alert("No video files found! Please upload MP4 videos along with your ZIP file, or ensure your ZIP contains MP4s.");
+      return;
+    }
 
     const newPlaylistItems: PlaylistItem[] = [];
 
@@ -890,13 +896,17 @@ function App() {
           </p>
           
           <div className="landing-grid">
-            <label className="landing-option">
+            <label 
+              className="landing-option"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); void handlePlaylistFiles(e.dataTransfer.files); }}
+            >
               <div className="icon-wrapper">
                 <Upload size={32} />
               </div>
               <h3>1. Local Files (No Sync)</h3>
               <p>Drag & drop MP4 or ZIP files</p>
-              <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
+              <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
             </label>
 
             <div className="landing-option">
@@ -910,7 +920,7 @@ function App() {
               ) : (
                 <label className="btn" style={{ width: '100%', cursor: 'pointer', textAlign: 'center', display: 'block', backgroundColor: 'var(--primary)' }}>
                   Now Select Local Videos
-                  <input type="file" accept="video/mp4" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); }} style={{ display: 'none' }} />
+                  <input type="file" accept="video/mp4" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
                 </label>
               )}
             </div>
