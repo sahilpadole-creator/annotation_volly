@@ -531,76 +531,68 @@ function App() {
       return;
     }
 
-    const newPlaylistItems: PlaylistItem[] = [];
-
-    setState(prev => {
-      const newPlaylist: PlaylistItem[] = allVideoFiles.map(file => {
-        const existing = prev.playlist.find(p => p.name === file.name);
-        
-        let itemEvents = existing?.events || [];
-        let itemRally = existing?.rally || { start_frame: null, end_frame: null };
-        let isApplied = existing?.isSkillAlgorithmApplied || false;
-
-        const stem = file.name.replace(/\.[^/.]+$/, '');
-        if (parsedAnnotations[stem]) {
-          itemEvents = parsedAnnotations[stem].events;
-          itemRally = parsedAnnotations[stem].rally;
-          isApplied = true;
-        }
-
-        return {
-          id: file.name + file.lastModified,
-          name: file.name,
-          file: file,
-          events: itemEvents,
-          rally: itemRally,
-          isSkillAlgorithmApplied: isApplied,
-          videoMetadata: existing?.videoMetadata || null,
-          isCompleted: existing?.isCompleted || false,
-          driveFolderId: destinationFolderId || undefined
-        };
-      });
+    const newPlaylistItems: PlaylistItem[] = allVideoFiles.map(file => {
+      const existing = stateRef.current.playlist.find(p => p.name === file.name);
       
-      newPlaylistItems.push(...newPlaylist);
+      let itemEvents = existing?.events || [];
+      let itemRally = existing?.rally || { start_frame: null, end_frame: null };
+      let isApplied = existing?.isSkillAlgorithmApplied || false;
 
-      const total = newPlaylist.length;
-      const completed = newPlaylist.filter(p => p.isSkillAlgorithmApplied).length;
-      
-      if (total > 0) {
-        setBatchProgress({
-          isRunning: completed < total,
-          completed,
-          total,
-          lastFps: 0,
-          avgTimeSec: 0
-        });
+      const stem = file.name.replace(/\.[^/.]+$/, '');
+      if (parsedAnnotations[stem]) {
+        itemEvents = parsedAnnotations[stem].events;
+        itemRally = parsedAnnotations[stem].rally;
+        isApplied = true;
       }
 
-      return { ...prev, playlist: newPlaylist, currentPlaylistIndex: 0 };
+      return {
+        id: file.name + file.lastModified,
+        name: file.name,
+        file: file,
+        events: itemEvents,
+        rally: itemRally,
+        isSkillAlgorithmApplied: isApplied,
+        videoMetadata: existing?.videoMetadata || null,
+        isCompleted: existing?.isCompleted || false,
+        driveFolderId: destinationFolderId || undefined
+      };
     });
 
-    setTimeout(() => {
-      if (newPlaylistItems.length > 0) {
-         const total = newPlaylistItems.length;
-         const completed = newPlaylistItems.filter(p => p.isSkillAlgorithmApplied).length;
-         
-         // Only transition to main screen immediately if NO processing is needed
-         if (completed === total) {
-           const item = newPlaylistItems[0];
-           if (item.file) {
-             const url = URL.createObjectURL(item.file);
-             setVideoUrl(url);
-           }
-           setState(prev => ({
-             ...prev,
-             videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
-             rally: item.rally || { start_frame: null, end_frame: null },
-             events: item.events || [],
-             currentFrame: 0
-           }));
-         }
+    const total = newPlaylistItems.length;
+    const completed = newPlaylistItems.filter(p => p.isSkillAlgorithmApplied).length;
+    
+    if (total > 0) {
+      setBatchProgress({
+        isRunning: completed < total,
+        completed,
+        total,
+        lastFps: 0,
+        avgTimeSec: 0
+      });
+    }
+
+    if (completed === total && total > 0) {
+      const item = newPlaylistItems[0];
+      if (item.file) {
+        const url = URL.createObjectURL(item.file);
+        setVideoUrl(url);
       }
-    }, 0);
+      setState(prev => ({
+        ...prev,
+        playlist: newPlaylistItems,
+        currentPlaylistIndex: 0,
+        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
+        rally: item.rally || { start_frame: null, end_frame: null },
+        events: item.events || [],
+        currentFrame: 0
+      }));
+    } else {
+      setState(prev => ({
+        ...prev,
+        playlist: newPlaylistItems,
+        currentPlaylistIndex: 0
+      }));
+    }
   };
 
   const handleDrivePlaylist = async (playlist: PlaylistItem[]) => {
