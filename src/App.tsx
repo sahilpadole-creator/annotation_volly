@@ -453,7 +453,7 @@ function App() {
         const parsed = JSON.parse(saved);
         if (parsed.state) {
           // If we have a playlist, don't load the object URLs directly, just metadata
-          setState({ ...parsed.state, currentFrame: 0 });
+          setState({ ...parsed.state, currentFrame: parsed.state.currentFrame || 0 });
         }
       } catch (e) {
         console.error("Failed to parse local storage", e);
@@ -464,10 +464,22 @@ function App() {
   // Autosave
   useEffect(() => {
     if (state.playlist.length > 0 || state.videoMetadata) {
+      // Keep playlist in sync with current events before saving
+      const currentPlaylist = [...state.playlist];
+      if (currentPlaylist.length > 0 && currentPlaylist[state.currentPlaylistIndex]) {
+        currentPlaylist[state.currentPlaylistIndex] = {
+           ...currentPlaylist[state.currentPlaylistIndex],
+           events: state.events,
+           rally: state.rally,
+           videoMetadata: state.videoMetadata,
+           isCompleted: (state.rally.start_frame !== null && state.rally.end_frame !== null)
+        };
+      }
+
       // Don't save Object URLs or File objects to localStorage
       const stateToSave = {
         ...state,
-        playlist: state.playlist.map(item => ({ ...item, file: undefined }))
+        playlist: currentPlaylist.map(item => ({ ...item, file: undefined }))
       };
       localStorage.setItem('volleyball_annotations', JSON.stringify({ state: stateToSave }));
     }
@@ -577,6 +589,10 @@ function App() {
         const url = URL.createObjectURL(item.file);
         setVideoUrl(url);
       }
+      
+      const isRestoring = stateRef.current.videoMetadata?.filename === item.name;
+      const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
+      
       setState(prev => ({
         ...prev,
         playlist: newPlaylistItems,
@@ -584,7 +600,7 @@ function App() {
         videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
         rally: item.rally || { start_frame: null, end_frame: null },
         events: item.events || [],
-        currentFrame: 0
+        currentFrame: savedFrame
       }));
     } else {
       setState(prev => ({
@@ -700,6 +716,10 @@ function App() {
       if (isNaN(duration)) return;
       
       const fps = state.videoMetadata.fps;
+      
+      if (state.currentFrame > 0) {
+        v.currentTime = state.currentFrame / fps;
+      }
       
       setState(prev => ({
         ...prev,
