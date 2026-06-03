@@ -552,9 +552,14 @@ function App() {
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
       if (parsedAnnotations[stem]) {
-        itemEvents = parsedAnnotations[stem].events;
-        itemRally = parsedAnnotations[stem].rally;
-        isApplied = true;
+        // Only use ZIP annotations if we don't have autosaved progress for this video,
+        // or if the autosaved progress is completely empty.
+        // This prevents overwriting the user's manual corrections when they re-upload the ZIP.
+        if (!existing || (!existing.isSkillAlgorithmApplied && (!existing.events || existing.events.length === 0))) {
+          itemEvents = parsedAnnotations[stem].events;
+          itemRally = parsedAnnotations[stem].rally;
+          isApplied = true;
+        }
       }
 
       return {
