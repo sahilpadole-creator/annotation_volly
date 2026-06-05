@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
-import type { AppState, SkillLabel, PlaylistItem } from './types';
-import { exportToXML, exportAllToZip, generateXMLString } from './utils/exportUtils';
+import type { AppState, SkillLabel, PlaylistItem, SkillEvent } from './types';
+import { exportToXML, exportAllToZip, generateXMLString, exportUpdatedJSON } from './utils/exportUtils';
 import { GoogleDriveConnector } from './components/GoogleDriveConnector';
-import { parseZIPAnnotations, parseXMLAnnotations } from './utils/importUtils';
+import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations } from './utils/importUtils';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
@@ -54,7 +54,11 @@ function App() {
     rally: { start_frame: null, end_frame: null },
     events: [],
     currentFrame: 0,
+    playerBoxes: {},
+    manualActions: [],
   });
+
+  const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const [destinationFolderId, setDestinationFolderId] = useState<string | null>(null);
@@ -132,15 +136,85 @@ function App() {
       }
     }
     const finalEvents = keptEvents.sort((a, b) => a.frame - b.frame);
-
     const startFrame = payload?.rally?.start_frame ?? payload?.start_frame ?? null;
     const endFrame = payload?.rally?.end_frame ?? payload?.end_frame ?? null;
+    
+    console.log(`[parsePredictionsFile] Parsed ${finalEvents.length} events from payload.`);
 
     return {
       events: finalEvents,
       startFrame: typeof startFrame === 'number' ? startFrame : null,
       endFrame: typeof endFrame === 'number' ? endFrame : null,
     };
+  };
+
+  const applySkillHeuristics = (events: SkillEvent[]): SkillEvent[] => {
+    if (events.length === 0) return events;
+
+    let modified = JSON.parse(JSON.stringify(events)) as SkillEvent[];
+
+    // Helper to update skill and its associated class_id
+    const updateSkill = (event: SkillEvent, newSkill: string) => {
+      event.skill = newSkill as SkillLabel;
+      if (LABEL_TO_SKILL[newSkill]) {
+        event.class_id = LABEL_TO_SKILL[newSkill].classId;
+      }
+    };
+
+    // Rule 4: Remove consecutive duplicates of toss, serve, attack/block
+    let i = 0;
+    while (i < modified.length - 1) {
+      const current = modified[i];
+      const next = modified[i + 1];
+      
+      const isTargetSkill = ['toss', 'serve', 'attack', 'block'].includes(current.skill);
+      
+      if (current.skill === next.skill && isTargetSkill) {
+        const conf1 = current.confidence ?? 1.0;
+        const conf2 = next.confidence ?? 1.0;
+        
+        if (conf1 >= conf2) {
+          modified.splice(i + 1, 1);
+        } else {
+          modified.splice(i, 1);
+          continue; // check the new current element
+        }
+      } else {
+        i++;
+      }
+    }
+
+    for (let i = 0; i < modified.length; i++) {
+      // 3-skill window (Rule 2 & 3)
+      if (i <= modified.length - 3) {
+        const e1 = modified[i];
+        const e2 = modified[i+1];
+        const e3 = modified[i+2];
+
+        // Rule 3: toss -> serve -> set/dig becomes toss -> serve -> reception
+        if (e1.skill === 'toss' && e2.skill === 'serve' && (e3.skill === 'set' || e3.skill === 'dig')) {
+          updateSkill(e3, 'reception');
+        }
+
+        // Rule 2: reception/dig -> dig -> attack/block becomes reception/dig -> set -> attack/block
+        if ((e1.skill === 'reception' || e1.skill === 'dig') && e2.skill === 'dig' && (e3.skill === 'attack' || e3.skill === 'block')) {
+          updateSkill(e2, 'set');
+        }
+      }
+      
+      // 2-skill window (Rule 1)
+      if (i <= modified.length - 2) {
+        const e1 = modified[i];
+        const e2 = modified[i+1];
+        
+        // Rule 1: reception -> dig becomes reception -> set
+        if (e1.skill === 'reception' && e2.skill === 'dig') {
+          updateSkill(e2, 'set');
+        }
+      }
+    }
+
+    return modified;
   };
 
   const applyImportedPredictions = (parsed: PredictionImportPayload, sourceName: string) => {
@@ -166,10 +240,11 @@ function App() {
       }
       
       const deduplicated = keptEvents.sort((a, b) => a.frame - b.frame);
+      const heuristicallyCorrected = applySkillHeuristics(deduplicated);
 
       return {
         ...prev,
-        events: deduplicated,
+        events: heuristicallyCorrected,
         rally: {
           start_frame: startFrame ?? prev.rally.start_frame,
           end_frame: endFrame ?? prev.rally.end_frame,
@@ -301,9 +376,12 @@ function App() {
           const payload = await inferSingleVideo(fileToInfer!);
           const { events, startFrame, endFrame } = parsePredictionsFile(payload);
           
+          const heuristicallyCorrected = applySkillHeuristics(events);
+          console.log(`[batch] Original events: ${events.length}, Corrected events: ${heuristicallyCorrected.length}`);
+          
           const updatedItem = {
             ...item,
-            events: events,
+            events: heuristicallyCorrected,
             rally: {
               start_frame: startFrame ?? item.rally?.start_frame ?? null,
               end_frame: endFrame ?? item.rally?.end_frame ?? null
@@ -319,7 +397,7 @@ function App() {
               return {
                 ...prev,
                 playlist: newPlaylist,
-                events: events,
+                events: heuristicallyCorrected,
                 rally: updatedItem.rally
               };
             }
@@ -331,7 +409,7 @@ function App() {
             const xml = generateXMLString(
               item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
               updatedItem.rally,
-              events
+              heuristicallyCorrected
             );
             const xmlBlob = new Blob([xml], { type: 'application/xml' });
             const xmlFilename = `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml`;
@@ -453,7 +531,11 @@ function App() {
         const parsed = JSON.parse(saved);
         if (parsed.state) {
           // If we have a playlist, don't load the object URLs directly, just metadata
-          setState({ ...parsed.state, currentFrame: parsed.state.currentFrame || 0 });
+          setState({ 
+            ...parsed.state, 
+            currentFrame: parsed.state.currentFrame || 0,
+            manualActions: parsed.state.manualActions || [] 
+          });
         }
       } catch (e) {
         console.error("Failed to parse local storage", e);
@@ -471,15 +553,22 @@ function App() {
            ...currentPlaylist[state.currentPlaylistIndex],
            events: state.events,
            rally: state.rally,
+           manualActions: state.manualActions,
            videoMetadata: state.videoMetadata,
            isCompleted: (state.rally.start_frame !== null && state.rally.end_frame !== null)
         };
       }
 
-      // Don't save Object URLs or File objects to localStorage
+      // Don't save Object URLs, File objects, or large JSON data to localStorage
       const stateToSave = {
         ...state,
-        playlist: currentPlaylist.map(item => ({ ...item, file: undefined }))
+        playerBoxes: {}, // Exclude from autosave
+        playlist: currentPlaylist.map(item => ({ 
+          ...item, 
+          file: undefined,
+          rawJsonString: undefined, // Exclude from autosave
+          playerBoxes: undefined, // Exclude from autosave
+        }))
       };
       localStorage.setItem('volleyball_annotations', JSON.stringify({ state: stateToSave }));
     }
@@ -510,6 +599,8 @@ function App() {
       },
       rally: item.rally || { start_frame: null, end_frame: null },
       events: item.events || [],
+      playerBoxes: item.playerBoxes || {},
+      manualActions: item.manualActions || [],
       currentFrame: 0
     }));
   };
@@ -520,19 +611,33 @@ function App() {
     const fileArray = Array.from(files);
     const videoFiles = fileArray.filter(f => f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mp4'));
     const zipFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.zip'));
+    const jsonFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.json'));
     
     let parsedAnnotations: Record<string, any> = {};
+    let parsedJsonAnnotations: Record<string, any> = {};
     let extractedVideos: File[] = [];
     if (zipFiles.length > 0) {
       try {
         const result = await parseZIPAnnotations(zipFiles[0]);
         parsedAnnotations = result.annotations;
+        parsedJsonAnnotations = result.jsonAnnotations || {};
         extractedVideos = result.videos;
         console.log(`Loaded annotations for ${Object.keys(parsedAnnotations).length} videos from ZIP.`);
         console.log(`Extracted ${extractedVideos.length} videos from ZIP.`);
       } catch (e) {
         console.error("Error parsing ZIP", e);
         window.alert("Failed to read the ZIP file. It may be too large or corrupted.");
+      }
+    }
+
+    for (const jsonFile of jsonFiles) {
+      try {
+        const text = await jsonFile.text();
+        const result = parseJSONAnnotations(text, []);
+        const stem = jsonFile.name.replace(/\.json$/i, '');
+        parsedJsonAnnotations[stem] = result;
+      } catch (err) {
+        console.error(`Failed to parse standalone JSON: ${jsonFile.name}`, err);
       }
     }
 
@@ -549,6 +654,15 @@ function App() {
       let itemEvents = existing?.events || [];
       let itemRally = existing?.rally || { start_frame: null, end_frame: null };
       let isApplied = existing?.isSkillAlgorithmApplied || false;
+      let itemPlayerBoxes = existing?.playerBoxes || {};
+      let itemRawJson = existing?.rawJsonString || undefined;
+      let itemManualActions = existing?.manualActions || [];
+
+      // Failsafe: if the app claims the algorithm was applied but there are no events, 
+      // it was likely stuck in a bugged state from a previous session. Reset it.
+      if (isApplied && itemEvents.length === 0) {
+        isApplied = false;
+      }
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
       if (parsedAnnotations[stem]) {
@@ -561,6 +675,28 @@ function App() {
           isApplied = true;
         }
       }
+      
+      let jsonKey = stem;
+      if (!parsedJsonAnnotations[jsonKey]) {
+        // Try fuzzy matching: check if any json key starts with the video stem case-insensitively
+        const lowerStem = stem.toLowerCase();
+        const possibleKey = Object.keys(parsedJsonAnnotations).find(k => {
+          const lowerK = k.toLowerCase();
+          return lowerK.startsWith(lowerStem) || lowerStem.startsWith(lowerK);
+        });
+        if (possibleKey) jsonKey = possibleKey;
+      }
+      
+      if (parsedJsonAnnotations[jsonKey]) {
+        // If there are existing manual actions for this video, we re-parse to apply them
+        const parsedResult = itemManualActions.length > 0 
+          ? parseJSONAnnotations(parsedJsonAnnotations[jsonKey].rawJsonString, itemManualActions)
+          : parsedJsonAnnotations[jsonKey];
+          
+        itemPlayerBoxes = parsedResult.parsed;
+        itemRawJson = parsedResult.rawJsonString;
+        // Do NOT set isApplied = true here, because we still want to run the skill inference algorithm on the backend!
+      }
 
       return {
         id: file.name + file.lastModified,
@@ -568,6 +704,9 @@ function App() {
         file: file,
         events: itemEvents,
         rally: itemRally,
+        playerBoxes: itemPlayerBoxes,
+        rawJsonString: itemRawJson,
+        manualActions: itemManualActions,
         isSkillAlgorithmApplied: isApplied,
         videoMetadata: existing?.videoMetadata || null,
         isCompleted: existing?.isCompleted || false,
@@ -605,6 +744,7 @@ function App() {
         videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
         rally: item.rally || { start_frame: null, end_frame: null },
         events: item.events || [],
+        playerBoxes: item.playerBoxes || {},
         currentFrame: savedFrame
       }));
     } else {
@@ -688,6 +828,7 @@ function App() {
           videoMetadata: prev.videoMetadata,
           rally: prev.rally,
           events: prev.events,
+          manualActions: prev.manualActions,
           isCompleted: (prev.rally.start_frame !== null && prev.rally.end_frame !== null)
         };
       }
@@ -829,6 +970,31 @@ function App() {
       } else if (key === 'delete' || key === 'backspace') {
         deleteCurrentFrameData();
         e.preventDefault();
+      } else if (key === 'a') {
+        if (selectedTrackId !== null) {
+          setState(prev => {
+            const currentActions = prev.manualActions || [];
+            const filtered = currentActions.filter(m => !(m.frame === prev.currentFrame && m.track_id === selectedTrackId));
+            const newActions = [...filtered, { frame: prev.currentFrame, track_id: selectedTrackId }];
+            
+            // Re-parse the playerBoxes with the new actions
+            const playlistItem = prev.playlist[prev.currentPlaylistIndex];
+            let newBoxes = prev.playerBoxes;
+            if (playlistItem?.rawJsonString) {
+              const res = parseJSONAnnotations(playlistItem.rawJsonString, newActions);
+              newBoxes = res.parsed;
+            }
+            
+            return {
+              ...prev,
+              manualActions: newActions,
+              playerBoxes: newBoxes
+            };
+          });
+        } else {
+          window.alert("Please click on a player's bounding box first to select them, then press 'A'.");
+        }
+        e.preventDefault();
       } else if (key === 'arrowleft') {
         seekToFrame(state.currentFrame - 1);
         e.preventDefault();
@@ -852,7 +1018,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [state.currentFrame, seekToFrame]);
+  }, [state.currentFrame, seekToFrame, selectedTrackId]);
 
   const getValidationWarnings = () => {
     const warnings: { type: string, msg: string }[] = [];
@@ -868,6 +1034,55 @@ function App() {
   };
 
   const warnings = getValidationWarnings();
+
+  // Calculate active frame ranges from the JSON data
+  const activeRanges = useMemo(() => {
+    if (!state.playerBoxes) return [];
+    
+    // Group active frames by track_id
+    const trackActiveFrames: Record<number, number[]> = {};
+    
+    Object.keys(state.playerBoxes).forEach(frameStr => {
+      const frame = parseInt(frameStr, 10);
+      const boxes = state.playerBoxes[frame];
+      if (boxes) {
+        boxes.forEach(box => {
+          if (box.is_active) {
+            if (!trackActiveFrames[box.track_id]) trackActiveFrames[box.track_id] = [];
+            trackActiveFrames[box.track_id].push(frame);
+          }
+        });
+      }
+    });
+    
+    // Convert to contiguous ranges
+    const ranges: { trackId: number, start: number, end: number }[] = [];
+    
+    Object.entries(trackActiveFrames).forEach(([trackIdStr, frames]) => {
+      const trackId = parseInt(trackIdStr, 10);
+      frames.sort((a, b) => a - b);
+      
+      if (frames.length === 0) return;
+      
+      let currentStart = frames[0];
+      let currentEnd = frames[0];
+      
+      for (let i = 1; i < frames.length; i++) {
+        const frame = frames[i];
+        if (frame === currentEnd + 1) {
+          currentEnd = frame;
+        } else {
+          ranges.push({ trackId, start: currentStart, end: currentEnd });
+          currentStart = frame;
+          currentEnd = frame;
+        }
+      }
+      ranges.push({ trackId, start: currentStart, end: currentEnd });
+    });
+    
+    // Sort by start frame
+    return ranges.sort((a, b) => a.start - b.start);
+  }, [state.playerBoxes]);
 
   if (!videoUrl) {
     if (batchProgress.total > 0 && batchProgress.isRunning) {
@@ -922,8 +1137,8 @@ function App() {
                 <Upload size={32} />
               </div>
               <h3>1. Local Files (No Sync)</h3>
-              <p>Drag & drop MP4 or ZIP files</p>
-              <input type="file" accept="video/mp4,application/zip,.zip" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
+              <p>Drag & drop MP4, ZIP, or JSON files</p>
+              <input type="file" accept="video/mp4,application/zip,.zip,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
             </label>
 
             <div className="landing-option">
@@ -937,7 +1152,7 @@ function App() {
               ) : (
                 <label className="btn" style={{ width: '100%', cursor: 'pointer', textAlign: 'center', display: 'block', backgroundColor: 'var(--primary)' }}>
                   Now Select Local Videos
-                  <input type="file" accept="video/mp4" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
+                  <input type="file" accept="video/mp4,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
                 </label>
               )}
             </div>
@@ -966,7 +1181,7 @@ function App() {
             <button 
               className="btn outline icon-only" 
               onClick={() => {
-                setState({ playlist: [], currentPlaylistIndex: 0, videoMetadata: null, rally: { start_frame: null, end_frame: null }, events: [], currentFrame: 0 });
+                setState({ playlist: [], currentPlaylistIndex: 0, videoMetadata: null, rally: { start_frame: null, end_frame: null }, events: [], currentFrame: 0, playerBoxes: {}, manualActions: [] });
                 setVideoUrl('');
                 setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
               }}
@@ -1031,6 +1246,21 @@ function App() {
             >
               <Download size={16} /> Batch ZIP
             </button>
+
+            {state.playlist[state.currentPlaylistIndex]?.rawJsonString && (
+              <button 
+                className="btn" 
+                style={{ backgroundColor: 'var(--color-serve)', marginTop: '0.5rem' }}
+                onClick={() => {
+                  const item = state.playlist[state.currentPlaylistIndex];
+                  if (item?.rawJsonString) {
+                    exportUpdatedJSON(item.rawJsonString, state.manualActions, item.name, includeMp4InZip, item.file);
+                  }
+                }}
+              >
+                <Download size={16} /> Download JSON
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1045,7 +1275,61 @@ function App() {
             onTimeUpdate={handleTimeUpdate}
             controls={false}
             crossOrigin="anonymous" // Needed for Drive URLs if they support it
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
+          {state.videoMetadata && state.playerBoxes && state.playerBoxes[state.currentFrame] && (
+            <svg 
+              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 5 }}
+              viewBox={`0 0 ${state.videoMetadata.width || 1280} ${state.videoMetadata.height || 720}`}
+              preserveAspectRatio="xMidYMid meet"
+            >
+              {state.playerBoxes[state.currentFrame].map((box, idx) => {
+                const isSelected = selectedTrackId === box.track_id;
+                const color = box.is_active ? '#4ade80' : '#ef4444';
+                return (
+                  <g 
+                    key={idx} 
+                    style={{ pointerEvents: 'auto', cursor: 'pointer' }}
+                    onClick={() => setSelectedTrackId(box.track_id)}
+                  >
+                    {/* Invisible larger rect to make clicking easier */}
+                    <rect 
+                      x={box.x_min - 10} 
+                      y={box.y_min - 10} 
+                      width={(box.x_max - box.x_min) + 20} 
+                      height={(box.y_max - box.y_min) + 20} 
+                      fill="transparent" 
+                    />
+                    <rect 
+                      x={box.x_min} 
+                      y={box.y_min} 
+                      width={box.x_max - box.x_min} 
+                      height={box.y_max - box.y_min} 
+                      fill={isSelected ? 'rgba(255,255,255,0.2)' : 'none'} 
+                      stroke={isSelected ? '#fff' : color} 
+                      strokeWidth={isSelected ? "6" : "4"} 
+                    />
+                    <rect 
+                      x={box.x_min - 2} 
+                      y={box.y_min - 22} 
+                      width="50" 
+                      height="22" 
+                      fill={isSelected ? '#fff' : color} 
+                    />
+                    <text 
+                      x={box.x_min + 4} 
+                      y={box.y_min - 6} 
+                      fill={isSelected ? '#000' : '#fff'} 
+                      fontSize="14" 
+                      fontWeight="bold"
+                    >
+                      ID: {box.track_id}
+                    </text>
+                  </g>
+                );
+              })}
+            </svg>
+          )}
           {(() => {
             const activeEvent = state.events.find(e => e.frame === state.currentFrame);
             if (activeEvent) {
@@ -1164,8 +1448,8 @@ function App() {
         </div>
 
         {/* TIMELINE */}
-        <div className="glass-panel timeline">
-          <div className="timeline-track">
+        <div className="glass-panel timeline" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', padding: '0.8rem' }}>
+          <div className="timeline-track" style={{ position: 'relative', width: '100%', height: '30px' }}>
             {state.rally.start_frame !== null && state.videoMetadata && (
               <div 
                 className="timeline-marker" 
@@ -1182,14 +1466,81 @@ function App() {
                 onClick={() => seekToFrame(state.rally.end_frame!)}
               />
             )}
-            {state.videoMetadata && state.events.map(event => (
+            
+            {/* Active window blocks on the timeline */}
+            {state.videoMetadata && activeRanges.map((range, idx) => {
+              const startPct = (range.start / state.videoMetadata!.frame_count) * 100;
+              const widthPct = ((range.end - range.start) / state.videoMetadata!.frame_count) * 100;
+              return (
+                <div
+                  key={`active-win-${idx}`}
+                  style={{
+                    position: 'absolute',
+                    left: `${startPct}%`,
+                    width: `${Math.max(widthPct, 0.2)}%`,
+                    height: '100%',
+                    backgroundColor: 'rgba(74, 222, 128, 0.3)',
+                    borderLeft: '1px solid #4ade80',
+                    borderRight: '1px solid #4ade80',
+                    top: 0,
+                    cursor: 'pointer',
+                    zIndex: 1
+                  }}
+                  title={`Player ${range.trackId} active: ${range.start} to ${range.end}`}
+                  onClick={() => seekToFrame(range.start)}
+                />
+              )
+            })}
+
+            {state.videoMetadata && state.events.map(event => {
+              const abbreviation = {
+                'toss': 'T',
+                'serve': 'Sr',
+                'reception': 'R',
+                'set': 'St',
+                'dig': 'D',
+                'attack': 'A',
+                'block': 'B'
+              }[event.skill] || event.skill.charAt(0).toUpperCase();
+
+              return (
+                <div 
+                  key={event.frame}
+                  className="timeline-skill-marker" 
+                  style={{ 
+                    left: `${state.videoMetadata!.frame_count > 0 ? (event.frame / state.videoMetadata!.frame_count) * 100 : 0}%`, 
+                    backgroundColor: `var(--color-${event.skill})`, 
+                    zIndex: 2 
+                  }}
+                  title={`${event.skill} at frame ${event.frame}`}
+                  onClick={() => seekToFrame(event.frame)}
+                >
+                  {abbreviation}
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem', maxHeight: '150px', overflowY: 'auto', paddingRight: '4px' }}>
+            {activeRanges.length === 0 && <span style={{ color: '#64748b' }}>No active players...</span>}
+            {activeRanges.map((range, idx) => (
               <div 
-                key={event.frame}
-                className="timeline-marker" 
-                style={{ left: `${(event.frame / state.videoMetadata!.frame_count) * 100}%`, backgroundColor: `var(--color-${event.skill})` }}
-                title={`${event.skill} at frame ${event.frame}`}
-                onClick={() => seekToFrame(event.frame)}
-              />
+                key={idx} 
+                style={{ 
+                  background: 'rgba(74, 222, 128, 0.15)', 
+                  border: '1px solid rgba(74, 222, 128, 0.4)', 
+                  padding: '4px 10px', 
+                  borderRadius: '6px', 
+                  cursor: 'pointer',
+                  transition: 'background 0.2s',
+                }}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(74, 222, 128, 0.3)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(74, 222, 128, 0.15)'}
+                onClick={() => seekToFrame(range.start)}
+                title="Click to jump to this action"
+              >
+                <strong style={{ color: '#4ade80' }}>Player {range.trackId}:</strong> {range.start} - {range.end}
+              </div>
             ))}
           </div>
         </div>
@@ -1233,6 +1584,7 @@ function App() {
             <div><span className="hotkey">6</span> Attack/Block</div>
             <div><span className="hotkey">S</span> Start Rally</div>
             <div><span className="hotkey">E</span> End Rally</div>
+            <div><span className="hotkey">A</span> Active Player</div>
             <div><span className="hotkey">Del</span> Clear Frame</div>
           </div>
         </div>

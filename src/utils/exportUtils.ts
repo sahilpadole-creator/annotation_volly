@@ -37,6 +37,100 @@ export const exportToJSON = (
   URL.revokeObjectURL(url);
 };
 
+export const getUpdatedJSONString = (
+  rawJsonString: string,
+  manualActions: { frame: number; track_id: number }[]
+): string | null => {
+  try {
+    const data = JSON.parse(rawJsonString);
+    if (!data.players && !data.tracks) return null;
+    
+    if (data.tracks && Array.isArray(data.tracks)) {
+      // New format
+      manualActions.forEach(mAct => {
+        const track = data.tracks.find((t: any) => t.track_id === mAct.track_id);
+        if (track && track.frames) {
+          const frameObj = track.frames.find((f: any) => f.frame_num === mAct.frame);
+          if (frameObj) {
+            frameObj.ball_carrier = true;
+          } else {
+            // Push a dummy frame if it doesn't exist to register the action
+            track.frames.push({
+               frame_num: mAct.frame,
+               x: 0, y: 0, w: 0, h: 0, conf: 1.0,
+               ball_carrier: true
+            });
+            // Sort frames
+            track.frames.sort((a: any, b: any) => a.frame_num - b.frame_num);
+          }
+        }
+      });
+    } else {
+      // Old format
+      manualActions.forEach(mAct => {
+        const pKey = `player_${mAct.track_id}`;
+        if (!data.players[pKey]) data.players[pKey] = {};
+        if (!data.players[pKey].action) data.players[pKey].action = [];
+        
+        // Check if it already exists to avoid duplicates
+        const exists = data.players[pKey].action.some((a: any) => a.frame === mAct.frame);
+        if (!exists) {
+          data.players[pKey].action.push({
+            frame: mAct.frame,
+            skill: "manual_active",
+            side: "unknown"
+          });
+        }
+      });
+    }
+    
+    return JSON.stringify(data, null, 2);
+  } catch (e) {
+    console.error("Failed to parse JSON for update", e);
+    return null;
+  }
+};
+
+export const exportUpdatedJSON = async (
+  rawJsonString: string,
+  manualActions: { frame: number; track_id: number }[],
+  filename: string,
+  includeMp4: boolean = false,
+  videoFile?: File
+) => {
+  try {
+    const updatedJsonString = getUpdatedJSONString(rawJsonString, manualActions);
+    if (!updatedJsonString) return;
+
+    const stem = filename.replace(/\.[^/.]+$/, "");
+    
+    if (includeMp4 && videoFile) {
+      const zip = new JSZip();
+      zip.file(`${stem}_updated.json`, updatedJsonString);
+      zip.file(videoFile.name, videoFile);
+      
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${stem}_updated_data.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } else {
+      const blob = new Blob([updatedJsonString], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${stem}_updated.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  } catch (e) {
+    console.error("Failed to export updated JSON", e);
+    alert("Failed to export updated JSON. See console for details.");
+  }
+};
+
 export const generateXMLString = (
   metadata: VideoMetadata,
   rally: Rally,
@@ -121,17 +215,32 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
 
   let hasData = false;
   playlist.forEach(item => {
-    if (item.rally && item.events) {
+    let itemHasData = false;
+    const stem = item.name.replace(/\.[^/.]+$/, "");
+    
+    // Add XML annotations if available
+    if (item.rally && item.events && item.events.length > 0) {
       const meta = item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 };
       const xml = generateXMLString(meta, item.rally, item.events);
-      const stem = item.name.replace(/\.[^/.]+$/, "");
       zip.file(`annotations_${stem}.xml`, xml);
-      
+      itemHasData = true;
+    }
+    
+    // Add updated JSON if available
+    if (item.rawJsonString) {
+      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || []);
+      if (updatedJsonString) {
+        zip.file(`${stem}_updated.json`, updatedJsonString);
+        itemHasData = true;
+      }
+    }
+    
+    // Add MP4 if requested and we have some annotation data for it
+    if (itemHasData) {
+      hasData = true;
       if (includeMp4 && item.file) {
         zip.file(item.file.name, item.file);
       }
-      
-      hasData = true;
     }
   });
 

@@ -22,6 +22,15 @@ export interface VideoMetadata {
   frame_count: number;
 }
 
+export interface PlayerBox {
+  x_min: number;
+  y_min: number;
+  x_max: number;
+  y_max: number;
+  track_id: number;
+  is_active: boolean;
+}
+
 export interface PlaylistItem {
   id: string;
   name: string;
@@ -32,6 +41,9 @@ export interface PlaylistItem {
   videoMetadata?: VideoMetadata | null;
   rally?: Rally;
   events?: SkillEvent[];
+  playerBoxes?: Record<number, PlayerBox[]>;
+  rawJsonString?: string;
+  manualActions?: { frame: number; track_id: number }[];
   isCompleted?: boolean;
   isSkillAlgorithmApplied?: boolean;
 }
@@ -42,5 +54,8 @@ export interface AppState {
   videoMetadata: VideoMetadata | null;
   rally: Rally;
   events: SkillEvent[];
+  playerBoxes: Record<number, PlayerBox[]>;
+  rawJsonString?: string;
+  manualActions: { frame: number; track_id: number }[];
   currentFrame: number;
 }

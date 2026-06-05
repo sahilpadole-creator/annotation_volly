@@ -1,10 +1,143 @@
 import JSZip from 'jszip';
-import type { SkillEvent, Rally, SkillLabel } from '../types';
+import type { SkillEvent, Rally, SkillLabel, PlayerBox } from '../types';
 
 export interface ParsedAnnotations {
   rally: Rally;
   events: SkillEvent[];
 }
+
+export const parseJSONAnnotations = (
+  jsonString: string, 
+  manualActions: { frame: number; track_id: number }[] = []
+): { parsed: Record<number, PlayerBox[]>, rawJsonString: string } => {
+  try {
+    const data = JSON.parse(jsonString);
+    const playerBoxes: Record<number, PlayerBox[]> = {};
+    
+    // Check if new format with 'tracks' array
+    if (data.tracks && Array.isArray(data.tracks)) {
+      data.tracks.forEach((track: any) => {
+        const trackId = track.track_id;
+        const activeFrames = new Set<number>();
+        
+        // Track actions (ball_carrier)
+        if (track.frames && Array.isArray(track.frames)) {
+          track.frames.forEach((f: any) => {
+            if (f.ball_carrier === true) {
+              // Add a window of +/- 10 frames (20 frames total)
+              for (let i = f.frame_num - 10; i <= f.frame_num + 10; i++) {
+                activeFrames.add(i);
+              }
+            }
+          });
+        }
+        
+        // Manual actions
+        manualActions.forEach(mAct => {
+          if (mAct.track_id === trackId) {
+            for (let i = mAct.frame - 10; i <= mAct.frame + 10; i++) {
+              activeFrames.add(i);
+            }
+          }
+        });
+        
+        if (track.frames && Array.isArray(track.frames)) {
+          track.frames.forEach((f: any) => {
+             const frame_idx = f.frame_num;
+             const x_min = f.x;
+             const y_min = f.y;
+             const x_max = f.x + f.w;
+             const y_max = f.y + f.h;
+             
+             if (x_max > x_min && y_max > y_min) {
+               if (!playerBoxes[frame_idx]) {
+                 playerBoxes[frame_idx] = [];
+               }
+               
+               playerBoxes[frame_idx].push({
+                 x_min,
+                 y_min,
+                 x_max,
+                 y_max,
+                 track_id: trackId,
+                 is_active: activeFrames.has(frame_idx)
+               });
+             }
+          });
+        }
+      });
+      
+      return { parsed: playerBoxes, rawJsonString: jsonString };
+    }
+
+    // Otherwise, process old format: data.players
+    const players = data.players || {};
+    for (const [pKey, pData] of Object.entries(players)) {
+      const anyData = pData as any;
+      let trackId = -1;
+      try {
+        trackId = parseInt(pKey.split('_')[1], 10);
+      } catch {
+        // ignore
+      }
+      
+      const activeFrames = new Set<number>();
+      
+      if (anyData.action && Array.isArray(anyData.action)) {
+        anyData.action.forEach((act: any) => {
+          if (act && typeof act.frame === 'number') {
+            for (let f = act.frame - 10; f <= act.frame + 10; f++) {
+              activeFrames.add(f);
+            }
+          }
+        });
+      }
+
+      manualActions.forEach(mAct => {
+        if (mAct.track_id === trackId) {
+          for (let f = mAct.frame - 10; f <= mAct.frame + 10; f++) {
+            activeFrames.add(f);
+          }
+        }
+      });
+      
+      const x_min_list = anyData.x_min || [];
+      const y_min_list = anyData.y_min || [];
+      const x_max_list = anyData.x_max || [];
+      const y_max_list = anyData.y_max || [];
+      
+      const maxLen = Math.min(x_min_list.length, y_min_list.length, x_max_list.length, y_max_list.length);
+      
+      for (let frame_idx = 0; frame_idx < maxLen; frame_idx++) {
+        const x_min = x_min_list[frame_idx];
+        const y_min = y_min_list[frame_idx];
+        const x_max = x_max_list[frame_idx];
+        const y_max = y_max_list[frame_idx];
+        
+        if (x_max > x_min && y_max > y_min) {
+          if (!playerBoxes[frame_idx]) {
+            playerBoxes[frame_idx] = [];
+          }
+          
+          playerBoxes[frame_idx].push({
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+            track_id: trackId,
+            is_active: activeFrames.has(frame_idx)
+          });
+        }
+      }
+    }
+    
+    return { parsed: playerBoxes, rawJsonString: jsonString };
+  } catch (err) {
+    console.error("Failed to parse JSON annotations", err);
+    return { parsed: {}, rawJsonString: jsonString };
+  }
+};
+
 
 export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
   const parser = new DOMParser();
@@ -60,10 +193,11 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
   return { rally, events };
 };
 
-export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations: Record<string, ParsedAnnotations>, videos: File[] }> => {
+export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations: Record<string, ParsedAnnotations>, jsonAnnotations: Record<string, {parsed: Record<number, PlayerBox[]>, rawJsonString: string}>, videos: File[] }> => {
   const zip = new JSZip();
   const loadedZip = await zip.loadAsync(zipFile);
   const annotations: Record<string, ParsedAnnotations> = {};
+  const jsonAnnotations: Record<string, {parsed: Record<number, PlayerBox[]>, rawJsonString: string}> = {};
   const videos: File[] = [];
   
   for (const filename of Object.keys(loadedZip.files)) {
@@ -89,6 +223,19 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
       } catch (err) {
         console.error(`Failed to parse XML from ZIP: ${filename}`, err);
       }
+    } else if (filename.toLowerCase().endsWith('.json')) {
+      const jsonString = await file.async("string");
+      try {
+        const result = parseJSONAnnotations(jsonString);
+        let stem = filename.replace(/\.json$/i, '');
+        const lastSlash = stem.lastIndexOf('/');
+        if (lastSlash >= 0) {
+          stem = stem.substring(lastSlash + 1);
+        }
+        jsonAnnotations[stem] = result;
+      } catch (err) {
+        console.error(`Failed to parse JSON from ZIP: ${filename}`, err);
+      }
     } else if (filename.toLowerCase().endsWith('.mp4') || filename.toLowerCase().endsWith('.mov') || filename.toLowerCase().endsWith('.avi')) {
       try {
         const blob = await file.async("blob");
@@ -100,5 +247,5 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
     }
   }
   
-  return { annotations, videos };
+  return { annotations, jsonAnnotations, videos };
 };
