@@ -90,11 +90,12 @@ export const parseJSONAnnotations = (
       }
       
       const activeFrames = new Set<number>();
+      const removedFrames = new Set<number>();
       
       if (anyData.action && Array.isArray(anyData.action)) {
         anyData.action.forEach((act: any) => {
           if (act && typeof act.frame === 'number') {
-            for (let f = act.frame - 10; f <= act.frame + 10; f++) {
+            for (let f = act.frame - 2; f <= act.frame + 2; f++) {
               activeFrames.add(f);
             }
           }
@@ -103,8 +104,16 @@ export const parseJSONAnnotations = (
 
       manualActions.forEach(mAct => {
         if (mAct.track_id === trackId) {
-          for (let f = mAct.frame - 10; f <= mAct.frame + 10; f++) {
-            activeFrames.add(f);
+          if (mAct.action === 'remove') {
+            for (let f = mAct.frame - 2; f <= mAct.frame + 2; f++) {
+              removedFrames.add(f);
+              activeFrames.delete(f);
+            }
+          } else {
+            for (let f = mAct.frame - 2; f <= mAct.frame + 2; f++) {
+              activeFrames.add(f);
+              removedFrames.delete(f);
+            }
           }
         }
       });
@@ -133,7 +142,7 @@ export const parseJSONAnnotations = (
             x_max,
             y_max,
             track_id: trackId,
-            is_active: activeFrames.has(frame_idx)
+            is_active: activeFrames.has(frame_idx) && !removedFrames.has(frame_idx)
           });
         }
       }

@@ -72,14 +72,19 @@ export const getUpdatedJSONString = (
         if (!data.players[pKey]) data.players[pKey] = {};
         if (!data.players[pKey].action) data.players[pKey].action = [];
         
-        // Check if it already exists to avoid duplicates
-        const exists = data.players[pKey].action.some((a: any) => a.frame === mAct.frame);
-        if (!exists) {
-          data.players[pKey].action.push({
-            frame: mAct.frame,
-            skill: "manual_active",
-            side: "unknown"
-          });
+        if (mAct.action === 'remove') {
+          // Remove the action if it exists
+          data.players[pKey].action = data.players[pKey].action.filter((a: any) => a.frame !== mAct.frame);
+        } else {
+          // Check if it already exists to avoid duplicates
+          const exists = data.players[pKey].action.some((a: any) => a.frame === mAct.frame);
+          if (!exists) {
+            data.players[pKey].action.push({
+              frame: mAct.frame,
+              skill: "manual_active",
+              side: "unknown"
+            });
+          }
         }
       });
     }
