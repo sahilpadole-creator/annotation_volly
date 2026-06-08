@@ -184,6 +184,18 @@ function App() {
       }
     }
 
+    // NEW RULE: Only one reception allowed per video/rally. Subsequent ones become digs.
+    let hasSeenReception = false;
+    for (let i = 0; i < modified.length; i++) {
+      if (modified[i].skill === 'reception') {
+        if (hasSeenReception) {
+          updateSkill(modified[i], 'dig');
+        } else {
+          hasSeenReception = true;
+        }
+      }
+    }
+
     for (let i = 0; i < modified.length; i++) {
       // 3-skill window (Rule 2 & 3)
       if (i <= modified.length - 3) {
