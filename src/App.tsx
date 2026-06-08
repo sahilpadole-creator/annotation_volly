@@ -959,8 +959,10 @@ function App() {
   const handleAssignPlayer = (frame: number, trackId: number) => {
     setState(prev => {
       const currentActions = prev.manualActions || [];
+      const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId);
+      
       const filtered = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
-      const newActions = [...filtered, { frame, track_id: trackId }];
+      const newActions = isCurrentlyAssigned ? filtered : [...filtered, { frame, track_id: trackId }];
       
       // Re-parse the playerBoxes with the new actions
       const playlistItem = prev.playlist[prev.currentPlaylistIndex];
@@ -973,7 +975,7 @@ function App() {
       // Update the event's player_id if there is an event at this frame
       const newEvents = prev.events.map(ev => {
         if (ev.frame === frame) {
-          return { ...ev, player_id: trackId };
+          return { ...ev, player_id: isCurrentlyAssigned ? undefined : trackId };
         }
         return ev;
       });
