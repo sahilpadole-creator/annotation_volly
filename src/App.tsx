@@ -1319,6 +1319,15 @@ function App() {
                     key={idx} 
                     style={{ pointerEvents: 'auto', cursor: 'pointer' }}
                     onClick={() => setSelectedTrackId(box.track_id)}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      const hasEvent = state.events.some(ev => ev.frame === state.currentFrame);
+                      if (hasEvent) {
+                        handleAssignPlayer(state.currentFrame, box.track_id);
+                      } else {
+                        window.alert("No skill event found on this exact frame. Please create a skill first before assigning a player.");
+                      }
+                    }}
                   >
                     {/* Invisible larger rect to make clicking easier */}
                     <rect 
