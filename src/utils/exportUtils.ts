@@ -39,7 +39,8 @@ export const exportToJSON = (
 
 export const getUpdatedJSONString = (
   rawJsonString: string,
-  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[]
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[],
+  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
 ): string | null => {
   try {
     const data = JSON.parse(rawJsonString);
@@ -89,6 +90,16 @@ export const getUpdatedJSONString = (
       });
     }
     
+    // Update the main actions array with the current state.events to prevent reverting
+    if (events && Array.isArray(events)) {
+      data.actions = events.map(ev => ({
+        frame: ev.frame,
+        skill: ev.skill || "unknown",
+        side: "unknown", // fallback
+        active_players: ev.player_id !== undefined ? [ev.player_id] : []
+      }));
+    }
+    
     return JSON.stringify(data, null, 2);
   } catch (e) {
     console.error("Failed to parse JSON for update", e);
@@ -101,10 +112,11 @@ export const exportUpdatedJSON = async (
   manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[],
   filename: string,
   includeMp4: boolean = false,
-  videoFile?: File
+  videoFile?: File,
+  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
 ) => {
   try {
-    const updatedJsonString = getUpdatedJSONString(rawJsonString, manualActions);
+    const updatedJsonString = getUpdatedJSONString(rawJsonString, manualActions, events);
     if (!updatedJsonString) return;
 
     const stem = filename.replace(/\.[^/.]+$/, "");

@@ -1286,7 +1286,7 @@ function App() {
                 onClick={() => {
                   const item = state.playlist[state.currentPlaylistIndex];
                   if (item?.rawJsonString) {
-                    exportUpdatedJSON(item.rawJsonString, state.manualActions, item.name, includeMp4InZip, item.file);
+                    exportUpdatedJSON(item.rawJsonString, state.manualActions, item.name, includeMp4InZip, item.file, state.events);
                   }
                 }}
               >
