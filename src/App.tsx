@@ -669,7 +669,7 @@ function App() {
     }
 
     const newPlaylistItems: PlaylistItem[] = allVideoFiles.map(file => {
-      const existing = stateRef.current.playlist.find(p => p.name === file.name);
+      let existing = stateRef.current.playlist.find(p => p.name === file.name);
       
       let itemEvents = existing?.events || [];
       let itemRally = existing?.rally || { start_frame: null, end_frame: null };
