@@ -985,6 +985,9 @@ function App() {
         events: newEvents
       };
     });
+    
+    // Clear the selection so the green active highlight becomes visible
+    setSelectedTrackId(null);
   };
 
   useEffect(() => {
@@ -1668,11 +1671,12 @@ function App() {
                           <button 
                             className="btn icon-only outline" 
                             title="Assign selected player to this skill"
-                            disabled={selectedTrackId === null}
                             onClick={(e) => { 
                               e.stopPropagation(); 
                               if (selectedTrackId !== null) {
                                 handleAssignPlayer(event.frame, selectedTrackId);
+                              } else {
+                                window.alert("Please click a red player bounding box on the video first to select a player!");
                               }
                             }}>
                             <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
