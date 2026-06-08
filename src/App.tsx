@@ -641,7 +641,10 @@ function App() {
       try {
         const text = await jsonFile.text();
         const result = parseJSONAnnotations(text, []);
-        const stem = jsonFile.name.replace(/\.json$/i, '');
+        let stem = jsonFile.name.replace(/\.json$/i, '');
+        if (stem.startsWith('annotations_')) {
+          stem = stem.replace(/^annotations_/, '');
+        }
         parsedJsonAnnotations[stem] = result;
       } catch (err) {
         console.error(`Failed to parse standalone JSON: ${jsonFile.name}`, err);
@@ -681,15 +684,8 @@ function App() {
       }
       
       let jsonKey = stem;
-      if (!parsedJsonAnnotations[jsonKey]) {
-        // Try fuzzy matching: check if any json key starts with the video stem case-insensitively
-        const lowerStem = stem.toLowerCase();
-        const possibleKey = Object.keys(parsedJsonAnnotations).find(k => {
-          const lowerK = k.toLowerCase();
-          return lowerK.includes(lowerStem) || lowerStem.includes(lowerK);
-        });
-        if (possibleKey) jsonKey = possibleKey;
-      }
+      // Exact match is enough now because we strip annotations_ from both ZIP and standalone uploads
+
       
       if (parsedJsonAnnotations[jsonKey]) {
         // If there are existing manual actions for this video, we re-parse to apply them
