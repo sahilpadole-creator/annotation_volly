@@ -35,7 +35,7 @@ export const parseJSONAnnotations = (
         // Manual actions
         manualActions.forEach(mAct => {
           if (mAct.track_id === trackId) {
-            for (let i = mAct.frame - 10; i <= mAct.frame + 10; i++) {
+            for (let i = mAct.frame - 5; i <= mAct.frame + 5; i++) {
               activeFrames.add(i);
             }
           }

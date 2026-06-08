@@ -180,7 +180,13 @@ export const generateXMLString = (
     
     if (event) {
       const src = event.source || 'manual';
-      xml += `    <tag label="${event.skill}" source="${src}"></tag>\n`;
+      if (event.player_id !== undefined) {
+        xml += `    <tag label="${event.skill}" source="${src}">\n`;
+        xml += `      <attribute name="player_id">${event.player_id}</attribute>\n`;
+        xml += `    </tag>\n`;
+      } else {
+        xml += `    <tag label="${event.skill}" source="${src}"></tag>\n`;
+      }
     }
     
     if (isEndRally) {

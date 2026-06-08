@@ -328,10 +328,6 @@ function App() {
         if (nextIndex === -1) {
           processingRef.current = false;
           setBatchProgress(prev => ({ ...prev, isRunning: false }));
-          // Load the first video now that batch is done
-          if (currentPlaylist.length > 0 && !videoUrl) {
-            loadVideoIntoPlayer(currentPlaylist[0]);
-          }
           
           // Automatically download the batch ZIP when finished!
           const annotated = currentPlaylist.filter(p => p.isSkillAlgorithmApplied);
@@ -390,10 +386,12 @@ function App() {
           };
 
           setState(prev => {
+            console.log(`[batch] setState callback. prev.currentPlaylistIndex=${prev.currentPlaylistIndex}, nextIndex=${nextIndex}`);
             const newPlaylist = [...prev.playlist];
             newPlaylist[nextIndex] = updatedItem;
             
             if (prev.currentPlaylistIndex === nextIndex) {
+              console.log(`[batch] Updating main state events to length: ${heuristicallyCorrected.length}`);
               return {
                 ...prev,
                 playlist: newPlaylist,
@@ -401,6 +399,7 @@ function App() {
                 rally: updatedItem.rally
               };
             }
+            console.log(`[batch] NOT updating main state events! Mismatch index.`);
             return { ...prev, playlist: newPlaylist };
           });
 
@@ -455,14 +454,9 @@ function App() {
       const item = state.playlist[0];
       if (item.file) {
         setVideoUrl(URL.createObjectURL(item.file));
+      } else if (item.driveUrl) {
+        setVideoUrl(item.driveUrl);
       }
-      setState(prev => ({
-        ...prev,
-        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
-        rally: item.rally || { start_frame: null, end_frame: null },
-        events: item.events || [],
-        currentFrame: 0
-      }));
     }
   }, [batchProgress.isRunning, batchProgress.completed, batchProgress.total, state.playlist, videoUrl]);
 
@@ -545,6 +539,7 @@ function App() {
 
   // Autosave
   useEffect(() => {
+    console.log(`[DEBUG] state.events changed! Length: ${state.events.length}`);
     if (state.playlist.length > 0 || state.videoMetadata) {
       // Keep playlist in sync with current events before saving
       const currentPlaylist = [...state.playlist];
@@ -748,10 +743,19 @@ function App() {
         currentFrame: savedFrame
       }));
     } else {
+      const item = newPlaylistItems[0];
+      const isRestoring = stateRef.current.videoMetadata?.filename === item.name;
+      const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
+      
       setState(prev => ({
         ...prev,
         playlist: newPlaylistItems,
-        currentPlaylistIndex: 0
+        currentPlaylistIndex: 0,
+        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
+        rally: item.rally || { start_frame: null, end_frame: null },
+        events: item.events || [],
+        playerBoxes: item.playerBoxes || {},
+        currentFrame: savedFrame
       }));
     }
   };
@@ -952,14 +956,53 @@ function App() {
     });
   };
 
+  const handleAssignPlayer = (frame: number, trackId: number) => {
+    setState(prev => {
+      const currentActions = prev.manualActions || [];
+      const filtered = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
+      const newActions = [...filtered, { frame, track_id: trackId }];
+      
+      // Re-parse the playerBoxes with the new actions
+      const playlistItem = prev.playlist[prev.currentPlaylistIndex];
+      let newBoxes = prev.playerBoxes;
+      if (playlistItem?.rawJsonString) {
+        const res = parseJSONAnnotations(playlistItem.rawJsonString, newActions);
+        newBoxes = res.parsed;
+      }
+      
+      // Update the event's player_id if there is an event at this frame
+      const newEvents = prev.events.map(ev => {
+        if (ev.frame === frame) {
+          return { ...ev, player_id: trackId };
+        }
+        return ev;
+      });
+      
+      return {
+        ...prev,
+        manualActions: newActions,
+        playerBoxes: newBoxes,
+        events: newEvents
+      };
+    });
+  };
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (document.activeElement?.tagName === 'INPUT') return;
-
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
       const key = e.key.toLowerCase();
       
-      if (SKILL_MAP[key]) {
-        addEvent(SKILL_MAP[key]);
+      if (['1', '2', '3', '4', '5', '6'].includes(key)) {
+        const skillMap: Record<string, { label: SkillLabel; classId: number }> = {
+          '1': { label: 'toss', classId: 0 },
+          '2': { label: 'serve', classId: 1 },
+          '3': { label: 'reception', classId: 2 },
+          '4': { label: 'set', classId: 3 },
+          '5': { label: 'dig', classId: 4 },
+          '6': { label: 'attack', classId: 5 } // Using attack for both attack/block in UI
+        };
+        addEvent(skillMap[key]);
         e.preventDefault();
       } else if (key === 's') {
         setRallyBound('start');
@@ -972,25 +1015,7 @@ function App() {
         e.preventDefault();
       } else if (key === 'a') {
         if (selectedTrackId !== null) {
-          setState(prev => {
-            const currentActions = prev.manualActions || [];
-            const filtered = currentActions.filter(m => !(m.frame === prev.currentFrame && m.track_id === selectedTrackId));
-            const newActions = [...filtered, { frame: prev.currentFrame, track_id: selectedTrackId }];
-            
-            // Re-parse the playerBoxes with the new actions
-            const playlistItem = prev.playlist[prev.currentPlaylistIndex];
-            let newBoxes = prev.playerBoxes;
-            if (playlistItem?.rawJsonString) {
-              const res = parseJSONAnnotations(playlistItem.rawJsonString, newActions);
-              newBoxes = res.parsed;
-            }
-            
-            return {
-              ...prev,
-              manualActions: newActions,
-              playerBoxes: newBoxes
-            };
-          });
+          handleAssignPlayer(state.currentFrame, selectedTrackId);
         } else {
           window.alert("Please click on a player's bounding box first to select them, then press 'A'.");
         }
@@ -1493,6 +1518,7 @@ function App() {
             })}
 
             {state.videoMetadata && state.events.map(event => {
+              const skillName = (event.skill || (event as any).label || '').toString();
               const abbreviation = {
                 'toss': 'T',
                 'serve': 'Sr',
@@ -1501,7 +1527,7 @@ function App() {
                 'dig': 'D',
                 'attack': 'A',
                 'block': 'B'
-              }[event.skill] || event.skill.charAt(0).toUpperCase();
+              }[skillName] || (skillName ? skillName.charAt(0).toUpperCase() : '?');
 
               return (
                 <div 
@@ -1509,10 +1535,10 @@ function App() {
                   className="timeline-skill-marker" 
                   style={{ 
                     left: `${state.videoMetadata!.frame_count > 0 ? (event.frame / state.videoMetadata!.frame_count) * 100 : 0}%`, 
-                    backgroundColor: `var(--color-${event.skill})`, 
+                    backgroundColor: `var(--color-${skillName})`, 
                     zIndex: 2 
                   }}
-                  title={`${event.skill} at frame ${event.frame}`}
+                  title={`${skillName} at frame ${event.frame}`}
                   onClick={() => seekToFrame(event.frame)}
                 >
                   {abbreviation}
@@ -1590,7 +1616,10 @@ function App() {
         </div>
 
         <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <h2>Annotations</h2>
+          <h2 style={{color: 'red'}}>Annotations (DEBUG LENGTH: {state.events.length})</h2>
+          <div style={{color: 'yellow', fontSize: '10px', wordBreak: 'break-all'}}>
+            {JSON.stringify(state.events.slice(0, 2))}
+          </div>
           
           {warnings.length > 0 && (
             <div style={{ marginBottom: '1rem' }}>
@@ -1623,15 +1652,37 @@ function App() {
                   </tr>
                 )}
                 
-                {[...state.events].sort((a, b) => a.frame - b.frame).map(event => (
-                  <tr key={event.frame} className={state.currentFrame === event.frame ? 'active-row' : ''} onClick={() => seekToFrame(event.frame)} style={{ cursor: 'pointer' }}>
-                    <td>{event.frame}</td>
-                    <td><span className={`badge ${event.skill}`}>{event.skill}</span></td>
-                    <td>
-                      <button className="btn icon-only outline" onClick={(e) => { e.stopPropagation(); setState(prev => ({ ...prev, events: prev.events.filter(ev => ev.frame !== event.frame) })) }}><Trash2 size={14} /></button>
-                    </td>
-                  </tr>
-                ))}
+                {[...state.events].sort((a, b) => a.frame - b.frame).map(event => {
+                  const skillName = (event.skill || (event as any).label || '').toString();
+                  return (
+                    <tr key={event.frame} className={state.currentFrame === event.frame ? 'active-row' : ''} onClick={() => seekToFrame(event.frame)} style={{ cursor: 'pointer' }}>
+                      <td>{event.frame}</td>
+                      <td>
+                        <span className={`badge ${skillName}`}>{skillName}</span>
+                        {event.player_id !== undefined && (
+                           <span style={{ marginLeft: '0.5rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)' }}>ID: {event.player_id}</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: '0.25rem' }}>
+                          <button 
+                            className="btn icon-only outline" 
+                            title="Assign selected player to this skill"
+                            disabled={selectedTrackId === null}
+                            onClick={(e) => { 
+                              e.stopPropagation(); 
+                              if (selectedTrackId !== null) {
+                                handleAssignPlayer(event.frame, selectedTrackId);
+                              }
+                            }}>
+                            <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
+                          </button>
+                          <button className="btn icon-only outline" onClick={(e) => { e.stopPropagation(); setState(prev => ({ ...prev, events: prev.events.filter(ev => ev.frame !== event.frame) })) }}><Trash2 size={14} /></button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
 
                 {state.rally.end_frame !== null && (
                   <tr className={state.currentFrame === state.rally.end_frame ? 'active-row' : ''} onClick={() => seekToFrame(state.rally.end_frame!)} style={{ cursor: 'pointer' }}>
