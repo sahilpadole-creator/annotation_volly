@@ -35,6 +35,7 @@ type PredictionImportPayload = {
   rally?: { start_frame?: number | null; end_frame?: number | null };
   start_frame?: number;
   end_frame?: number;
+  video_fps?: number;
 };
 
 const INFERENCE_API_BASE = import.meta.env.VITE_INFERENCE_API_BASE || 'http://localhost:8000';
@@ -261,6 +262,10 @@ function App() {
           start_frame: startFrame ?? prev.rally.start_frame,
           end_frame: endFrame ?? prev.rally.end_frame,
         },
+        videoMetadata: prev.videoMetadata ? {
+          ...prev.videoMetadata,
+          fps: parsed.video_fps ?? prev.videoMetadata.fps,
+        } : null,
       };
     });
 
@@ -387,6 +392,7 @@ function App() {
           const heuristicallyCorrected = applySkillHeuristics(events);
           console.log(`[batch] Original events: ${events.length}, Corrected events: ${heuristicallyCorrected.length}`);
           
+          const videoFps = (payload as any).video_fps;
           const updatedItem = {
             ...item,
             events: heuristicallyCorrected,
@@ -394,6 +400,10 @@ function App() {
               start_frame: startFrame ?? item.rally?.start_frame ?? null,
               end_frame: endFrame ?? item.rally?.end_frame ?? null
             },
+            videoMetadata: item.videoMetadata ? {
+              ...item.videoMetadata,
+              fps: videoFps ?? item.videoMetadata.fps,
+            } : null,
             isSkillAlgorithmApplied: true
           };
 
@@ -695,6 +705,15 @@ function App() {
           
         itemPlayerBoxes = parsedResult.parsed;
         itemRawJson = parsedResult.rawJsonString;
+        const parsedVideoFps = parsedResult.videoFps;
+        
+        if (parsedVideoFps) {
+          if (existing?.videoMetadata) {
+            existing.videoMetadata.fps = parsedVideoFps;
+          } else {
+            existing = { ...existing, videoMetadata: { filename: file.name, fps: parsedVideoFps, width: 0, height: 0, duration: 0, frame_count: 0 } } as any;
+          }
+        }
         // Do NOT set isApplied = true here, because we still want to run the skill inference algorithm on the backend!
       }
 

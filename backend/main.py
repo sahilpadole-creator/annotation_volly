@@ -18,15 +18,18 @@ load_dotenv()
 
 app = FastAPI(title="Volleyball Annotator Inference API")
 
-def get_video_frame_count(path: str) -> int:
+def get_video_info(path: str) -> tuple[int, float]:
     try:
         import cv2
         cap = cv2.VideoCapture(path)
         cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0:
+            fps = 30.0
         cap.release()
-        return cnt
+        return cnt, fps
     except Exception:
-        return 0
+        return 0, 30.0
 
 
 def _cors_origins_from_env() -> list[str]:
@@ -220,7 +223,7 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
         end_time = time.time()
 
         duration = end_time - start_time
-        frame_count = get_video_frame_count(str(video_path))
+        frame_count, video_fps = get_video_info(str(video_path))
         fps = round(frame_count / duration, 2) if duration > 0 and frame_count > 0 else 0
 
         if not skill_json.is_file():
@@ -232,5 +235,6 @@ async def infer_skill5(video: UploadFile = File(...)) -> dict[str, Any]:
             "predictions": predictions,
             "inference_fps": fps,
             "inference_time_sec": round(duration, 2),
-            "frame_count": frame_count
+            "frame_count": frame_count,
+            "video_fps": video_fps
         }

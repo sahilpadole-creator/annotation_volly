@@ -9,7 +9,7 @@ export interface ParsedAnnotations {
 export const parseJSONAnnotations = (
   jsonString: string, 
   manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[] = []
-): { parsed: Record<number, PlayerBox[]>, rawJsonString: string } => {
+): { parsed: Record<number, PlayerBox[]>, rawJsonString: string, videoFps?: number } => {
   try {
     const data = JSON.parse(jsonString);
     const playerBoxes: Record<number, PlayerBox[]> = {};
@@ -75,7 +75,7 @@ export const parseJSONAnnotations = (
         }
       });
       
-      return { parsed: playerBoxes, rawJsonString: jsonString };
+      return { parsed: playerBoxes, rawJsonString: jsonString, videoFps: data.fps || data.video_fps };
     }
 
     // Otherwise, process old format: data.players
@@ -148,10 +148,10 @@ export const parseJSONAnnotations = (
       }
     }
     
-    return { parsed: playerBoxes, rawJsonString: jsonString };
+    return { parsed: playerBoxes, rawJsonString: jsonString, videoFps: data.fps || data.video_fps };
   } catch (err) {
     console.error("Failed to parse JSON annotations", err);
-    return { parsed: {}, rawJsonString: jsonString };
+    return { parsed: {}, rawJsonString: jsonString, videoFps: undefined };
   }
 };
 
