@@ -247,7 +247,12 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
         let stem = filename.replace(/\.json$/i, '');
         const lastSlash = stem.lastIndexOf('/');
         if (lastSlash >= 0) {
-          stem = stem.substring(lastSlash + 1);
+          const path = stem.substring(0, lastSlash + 1);
+          let base = stem.substring(lastSlash + 1);
+          if (base.startsWith('annotations_')) base = base.replace(/^annotations_/, '');
+          stem = path + base;
+        } else {
+          if (stem.startsWith('annotations_')) stem = stem.replace(/^annotations_/, '');
         }
         jsonAnnotations[stem] = result;
       } catch (err) {

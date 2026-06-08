@@ -665,11 +665,8 @@ function App() {
       let itemRawJson = existing?.rawJsonString || undefined;
       let itemManualActions = existing?.manualActions || [];
 
-      // Failsafe: if the app claims the algorithm was applied but there are no events, 
-      // it was likely stuck in a bugged state from a previous session. Reset it.
-      if (isApplied && itemEvents.length === 0) {
-        isApplied = false;
-      }
+      // Removed failsafe: if a video genuinely has 0 skill events, we shouldn't force it to rerun.
+
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
       if (parsedAnnotations[stem]) {
@@ -689,7 +686,7 @@ function App() {
         const lowerStem = stem.toLowerCase();
         const possibleKey = Object.keys(parsedJsonAnnotations).find(k => {
           const lowerK = k.toLowerCase();
-          return lowerK.startsWith(lowerStem) || lowerStem.startsWith(lowerK);
+          return lowerK.includes(lowerStem) || lowerStem.includes(lowerK);
         });
         if (possibleKey) jsonKey = possibleKey;
       }
