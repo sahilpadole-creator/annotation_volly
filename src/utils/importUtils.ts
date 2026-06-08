@@ -8,7 +8,7 @@ export interface ParsedAnnotations {
 
 export const parseJSONAnnotations = (
   jsonString: string, 
-  manualActions: { frame: number; track_id: number }[] = []
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[] = []
 ): { parsed: Record<number, PlayerBox[]>, rawJsonString: string } => {
   try {
     const data = JSON.parse(jsonString);
@@ -19,13 +19,14 @@ export const parseJSONAnnotations = (
       data.tracks.forEach((track: any) => {
         const trackId = track.track_id;
         const activeFrames = new Set<number>();
+        const removedFrames = new Set<number>();
         
         // Track actions (ball_carrier)
         if (track.frames && Array.isArray(track.frames)) {
           track.frames.forEach((f: any) => {
             if (f.ball_carrier === true) {
-              // Add a window of +/- 10 frames (20 frames total)
-              for (let i = f.frame_num - 10; i <= f.frame_num + 10; i++) {
+              // Add a window of +/- 2 frames
+              for (let i = f.frame_num - 2; i <= f.frame_num + 2; i++) {
                 activeFrames.add(i);
               }
             }
@@ -35,8 +36,16 @@ export const parseJSONAnnotations = (
         // Manual actions
         manualActions.forEach(mAct => {
           if (mAct.track_id === trackId) {
-            for (let i = mAct.frame - 5; i <= mAct.frame + 5; i++) {
-              activeFrames.add(i);
+            if (mAct.action === 'remove') {
+              for (let i = mAct.frame - 2; i <= mAct.frame + 2; i++) {
+                removedFrames.add(i);
+                activeFrames.delete(i);
+              }
+            } else {
+              for (let i = mAct.frame - 2; i <= mAct.frame + 2; i++) {
+                activeFrames.add(i);
+                removedFrames.delete(i);
+              }
             }
           }
         });
@@ -48,7 +57,6 @@ export const parseJSONAnnotations = (
              const y_min = f.y;
              const x_max = f.x + f.w;
              const y_max = f.y + f.h;
-             
              if (x_max > x_min && y_max > y_min) {
                if (!playerBoxes[frame_idx]) {
                  playerBoxes[frame_idx] = [];
@@ -60,7 +68,7 @@ export const parseJSONAnnotations = (
                  x_max,
                  y_max,
                  track_id: trackId,
-                 is_active: activeFrames.has(frame_idx)
+                 is_active: activeFrames.has(frame_idx) && !removedFrames.has(frame_idx)
                });
              }
           });

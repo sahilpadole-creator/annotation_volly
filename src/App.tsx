@@ -959,10 +959,12 @@ function App() {
   const handleAssignPlayer = (frame: number, trackId: number) => {
     setState(prev => {
       const currentActions = prev.manualActions || [];
-      const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId);
+      const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId && m.action !== 'remove');
       
       const filtered = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
-      const newActions = isCurrentlyAssigned ? filtered : [...filtered, { frame, track_id: trackId }];
+      const newActions = isCurrentlyAssigned 
+        ? [...filtered, { frame, track_id: trackId, action: 'remove' as const }] 
+        : [...filtered, { frame, track_id: trackId }];
       
       // Re-parse the playerBoxes with the new actions
       const playlistItem = prev.playlist[prev.currentPlaylistIndex];

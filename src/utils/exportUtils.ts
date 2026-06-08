@@ -39,7 +39,7 @@ export const exportToJSON = (
 
 export const getUpdatedJSONString = (
   rawJsonString: string,
-  manualActions: { frame: number; track_id: number }[]
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[]
 ): string | null => {
   try {
     const data = JSON.parse(rawJsonString);
@@ -52,8 +52,8 @@ export const getUpdatedJSONString = (
         if (track && track.frames) {
           const frameObj = track.frames.find((f: any) => f.frame_num === mAct.frame);
           if (frameObj) {
-            frameObj.ball_carrier = true;
-          } else {
+            frameObj.ball_carrier = mAct.action === 'remove' ? false : true;
+          } else if (mAct.action !== 'remove') {
             // Push a dummy frame if it doesn't exist to register the action
             track.frames.push({
                frame_num: mAct.frame,
@@ -93,7 +93,7 @@ export const getUpdatedJSONString = (
 
 export const exportUpdatedJSON = async (
   rawJsonString: string,
-  manualActions: { frame: number; track_id: number }[],
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[],
   filename: string,
   includeMp4: boolean = false,
   videoFile?: File

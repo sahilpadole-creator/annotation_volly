@@ -44,7 +44,7 @@ export interface PlaylistItem {
   events?: SkillEvent[];
   playerBoxes?: Record<number, PlayerBox[]>;
   rawJsonString?: string;
-  manualActions?: { frame: number; track_id: number }[];
+  manualActions?: { frame: number; track_id: number; action?: 'add' | 'remove' }[];
   isCompleted?: boolean;
   isSkillAlgorithmApplied?: boolean;
 }
@@ -57,6 +57,6 @@ export interface AppState {
   events: SkillEvent[];
   playerBoxes: Record<number, PlayerBox[]>;
   rawJsonString?: string;
-  manualActions: { frame: number; track_id: number }[];
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[];
   currentFrame: number;
 }
