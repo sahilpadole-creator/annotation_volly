@@ -22,3 +22,19 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Backend and Python
+backend/
+__pycache__/
+*.pyc
+
+# Local deployment configs
+railway.json
+render.yaml
+
+# Test scripts
+test*.js
+test*.cjs
+
+# Secrets
+.env

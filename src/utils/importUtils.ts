@@ -8,7 +8,7 @@ export interface ParsedAnnotations {
 
 export const parseJSONAnnotations = (
   jsonString: string, 
-  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[] = []
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[] = []
 ): { parsed: Record<number, PlayerBox[]>, rawJsonString: string, videoFps?: number } => {
   try {
     const data = JSON.parse(jsonString);
@@ -147,6 +147,39 @@ export const parseJSONAnnotations = (
         }
       }
     }
+    
+    // Process manually drawn boxes
+    manualActions.forEach(mAct => {
+      if (mAct.action === 'draw_box' && mAct.box) {
+        for (let i = mAct.frame - 2; i <= mAct.frame + 2; i++) {
+          if (i >= 0) {
+            if (!playerBoxes[i]) playerBoxes[i] = [];
+            if (!playerBoxes[i].some(b => b.track_id === mAct.track_id)) {
+              playerBoxes[i].push({ ...mAct.box, is_active: false });
+            }
+          }
+        }
+      }
+    });
+
+    // Apply manual add/remove to all boxes again to ensure drawn boxes get activated properly
+    manualActions.forEach(mAct => {
+      if (mAct.action === 'add' || !mAct.action) { // Default is 'add' if not specified in old format
+        for (let i = mAct.frame - 2; i <= mAct.frame + 2; i++) {
+          if (playerBoxes[i]) {
+            const box = playerBoxes[i].find(b => b.track_id === mAct.track_id);
+            if (box) box.is_active = true;
+          }
+        }
+      } else if (mAct.action === 'remove') {
+        for (let i = mAct.frame - 2; i <= mAct.frame + 2; i++) {
+          if (playerBoxes[i]) {
+            const box = playerBoxes[i].find(b => b.track_id === mAct.track_id);
+            if (box) box.is_active = false;
+          }
+        }
+      }
+    });
     
     return { parsed: playerBoxes, rawJsonString: jsonString, videoFps: data.fps || data.video_fps };
   } catch (err) {

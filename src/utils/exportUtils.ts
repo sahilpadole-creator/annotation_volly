@@ -39,7 +39,7 @@ export const exportToJSON = (
 
 export const getUpdatedJSONString = (
   rawJsonString: string,
-  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[],
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[],
   events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
 ): string | null => {
   try {
@@ -109,7 +109,7 @@ export const getUpdatedJSONString = (
 
 export const exportUpdatedJSON = async (
   rawJsonString: string,
-  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' }[],
+  manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[],
   filename: string,
   includeMp4: boolean = false,
   videoFile?: File,
@@ -251,7 +251,7 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
     
     // Add updated JSON if available
     if (item.rawJsonString) {
-      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || []);
+      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || [], item.events);
       if (updatedJsonString) {
         zip.file(`${stem}_updated.json`, updatedJsonString);
         itemHasData = true;

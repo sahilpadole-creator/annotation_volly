@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, FolderArchive, ArrowRight, ArrowLeft, CheckCircle } from 'lucide-react';
-import type { AppState, SkillLabel, PlaylistItem, SkillEvent } from './types';
-import { exportToXML, exportAllToZip, generateXMLString, exportUpdatedJSON } from './utils/exportUtils';
-import { GoogleDriveConnector } from './components/GoogleDriveConnector';
+import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, ArrowRight, ArrowLeft, CheckCircle, Eye, EyeOff } from 'lucide-react';
+import type { AppState, SkillLabel, PlaylistItem, SkillEvent, PlayerBox } from './types';
+import { exportAllToZip, generateXMLString } from './utils/exportUtils';
+import { detectVideoFps } from './utils/fpsUtils';
 import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations } from './utils/importUtils';
 import './index.css';
 
@@ -42,8 +42,6 @@ const INFERENCE_API_BASE = import.meta.env.VITE_INFERENCE_API_BASE || 'http://lo
 
 function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
-  const [isRunningTouch, setIsRunningTouch] = useState(false);
-  const [isRunningSkill5, setIsRunningSkill5] = useState(false);
   const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
   const [includeMp4InZip, setIncludeMp4InZip] = useState(false);
   const googleTokenRef = useRef<string | null>(null);
@@ -59,11 +57,97 @@ function App() {
     manualActions: [],
   });
 
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loginError, setLoginError] = useState('');
+
+  const handleLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (loginUsername === 'admin' && loginPassword === 'password123') {
+      setIsAuthenticated(true);
+      setLoginError('');
+    } else {
+      setLoginError('Invalid username or password');
+    }
+  };
+
+  const historyRef = useRef<{
+    events: SkillEvent[];
+    manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: PlayerBox }[];
+    playerBoxes: Record<number, any[]>;
+  }[]>([]);
+
+  const saveToHistory = (currentState: AppState) => {
+    historyRef.current.push({
+      events: JSON.parse(JSON.stringify(currentState.events)),
+      manualActions: JSON.parse(JSON.stringify(currentState.manualActions)),
+      playerBoxes: JSON.parse(JSON.stringify(currentState.playerBoxes))
+    });
+    // Keep history bounded to last 50 states
+    if (historyRef.current.length > 50) {
+      historyRef.current.shift();
+    }
+  };
+
+  const handleUndo = () => {
+    if (historyRef.current.length === 0) {
+      window.alert("No more actions to undo.");
+      return;
+    }
+    const previousState = historyRef.current.pop()!;
+    setState(prev => ({
+      ...prev,
+      events: previousState.events,
+      manualActions: previousState.manualActions,
+      playerBoxes: previousState.playerBoxes
+    }));
+  };
+
+  const handleResetRally = () => {
+    if (window.confirm("Are you sure you want to completely reset all manual annotations for this video? This cannot be undone.")) {
+      saveToHistory(state); // Save the current state before wiping it, just in case they want to undo the reset!
+      setState(prev => {
+        // Strip out manually drawn boxes (track_id >= 999000) and deactivate others
+        const resetBoxes: Record<number, any[]> = {};
+        Object.keys(prev.playerBoxes).forEach(fStr => {
+          const f = parseInt(fStr, 10);
+          resetBoxes[f] = prev.playerBoxes[f]
+            .filter(b => b.track_id < 999000)
+            .map(b => ({ ...b, is_active: false }));
+        });
+
+        // Strip player assignments from events and remove any manually created events
+        const resetEvents = prev.events
+          .filter(ev => ev.source !== 'manual')
+          .map(ev => ({ ...ev, player_id: undefined }));
+
+        return {
+          ...prev,
+          manualActions: [],
+          playerBoxes: resetBoxes,
+          events: resetEvents
+        };
+      });
+    }
+  };
+
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  const [showBoundingBoxes, setShowBoundingBoxes] = useState(true);
+  const [showOnlyActiveBoxes, setShowOnlyActiveBoxes] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [drawingBox, setDrawingBox] = useState<{ startX: number, startY: number, currentX: number, currentY: number } | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const cyclePlaybackRate = () => {
+    const rates = [0.25, 0.5, 1, 1.5, 2];
+    const currentIndex = rates.indexOf(playbackRate);
+    const nextIndex = (currentIndex + 1) % rates.length;
+    setPlaybackRate(rates[nextIndex]);
+  };
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [destinationFolderId, setDestinationFolderId] = useState<string | null>(null);
-  const importPredictionsInputRef = useRef<HTMLInputElement>(null);
   const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const stateRef = useRef(state);
   const processingRef = useRef(false);
@@ -71,6 +155,12 @@ function App() {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.playbackRate = playbackRate;
+    }
+  }, [playbackRate]);
 
   const parsePredictionLabel = (rawLabel: unknown): { label: SkillLabel; classId: number } | null => {
     if (typeof rawLabel !== 'string') return null;
@@ -147,6 +237,42 @@ function App() {
       startFrame: typeof startFrame === 'number' ? startFrame : null,
       endFrame: typeof endFrame === 'number' ? endFrame : null,
     };
+  };
+
+  const alignManualActionsToEvents = (actions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: PlayerBox }[], events: SkillEvent[], threshold = 5) => {
+    const snappedActions = actions.map(action => {
+      let closestEvent: SkillEvent | null = null;
+      let minDiff = threshold + 1;
+      for (const ev of events) {
+        const diff = Math.abs(ev.frame - action.frame);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closestEvent = ev;
+        }
+      }
+      if (closestEvent && minDiff > 0) {
+        return { ...action, frame: closestEvent.frame };
+      }
+      return action;
+    });
+
+    const activePerFrame = new Map<number, number>();
+    snappedActions.forEach(action => {
+      if (action.action === 'remove') {
+        if (activePerFrame.get(action.frame) === action.track_id) {
+          activePerFrame.delete(action.frame);
+        }
+      } else {
+        activePerFrame.set(action.frame, action.track_id);
+      }
+    });
+
+    const finalActions: { frame: number; track_id: number; action?: 'remove' }[] = [];
+    activePerFrame.forEach((track_id, frame) => {
+      finalActions.push({ frame, track_id });
+    });
+    
+    return finalActions;
   };
 
   const applySkillHeuristics = (events: SkillEvent[]): SkillEvent[] => {
@@ -230,60 +356,6 @@ function App() {
     return modified;
   };
 
-  const applyImportedPredictions = (parsed: PredictionImportPayload, sourceName: string) => {
-    const { events, startFrame, endFrame } = parsePredictionsFile(parsed);
-
-    if (events.length === 0) {
-      window.alert('No valid predictions found in JSON. Expected predictions: [{frame, label}]');
-      return false;
-    }
-
-    setState((prev) => {
-      const allEvents = [...prev.events, ...events];
-      
-      // Apply Greedy NMS (window = 10)
-      const nmsWindow = 10;
-      const sortedByConf = [...allEvents].sort((a, b) => (b.confidence ?? 1.0) - (a.confidence ?? 1.0));
-      const keptEvents: AppState['events'] = [];
-      
-      for (const ev of sortedByConf) {
-        if (!keptEvents.some(k => Math.abs(k.frame - ev.frame) <= nmsWindow)) {
-          keptEvents.push(ev);
-        }
-      }
-      
-      const deduplicated = keptEvents.sort((a, b) => a.frame - b.frame);
-      const heuristicallyCorrected = applySkillHeuristics(deduplicated);
-
-      return {
-        ...prev,
-        events: heuristicallyCorrected,
-        rally: {
-          start_frame: startFrame ?? prev.rally.start_frame,
-          end_frame: endFrame ?? prev.rally.end_frame,
-        },
-        videoMetadata: prev.videoMetadata ? {
-          ...prev.videoMetadata,
-          fps: parsed.video_fps ?? prev.videoMetadata.fps,
-        } : null,
-      };
-    });
-
-    window.alert(`Imported ${events.length} predictions from ${sourceName}`);
-    return true;
-  };
-
-  const handleImportPredictions = async (file: File | null) => {
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const parsed = JSON.parse(text) as PredictionImportPayload;
-      applyImportedPredictions(parsed, file.name);
-    } catch (err) {
-      console.error('Failed to import predictions', err);
-      window.alert('Failed to import predictions JSON. Please check the file format.');
-    }
-  };
 
   const inferSingleVideo = async (file: File) => {
     const formData = new FormData();
@@ -393,9 +465,18 @@ function App() {
           console.log(`[batch] Original events: ${events.length}, Corrected events: ${heuristicallyCorrected.length}`);
           
           const videoFps = (payload as any).video_fps;
+          
+          const alignedManualActions = alignManualActionsToEvents(item.manualActions || [], heuristicallyCorrected, 5);
+          let newPlayerBoxes = item.playerBoxes;
+          if (alignedManualActions.length > 0 && item.rawJsonString) {
+             newPlayerBoxes = parseJSONAnnotations(item.rawJsonString, alignedManualActions).parsed;
+          }
+
           const updatedItem = {
             ...item,
             events: heuristicallyCorrected,
+            manualActions: alignedManualActions,
+            playerBoxes: newPlayerBoxes,
             rally: {
               start_frame: startFrame ?? item.rally?.start_frame ?? null,
               end_frame: endFrame ?? item.rally?.end_frame ?? null
@@ -482,63 +563,6 @@ function App() {
     }
   }, [batchProgress.isRunning, batchProgress.completed, batchProgress.total, state.playlist, videoUrl]);
 
-  const runTouchModel = async () => {
-    const item = state.playlist[state.currentPlaylistIndex];
-    if (!item?.file) {
-      window.alert('Touch inference currently supports local uploaded video files only.');
-      return;
-    }
-    setIsRunningTouch(true);
-    try {
-      const formData = new FormData();
-      formData.append('video', item.file);
-      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/touch`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg || `Touch inference failed (${res.status})`);
-      }
-      const payload = await res.json();
-      const count = Array.isArray(payload?.touch_peaks) ? payload.touch_peaks.length : 0;
-      window.alert(`Touch inference complete. Peaks detected: ${count}`);
-    } catch (err) {
-      console.error('Touch inference failed', err);
-      window.alert(`Touch inference failed: ${(err as Error).message}`);
-    } finally {
-      setIsRunningTouch(false);
-    }
-  };
-
-  const runSkill5Model = async () => {
-    const item = state.playlist[state.currentPlaylistIndex];
-    if (!item?.file) {
-      window.alert('Skill inference currently supports local uploaded video files only.');
-      return;
-    }
-    setIsRunningSkill5(true);
-    try {
-      const formData = new FormData();
-      formData.append('video', item.file);
-      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/skill5`, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg || `Skill inference failed (${res.status})`);
-      }
-      const payload = await res.json();
-      applyImportedPredictions(payload, 'Skill5 Model');
-    } catch (err) {
-      console.error('Skill inference failed', err);
-      window.alert(`Skill inference failed: ${(err as Error).message}`);
-    } finally {
-      setIsRunningSkill5(false);
-    }
-  };
-
   // Load from localStorage on mount
   useEffect(() => {
     const saved = localStorage.getItem('volleyball_annotations');
@@ -546,11 +570,27 @@ function App() {
       try {
         const parsed = JSON.parse(saved);
         if (parsed.state) {
-          // If we have a playlist, don't load the object URLs directly, just metadata
+          // Sanitize any duplicated manual actions that were saved previously
+          const cleanedActions = alignManualActionsToEvents(
+            parsed.state.manualActions || [], 
+            parsed.state.events || [], 
+            5
+          );
+          
+          let newBoxes = parsed.state.playerBoxes;
+          if (parsed.state.playlist && parsed.state.playlist.length > 0) {
+            const currentItem = parsed.state.playlist[parsed.state.currentPlaylistIndex || 0];
+            if (currentItem && currentItem.rawJsonString) {
+              const res = parseJSONAnnotations(currentItem.rawJsonString, cleanedActions);
+              newBoxes = res.parsed;
+            }
+          }
+
           setState({ 
             ...parsed.state, 
             currentFrame: parsed.state.currentFrame || 0,
-            manualActions: parsed.state.manualActions || [] 
+            manualActions: cleanedActions,
+            playerBoxes: newBoxes
           });
         }
       } catch (e) {
@@ -629,6 +669,7 @@ function App() {
     const videoFiles = fileArray.filter(f => f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mp4'));
     const zipFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.zip'));
     const jsonFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.json'));
+    const xmlFiles = fileArray.filter(f => f.name.toLowerCase().endsWith('.xml'));
     
     let parsedAnnotations: Record<string, any> = {};
     let parsedJsonAnnotations: Record<string, any> = {};
@@ -661,6 +702,20 @@ function App() {
       }
     }
 
+    for (const xmlFile of xmlFiles) {
+      try {
+        const text = await xmlFile.text();
+        const parsed = parseXMLAnnotations(text);
+        let stem = xmlFile.name.replace(/\.xml$/i, '');
+        if (stem.startsWith('annotations_')) {
+          stem = stem.replace(/^annotations_/, '');
+        }
+        parsedAnnotations[stem] = parsed;
+      } catch (err) {
+        console.error(`Failed to parse standalone XML: ${xmlFile.name}`, err);
+      }
+    }
+
     const allVideoFiles = [...videoFiles, ...extractedVideos];
 
     if (allVideoFiles.length === 0) {
@@ -668,7 +723,7 @@ function App() {
       return;
     }
 
-    const newPlaylistItems: PlaylistItem[] = allVideoFiles.map(file => {
+    const newPlaylistItems: PlaylistItem[] = await Promise.all(allVideoFiles.map(async file => {
       let existing = stateRef.current.playlist.find(p => p.name === file.name);
       
       let itemEvents = existing?.events || [];
@@ -678,14 +733,11 @@ function App() {
       let itemRawJson = existing?.rawJsonString || undefined;
       let itemManualActions = existing?.manualActions || [];
 
-      // Removed failsafe: if a video genuinely has 0 skill events, we shouldn't force it to rerun.
-
+      // Detect native video FPS using MP4Box
+      const nativeFps = await detectVideoFps(file);
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
       if (parsedAnnotations[stem]) {
-        // Only use ZIP annotations if we don't have autosaved progress for this video,
-        // or if the autosaved progress is completely empty.
-        // This prevents overwriting the user's manual corrections when they re-upload the ZIP.
         if (!existing || (!existing.isSkillAlgorithmApplied && (!existing.events || existing.events.length === 0))) {
           itemEvents = parsedAnnotations[stem].events;
           itemRally = parsedAnnotations[stem].rally;
@@ -694,27 +746,36 @@ function App() {
       }
       
       let jsonKey = stem;
-      // Exact match is enough now because we strip annotations_ from both ZIP and standalone uploads
+      if (!parsedJsonAnnotations[jsonKey]) {
+        const possibleKey = Object.keys(parsedJsonAnnotations).find(k => k.startsWith(stem + '_') || stem.startsWith(k + '_'));
+        if (possibleKey) jsonKey = possibleKey;
+      }
 
-      
+      if (itemEvents.length > 0 && itemManualActions.length > 0) {
+        itemManualActions = alignManualActionsToEvents(itemManualActions, itemEvents, 5);
+      }
+
+      let jsonFps: number | undefined = undefined;
+
       if (parsedJsonAnnotations[jsonKey]) {
-        // If there are existing manual actions for this video, we re-parse to apply them
         const parsedResult = itemManualActions.length > 0 
           ? parseJSONAnnotations(parsedJsonAnnotations[jsonKey].rawJsonString, itemManualActions)
           : parsedJsonAnnotations[jsonKey];
           
         itemPlayerBoxes = parsedResult.parsed;
         itemRawJson = parsedResult.rawJsonString;
-        const parsedVideoFps = parsedResult.videoFps;
-        
-        if (parsedVideoFps) {
-          if (existing?.videoMetadata) {
-            existing.videoMetadata.fps = parsedVideoFps;
-          } else {
-            existing = { ...existing, videoMetadata: { filename: file.name, fps: parsedVideoFps, width: 0, height: 0, duration: 0, frame_count: 0 } } as any;
-          }
-        }
-        // Do NOT set isApplied = true here, because we still want to run the skill inference algorithm on the backend!
+        jsonFps = parsedResult.videoFps;
+      }
+      
+      // Determine the best available FPS
+      const finalFps = nativeFps || jsonFps || existing?.videoMetadata?.fps || 30;
+
+      // Update or create videoMetadata with the correct FPS
+      let newVideoMetadata = existing?.videoMetadata || null;
+      if (newVideoMetadata) {
+        newVideoMetadata = { ...newVideoMetadata, fps: finalFps };
+      } else {
+        newVideoMetadata = { filename: file.name, fps: finalFps, width: 0, height: 0, duration: 0, frame_count: 0 };
       }
 
       return {
@@ -727,11 +788,10 @@ function App() {
         rawJsonString: itemRawJson,
         manualActions: itemManualActions,
         isSkillAlgorithmApplied: isApplied,
-        videoMetadata: existing?.videoMetadata || null,
-        isCompleted: existing?.isCompleted || false,
-        driveFolderId: destinationFolderId || undefined
+        videoMetadata: newVideoMetadata,
+        isCompleted: existing?.isCompleted || false
       };
-    });
+    }));
 
     const total = newPlaylistItems.length;
     const completed = newPlaylistItems.filter(p => p.isSkillAlgorithmApplied).length;
@@ -784,68 +844,6 @@ function App() {
     }
   };
 
-  const handleDrivePlaylist = async (playlist: PlaylistItem[]) => {
-    setState(prev => ({ ...prev, playlist, currentPlaylistIndex: 0 }));
-
-    let finalPlaylist = playlist;
-    if (googleTokenRef.current) {
-      const updatedPlaylist = [...playlist];
-      let hasUpdates = false;
-
-      for (let i = 0; i < updatedPlaylist.length; i++) {
-        const item = updatedPlaylist[i];
-        if (item.driveXmlId) {
-          try {
-            const res = await fetch(`https://www.googleapis.com/drive/v3/files/${item.driveXmlId}?alt=media`, {
-              headers: { Authorization: `Bearer ${googleTokenRef.current}` }
-            });
-            if (res.ok) {
-              const xmlText = await res.text();
-              const parsed = parseXMLAnnotations(xmlText);
-              updatedPlaylist[i] = {
-                ...item,
-                events: parsed.events,
-                rally: parsed.rally,
-                isSkillAlgorithmApplied: true
-              };
-              hasUpdates = true;
-            }
-          } catch (e) {
-            console.error('Failed to fetch XML for', item.name, e);
-          }
-        }
-      }
-
-      if (hasUpdates) {
-        finalPlaylist = updatedPlaylist;
-        setState(prev => ({ ...prev, playlist: finalPlaylist }));
-        if (finalPlaylist.length > 0) {
-          // reload the first one in case it was updated
-          setState(prev => ({
-            ...prev,
-            events: finalPlaylist[0].events || [],
-            rally: finalPlaylist[0].rally || { start_frame: null, end_frame: null }
-          }));
-        }
-      }
-    }
-
-    const total = finalPlaylist.length;
-    const completed = finalPlaylist.filter(p => p.isSkillAlgorithmApplied).length;
-    if (total > 0) {
-      if (completed < total) {
-        setBatchProgress({
-          isRunning: true,
-          completed,
-          total,
-          lastFps: 0,
-          avgTimeSec: 0
-        });
-      } else {
-        loadVideoIntoPlayer(finalPlaylist[0]);
-      }
-    }
-  };
 
   const saveCurrentVideoState = () => {
     setState(prev => {
@@ -945,6 +943,7 @@ function App() {
   };
 
   const addEvent = (skillInfo: { label: SkillLabel; classId: number }) => {
+    saveToHistory(state);
     setState(prev => {
       const filtered = prev.events.filter(e => e.frame !== prev.currentFrame);
       return {
@@ -965,6 +964,7 @@ function App() {
   };
 
   const deleteCurrentFrameData = () => {
+    saveToHistory(state);
     setState(prev => {
       const isStart = prev.rally.start_frame === prev.currentFrame;
       const isEnd = prev.rally.end_frame === prev.currentFrame;
@@ -981,21 +981,44 @@ function App() {
   };
 
   const handleAssignPlayer = (frame: number, trackId: number) => {
+    saveToHistory(state);
     setState(prev => {
       const currentActions = prev.manualActions || [];
       const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId && m.action !== 'remove');
       
-      const filtered = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
-      const newActions = isCurrentlyAssigned 
-        ? [...filtered, { frame, track_id: trackId, action: 'remove' as const }] 
-        : [...filtered, { frame, track_id: trackId }];
+      // Find if another player is already assigned to this frame
+      const oldAssignedPlayerId = prev.events.find(e => e.frame === frame)?.player_id;
+      const assigningNewPlayer = !isCurrentlyAssigned;
       
-      // Re-parse the playerBoxes with the new actions
-      const playlistItem = prev.playlist[prev.currentPlaylistIndex];
-      let newBoxes = prev.playerBoxes;
-      if (playlistItem?.rawJsonString) {
-        const res = parseJSONAnnotations(playlistItem.rawJsonString, newActions);
-        newBoxes = res.parsed;
+      let newActions = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
+      
+      if (assigningNewPlayer && oldAssignedPlayerId !== undefined && oldAssignedPlayerId !== trackId) {
+        // Remove the old assigned player from actions
+        newActions = newActions.filter(m => !(m.frame === frame && m.track_id === oldAssignedPlayerId));
+        newActions.push({ frame, track_id: oldAssignedPlayerId, action: 'remove' as const });
+      }
+
+      if (assigningNewPlayer) {
+        newActions.push({ frame, track_id: trackId });
+      } else {
+        newActions.push({ frame, track_id: trackId, action: 'remove' as const });
+      }
+      
+      // Update is_active without re-parsing JSON to preserve drawn boxes
+      // Update across the +/- 2 frame window to ensure the timeline correctly reflects the replacement immediately
+      let newBoxes = { ...prev.playerBoxes };
+      for (let f = frame - 2; f <= frame + 2; f++) {
+        if (newBoxes[f]) {
+          newBoxes[f] = newBoxes[f].map(b => {
+            if (b.track_id === trackId) {
+              return { ...b, is_active: !isCurrentlyAssigned };
+            }
+            if (assigningNewPlayer && oldAssignedPlayerId !== undefined && b.track_id === oldAssignedPlayerId) {
+              return { ...b, is_active: false };
+            }
+            return b;
+          });
+        }
       }
       
       // Update the event's player_id if there is an event at this frame
@@ -1016,6 +1039,40 @@ function App() {
     
     // Clear the selection so the green active highlight becomes visible
     setSelectedTrackId(null);
+  };
+
+  const handleDeleteBox = (trackIdToDelete: number) => {
+    saveToHistory(state);
+    setState(prev => {
+      // Remove it from playerBoxes
+      const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
+      const newBoxes = currentBoxes.filter(b => b.track_id !== trackIdToDelete);
+      
+      // Also remove it from manualActions just in case it was assigned!
+      const currentActions = prev.manualActions || [];
+      const newActions = currentActions.filter(a => !(a.frame === prev.currentFrame && a.track_id === trackIdToDelete));
+      
+      // If it was the assigned player for the event, clear it
+      const newEvents = prev.events.map(ev => {
+        if (ev.frame === prev.currentFrame && ev.player_id === trackIdToDelete) {
+          return { ...ev, player_id: undefined };
+        }
+        return ev;
+      });
+
+      return {
+        ...prev,
+        playerBoxes: {
+          ...prev.playerBoxes,
+          [prev.currentFrame]: newBoxes
+        },
+        manualActions: newActions,
+        events: newEvents
+      };
+    });
+    if (selectedTrackId === trackIdToDelete) {
+      setSelectedTrackId(null);
+    }
   };
 
   useEffect(() => {
@@ -1076,6 +1133,78 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [state.currentFrame, seekToFrame, selectedTrackId]);
 
+  const handleSvgMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!state.videoMetadata) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    
+    const scaleX = state.videoMetadata.width / rect.width;
+    const scaleY = state.videoMetadata.height / rect.height;
+    
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    
+    setDrawingBox({ startX: x, startY: y, currentX: x, currentY: y });
+  };
+
+  const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!drawingBox || !state.videoMetadata) return;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    
+    const scaleX = state.videoMetadata.width / rect.width;
+    const scaleY = state.videoMetadata.height / rect.height;
+    
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+    
+    setDrawingBox(prev => prev ? { ...prev, currentX: x, currentY: y } : null);
+  };
+
+  const handleSvgMouseUp = () => {
+    if (!drawingBox) return;
+    
+    const x_min = Math.min(drawingBox.startX, drawingBox.currentX);
+    const x_max = Math.max(drawingBox.startX, drawingBox.currentX);
+    const y_min = Math.min(drawingBox.startY, drawingBox.currentY);
+    const y_max = Math.max(drawingBox.startY, drawingBox.currentY);
+    
+    if (x_max - x_min > 10 && y_max - y_min > 10) {
+      const highestTrackId = Math.max(0, ...Object.values(state.playerBoxes).flatMap(frameBoxes => frameBoxes.map(b => b.track_id)));
+      
+      const newBox: PlayerBox = {
+        x_min, y_min, x_max, y_max,
+        track_id: highestTrackId + 1,
+        is_active: false
+      };
+      
+      saveToHistory(state);
+      setState(prev => {
+        const newBoxesState = { ...prev.playerBoxes };
+        for (let f = prev.currentFrame - 2; f <= prev.currentFrame + 2; f++) {
+          if (f >= 0) {
+            newBoxesState[f] = [...(newBoxesState[f] || []), { ...newBox }];
+          }
+        }
+        
+        return {
+          ...prev,
+          playerBoxes: newBoxesState,
+          manualActions: [...(prev.manualActions || []), { 
+            frame: prev.currentFrame, 
+            track_id: newBox.track_id, 
+            action: 'draw_box', 
+            box: newBox 
+          }]
+        };
+      });
+      
+      setSelectedTrackId(newBox.track_id);
+    }
+    
+    setDrawingBox(null);
+  };
+
   const getValidationWarnings = () => {
     const warnings: { type: string, msg: string }[] = [];
     if (!state.videoMetadata) return warnings;
@@ -1085,6 +1214,21 @@ function App() {
         warnings.push({ type: 'error', msg: 'end_rally is before start_rally' });
       }
     }
+    
+    state.events.forEach(ev => {
+      const boxes = state.playerBoxes[ev.frame] || [];
+      
+      const visibleBoxes = boxes.filter(b => {
+        const width = b.x_max - b.x_min;
+        const height = b.y_max - b.y_min;
+        const isOffScreen = b.x_max < 0 || b.y_max < 0 || b.x_min > (state.videoMetadata?.width || 1280) || b.y_min > (state.videoMetadata?.height || 720);
+        return width > 5 && height > 5 && !isOffScreen;
+      });
+
+      if (visibleBoxes.length < 12) {
+        warnings.push({ type: 'warning', msg: `Frame ${ev.frame} (${ev.skill}) has only ${visibleBoxes.length}/12 visible players. Draw missing boxes if needed.` });
+      }
+    });
     
     return warnings;
   };
@@ -1136,10 +1280,102 @@ function App() {
       ranges.push({ trackId, start: currentStart, end: currentEnd });
     });
     
+    // Add skill info to ranges
+    const rangesWithSkill = ranges.map(range => {
+      // Find event that overlaps this range, or is close to it
+      const event = state.events.find(e => e.frame >= range.start - 5 && e.frame <= range.end + 5);
+      return { 
+        ...range, 
+        skillName: event ? event.skill : 'default'
+      };
+    });
+    
     // Sort by start frame
-    return ranges.sort((a, b) => a.start - b.start);
-  }, [state.playerBoxes]);
+    return rangesWithSkill.sort((a, b) => a.start - b.start);
+  }, [state.playerBoxes, state.events]);
+  if (!isAuthenticated) {
+    return (
+      <div className="landing-container" style={{ 
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', 
+        minHeight: '100vh', padding: '2rem',
+        background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
+      }}>
+        
+        <div style={{ textAlign: 'center', marginBottom: '2.5rem', animation: 'fadeInDown 0.8s ease-out' }}>
+          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
+            <div style={{ position: 'absolute', top: '50%', left: '50%', width: '120px', height: '120px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(15px)', zIndex: 0 }}></div>
+            <img src={`${import.meta.env.BASE_URL}logo.png`} alt="Veritas Pro Logo" style={{ width: '64px', height: '64px', position: 'relative', zIndex: 1, borderRadius: '16px', border: '1px solid rgba(255,255,255,0.15)', boxShadow: '0 8px 32px rgba(0,0,0,0.8)' }} />
+          </div>
+          <h1 style={{ fontSize: '2.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', background: 'linear-gradient(135deg, #ffffff 0%, #94a3b8 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+            Veritas Pro
+          </h1>
+          <p style={{ fontSize: '0.75rem', fontWeight: 700, letterSpacing: '3px', margin: 0, color: 'var(--primary)' }}>
+            POWERED BY THELIOS.AI
+          </p>
+        </div>
 
+        <div style={{ 
+          width: '100%', maxWidth: '400px', padding: '2.5rem', 
+          background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', 
+          borderRadius: '16px', boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)',
+          backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)'
+        }}>
+          <p style={{ margin: '0 0 1.5rem 0', color: 'white', fontWeight: 600, fontSize: '1.1rem', textAlign: 'center' }}>Secure Login</p>
+          
+          <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+            <div>
+              <label htmlFor="username" style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-muted)', fontSize: '0.85rem', fontWeight: 500 }}>Username</label>
+              <input 
+                id="username"
+                name="username"
+                type="text" 
+                value={loginUsername}
+                onChange={e => setLoginUsername(e.target.value)}
+                style={{ width: '100%', padding: '0.8rem 1rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.2)', color: 'white', outline: 'none', transition: 'border 0.2s' }}
+                onFocus={(e) => e.target.style.borderColor = 'var(--primary)'}
+                onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                placeholder="admin"
+                autoComplete="username"
+                autoFocus
+              />
+            </div>
+            <div>
+              <label htmlFor="password" style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-muted)', fontSize: '0.85rem', fontWeight: 500 }}>Password</label>
+              <div style={{ position: 'relative' }}>
+                <input 
+                  id="password"
+                  name="password"
+                  type={showPassword ? "text" : "password"} 
+                  value={loginPassword}
+                  onChange={e => setLoginPassword(e.target.value)}
+                  style={{ width: '100%', padding: '0.8rem 1rem', paddingRight: '2.5rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.2)', color: 'white', outline: 'none', transition: 'border 0.2s' }}
+                  onFocus={(e) => e.target.style.borderColor = 'var(--primary)'}
+                  onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                  placeholder="••••••••"
+                  autoComplete="current-password"
+                />
+                <button 
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  style={{ position: 'absolute', right: '1rem', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: 'rgba(255,255,255,0.4)', cursor: 'pointer', padding: 0, display: 'flex', transition: 'color 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.color = 'white'}
+                  onMouseLeave={(e) => e.currentTarget.style.color = 'rgba(255,255,255,0.4)'}
+                >
+                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
+              </div>
+            </div>
+            
+            {loginError && <div style={{ color: 'var(--color-attack)', fontSize: '0.85rem', textAlign: 'center', background: 'rgba(239, 68, 68, 0.1)', padding: '0.5rem', borderRadius: '6px' }}>{loginError}</div>}
+            
+            <button type="submit" className="btn" style={{ width: '100%', padding: '0.9rem', marginTop: '0.5rem', background: 'var(--primary)', color: 'white', fontWeight: 600, fontSize: '1rem', borderRadius: '8px', boxShadow: '0 4px 14px 0 rgba(59, 130, 246, 0.39)' }}>
+              Sign In &rarr;
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
   if (!videoUrl) {
     if (batchProgress.total > 0 && batchProgress.isRunning) {
       return (
@@ -1174,55 +1410,129 @@ function App() {
       );
     }
 
+    const downloadDocumentation = () => {
+      const docText = `VERITAS PRO - USER GUIDE
+
+1. Getting Started
+   - Drag and drop your MP4 files, ZIP files, or JSON annotation files directly into the "Local Files" area.
+   - The app will load them into the playlist sidebar on the left.
+
+2. Navigation & Hotkeys
+   - [S] : Mark the start of a rally.
+   - [E] : Mark the end of a rally.
+   - [A] : Select the currently active player bounding box.
+   - [Del] : Delete all annotations on the current frame.
+   - [1-6] : Assign a skill to the current frame (Toss, Serve, Reception, Set, Dig, Attack/Block).
+
+3. Bounding Boxes
+   - Double-click an existing bounding box to assign the player to the current skill event.
+   - Click and drag anywhere on the video to manually draw a new bounding box.
+   - Right-click any bounding box to instantly delete it.
+
+4. Action Buttons Explained
+   - Undo: Click this to instantly undo your last action (like drawing a box or assigning a player). It remembers your last 50 actions!
+   - Reset Rally: Completely wipes all manual annotations, drawn boxes, and player assignments for the current video. 
+   - Batch ZIP (Bottom Left): When you are completely finished annotating all videos in the playlist, click this to export your work. It will download a single ZIP file containing all your updated JSON and XML files.
+
+Enjoy using Veritas Pro!
+`;
+      const blob = new Blob([docText], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'Veritas_Pro_User_Guide.txt';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    };
+
     return (
-      <div className="landing-container">
-        <div className="landing-card">
-          <h1 className="landing-title">Volleyball Annotator Pro</h1>
-          <p className="landing-subtitle">
+      <div className="landing-container" style={{ 
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', 
+        minHeight: '100vh', padding: '2rem',
+        background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
+      }}>
+        
+        {/* HEADER SECTION */}
+        <div style={{ textAlign: 'center', marginBottom: '3rem', animation: 'fadeInDown 0.8s ease-out' }}>
+          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
+            <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
+            <img src={`${import.meta.env.BASE_URL}logo.png`} alt="Veritas Pro Logo" style={{ width: '72px', height: '72px', position: 'relative', zIndex: 1, borderRadius: '18px', border: '1px solid rgba(255,255,255,0.15)', boxShadow: '0 10px 40px rgba(0,0,0,0.9)' }} />
+          </div>
+          <h1 style={{ fontSize: '3.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', background: 'linear-gradient(135deg, #ffffff 0%, #94a3b8 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+            Veritas Pro
+          </h1>
+          <p style={{ fontSize: '0.85rem', fontWeight: 700, letterSpacing: '3px', margin: 0, color: 'var(--primary)' }}>
+            POWERED BY THELIOS.AI
+          </p>
+          <p style={{ fontSize: '1.1rem', color: 'var(--text-muted)', maxWidth: '500px', margin: '1.5rem auto 0 auto', lineHeight: 1.5 }}>
             Advanced skill tracking and batch processing pipeline.<br/>
             Load individual rallies or entire match datasets to begin.
           </p>
-          
-          <div className="landing-grid">
-            <label 
-              className="landing-option"
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => { e.preventDefault(); void handlePlaylistFiles(e.dataTransfer.files); }}
-            >
-              <div className="icon-wrapper">
-                <Upload size={32} />
-              </div>
-              <h3>1. Local Files (No Sync)</h3>
-              <p>Drag & drop MP4, ZIP, or JSON files</p>
-              <input type="file" accept="video/mp4,application/zip,.zip,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
-            </label>
-
-            <div className="landing-option">
-              <div className="icon-wrapper">
-                <FolderArchive size={32} />
-              </div>
-              <h3 style={{ marginBottom: '1rem' }}>2. Process Local & Sync</h3>
-              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Process local videos and automatically upload only XMLs to Google Drive.</p>
-              {!destinationFolderId ? (
-                <GoogleDriveConnector mode="destination" onDestinationSelected={(id) => setDestinationFolderId(id)} onTokenReceived={(t) => { googleTokenRef.current = t; }} buttonText="Select Destination Folder" />
-              ) : (
-                <label className="btn" style={{ width: '100%', cursor: 'pointer', textAlign: 'center', display: 'block', backgroundColor: 'var(--primary)' }}>
-                  Now Select Local Videos
-                  <input type="file" accept="video/mp4,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
-                </label>
-              )}
-            </div>
-
-            <div className="landing-option">
-              <div className="icon-wrapper">
-                <FolderArchive size={32} />
-              </div>
-              <h3 style={{ marginBottom: '1rem' }}>3. Cloud Load</h3>
-              <p style={{ fontSize: '0.85rem', color: 'rgba(255,255,255,0.7)', marginBottom: '1rem' }}>Load and process from a Google Drive folder.</p>
-              <GoogleDriveConnector onPlaylistLoaded={handleDrivePlaylist} onTokenReceived={(t) => { googleTokenRef.current = t; window.alert('Google Drive connected!'); }} buttonText="Select Cloud Folder" />
-            </div>
-          </div>
         </div>
+
+        {/* DROPZONE */}
+        <label 
+          className="premium-dropzone"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => { e.preventDefault(); void handlePlaylistFiles(e.dataTransfer.files); }}
+          style={{ 
+            width: '100%', maxWidth: '700px', padding: '3rem 2rem', 
+            background: 'rgba(255,255,255,0.02)', border: '1px dashed rgba(255,255,255,0.15)', 
+            borderRadius: '16px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.3s ease',
+            boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)', marginBottom: '3rem', position: 'relative', overflow: 'hidden'
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = 'rgba(59, 130, 246, 0.05)';
+            e.currentTarget.style.borderColor = 'var(--primary)';
+            e.currentTarget.style.transform = 'translateY(-2px)';
+            e.currentTarget.style.boxShadow = '0 15px 40px -10px rgba(59, 130, 246, 0.3)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = 'rgba(255,255,255,0.02)';
+            e.currentTarget.style.borderColor = 'rgba(255,255,255,0.15)';
+            e.currentTarget.style.transform = 'translateY(0)';
+            e.currentTarget.style.boxShadow = '0 10px 40px -10px rgba(0,0,0,0.5)';
+          }}
+        >
+          <div style={{ background: 'rgba(59, 130, 246, 0.1)', width: '64px', height: '64px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1.5rem auto', color: 'var(--primary)' }}>
+            <Upload size={32} />
+          </div>
+          <h2 style={{ fontSize: '1.5rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Upload Local Files</h2>
+          <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.95rem' }}>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, or <strong>JSON</strong> files here to start annotating.</p>
+          <input type="file" accept="video/mp4,application/zip,.zip,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
+        </label>
+
+        {/* FEATURE CARDS (Replaces old Documentation list) */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', width: '100%', maxWidth: '900px' }}>
+          
+          <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+            <div style={{ color: '#fbbf24', marginBottom: '0.8rem' }}><Settings size={24} /></div>
+            <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Hotkeys</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>Use keys <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>1-6</code> for assigning skills. Use <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>S</code> & <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>E</code> to mark rally boundaries.</p>
+          </div>
+
+          <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+            <div style={{ color: '#4ade80', marginBottom: '0.8rem' }}><FileVideo size={24} /></div>
+            <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Bounding Boxes</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>Click & drag over players to track. Double-click any box to instantly assign them to the active frame's skill.</p>
+          </div>
+
+          <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+            <div style={{ color: '#a78bfa', marginBottom: '0.8rem' }}><Download size={24} /></div>
+            <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Export Data</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>Click Batch ZIP in the sidebar to securely download perfectly synced JSON/XML datasets for model training.</p>
+          </div>
+          
+        </div>
+
+        <div style={{ marginTop: '3rem' }}>
+          <button onClick={downloadDocumentation} className="btn outline" style={{ fontSize: '0.85rem', padding: '0.6rem 1.2rem', borderRadius: '20px', color: 'var(--text-muted)', borderColor: 'rgba(255,255,255,0.2)' }}>
+            Download Full Guide (.txt)
+          </button>
+        </div>
+
       </div>
     );
   }
@@ -1230,10 +1540,23 @@ function App() {
   return (
     <div className="app-container">
       {/* PLAYLIST SIDEBAR */}
-      <div className="sidebar" style={{ minWidth: '200px', maxWidth: '250px' }}>
-        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h2>Playlist ({state.currentPlaylistIndex + 1}/{state.playlist.length})</h2>
+      <div className="sidebar" style={{ minWidth: '200px', maxWidth: '250px', overflowY: 'hidden' }}>
+        
+        {/* BRANDING HEADER */}
+        <div style={{ flexShrink: 0, paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', paddingLeft: '0.5rem' }}>
+          <img src={`${import.meta.env.BASE_URL}logo.png`} alt="Veritas Pro Logo" style={{ width: '38px', height: '38px', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.15)', boxShadow: '0 4px 12px rgba(0,0,0,0.4)' }} />
+          <div>
+            <h1 style={{ fontSize: '1.2rem', letterSpacing: '1px', textTransform: 'uppercase', margin: 0, fontWeight: 700, lineHeight: 1.1, textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>Veritas Pro</h1>
+            <p style={{ fontSize: '0.6rem', color: 'var(--primary)', letterSpacing: '1px', margin: 0, fontWeight: 700, marginTop: '2px', textShadow: '0 1px 2px rgba(0,0,0,0.5)' }}>BY THELIOS.AI</p>
+          </div>
+        </div>
+
+        {/* PLAYLIST PANEL */}
+        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <h2 style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Playlist ({state.currentPlaylistIndex + 1} / {state.playlist.length})
+            </h2>
             <button 
               className="btn outline icon-only" 
               onClick={() => {
@@ -1242,36 +1565,63 @@ function App() {
                 setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
               }}
               title="Return to Home"
+              style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', borderRadius: '6px' }}
             >
               Home
             </button>
           </div>
-          
-          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
-            {state.playlist.map((item, index) => (
-              <div 
-                key={item.id} 
-                onClick={() => changeVideo(index)}
-                style={{ 
-                  padding: '0.5rem', 
-                  backgroundColor: index === state.currentPlaylistIndex ? 'var(--primary-dark)' : 'rgba(255,255,255,0.05)',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '0.85rem',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem'
-                }}
-              >
+          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.25rem', marginTop: '0.2rem' }}>
+            {state.playlist.map((item, index) => {
+              const isActive = index === state.currentPlaylistIndex;
+              return (
+                <div 
+                  key={item.id} 
+                  onClick={() => changeVideo(index)}
+                  style={{ 
+                    padding: '0.6rem 0.8rem', 
+                    background: isActive ? 'linear-gradient(90deg, rgba(59, 130, 246, 0.25) 0%, transparent 100%)' : 'transparent',
+                    borderLeft: isActive ? '3px solid var(--primary)' : '3px solid transparent',
+                    borderRadius: '0 8px 8px 0',
+                    cursor: 'pointer',
+                    fontSize: '0.85rem',
+                    fontWeight: isActive ? 600 : 400,
+                    color: isActive ? 'white' : 'var(--text-muted)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.6rem',
+                    transition: 'all 0.2s ease'
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isActive) e.currentTarget.style.background = 'rgba(255,255,255,0.03)';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isActive) e.currentTarget.style.background = 'transparent';
+                  }}
+                >
                 <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {item.name}
                 </div>
                 {item.isCompleted && <CheckCircle size={14} color="var(--color-serve)" />}
               </div>
-            ))}
+            );
+          })}
           </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '1rem' }}>
+          {warnings.length > 0 && (
+            <div style={{ maxHeight: '150px', overflowY: 'auto', marginTop: '1rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.5rem', flexShrink: 0 }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 'bold', marginBottom: '0.5rem', color: 'var(--color-attack)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <AlertTriangle size={14} /> Validation Warnings
+              </div>
+              {warnings.map((w, i) => (
+                <div key={i} className={`validation-warning ${w.type}`} style={{ padding: '0.4rem', fontSize: '0.75rem', marginBottom: '4px' }}>
+                  {w.type === 'error' ? <AlertCircle size={14} /> : <AlertTriangle size={14} />}
+                  <span>{w.msg}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', flexShrink: 0 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', cursor: 'pointer', color: 'rgba(255,255,255,0.7)' }}>
               <input 
                 type="checkbox" 
@@ -1303,20 +1653,7 @@ function App() {
               <Download size={16} /> Batch ZIP
             </button>
 
-            {state.playlist[state.currentPlaylistIndex]?.rawJsonString && (
-              <button 
-                className="btn" 
-                style={{ backgroundColor: 'var(--color-serve)', marginTop: '0.5rem' }}
-                onClick={() => {
-                  const item = state.playlist[state.currentPlaylistIndex];
-                  if (item?.rawJsonString) {
-                    exportUpdatedJSON(item.rawJsonString, state.manualActions, item.name, includeMp4InZip, item.file, state.events);
-                  }
-                }}
-              >
-                <Download size={16} /> Download JSON
-              </button>
-            )}
+
           </div>
         </div>
       </div>
@@ -1333,13 +1670,19 @@ function App() {
             crossOrigin="anonymous" // Needed for Drive URLs if they support it
             style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
-          {state.videoMetadata && state.playerBoxes && state.playerBoxes[state.currentFrame] && (
+          {showBoundingBoxes && state.videoMetadata && (
             <svg 
-              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 5 }}
+              ref={svgRef}
+              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'auto', zIndex: 5, cursor: 'crosshair' }}
               viewBox={`0 0 ${state.videoMetadata.width || 1280} ${state.videoMetadata.height || 720}`}
               preserveAspectRatio="xMidYMid meet"
+              onMouseDown={handleSvgMouseDown}
+              onMouseMove={handleSvgMouseMove}
+              onMouseUp={handleSvgMouseUp}
+              onMouseLeave={handleSvgMouseUp}
             >
-              {state.playerBoxes[state.currentFrame].map((box, idx) => {
+              {(state.playerBoxes[state.currentFrame] || []).map((box, idx) => {
+                if (showOnlyActiveBoxes && !box.is_active) return null;
                 const isSelected = selectedTrackId === box.track_id;
                 const color = box.is_active ? '#4ade80' : '#ef4444';
                 return (
@@ -1347,6 +1690,13 @@ function App() {
                     key={idx} 
                     style={{ pointerEvents: 'auto', cursor: 'pointer' }}
                     onClick={() => setSelectedTrackId(box.track_id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (window.confirm("Delete this bounding box?")) {
+                        handleDeleteBox(box.track_id);
+                      }
+                    }}
                     onDoubleClick={(e) => {
                       e.stopPropagation();
                       const hasEvent = state.events.some(ev => ev.frame === state.currentFrame);
@@ -1393,6 +1743,20 @@ function App() {
                   </g>
                 );
               })}
+              
+              {drawingBox && (
+                <rect 
+                  x={Math.min(drawingBox.startX, drawingBox.currentX)}
+                  y={Math.min(drawingBox.startY, drawingBox.currentY)}
+                  width={Math.abs(drawingBox.currentX - drawingBox.startX)}
+                  height={Math.abs(drawingBox.currentY - drawingBox.startY)}
+                  fill="rgba(255,255,255,0.2)"
+                  stroke="#fff"
+                  strokeWidth="4"
+                  strokeDasharray="5,5"
+                  style={{ pointerEvents: 'none' }}
+                />
+              )}
             </svg>
           )}
           {(() => {
@@ -1467,6 +1831,33 @@ function App() {
             >+5f</button>
             
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              <button 
+                className={`btn outline ${!showBoundingBoxes ? 'active' : ''}`}
+                onClick={() => setShowBoundingBoxes(prev => !prev)}
+                title={showBoundingBoxes ? "Hide Bounding Boxes" : "Show Bounding Boxes"}
+                style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+              >
+                {showBoundingBoxes ? <EyeOff size={16} /> : <Eye size={16} />}
+                {showBoundingBoxes ? 'Hide All' : 'Show All'}
+              </button>
+              <button 
+                className={`btn outline ${showOnlyActiveBoxes ? 'active' : ''}`}
+                onClick={() => setShowOnlyActiveBoxes(prev => !prev)}
+                title={showOnlyActiveBoxes ? "Show All Boxes" : "Show Only Active Boxes"}
+                style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+                disabled={!showBoundingBoxes}
+              >
+                <Eye size={16} />
+                {showOnlyActiveBoxes ? 'All Players' : 'Active Only'}
+              </button>
+              <button 
+                className="btn outline"
+                onClick={cyclePlaybackRate}
+                title="Change Playback Speed"
+                style={{ padding: '0.5rem', fontFamily: 'monospace', width: '60px' }}
+              >
+                {playbackRate}x
+              </button>
               <div style={{ fontFamily: 'monospace', fontSize: '1.2rem' }}>
                 Frame: {state.currentFrame} / {state.videoMetadata?.frame_count || 0}
               </div>
@@ -1536,6 +1927,7 @@ function App() {
             {state.videoMetadata && activeRanges.map((range, idx) => {
               const startPct = (range.start / state.videoMetadata!.frame_count) * 100;
               const widthPct = ((range.end - range.start) / state.videoMetadata!.frame_count) * 100;
+              const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
               return (
                 <div
                   key={`active-win-${idx}`}
@@ -1544,9 +1936,10 @@ function App() {
                     left: `${startPct}%`,
                     width: `${Math.max(widthPct, 0.2)}%`,
                     height: '100%',
-                    backgroundColor: 'rgba(74, 222, 128, 0.3)',
-                    borderLeft: '1px solid #4ade80',
-                    borderRight: '1px solid #4ade80',
+                    backgroundColor: skillColor,
+                    opacity: 0.3,
+                    borderLeft: `1px solid ${skillColor}`,
+                    borderRight: `1px solid ${skillColor}`,
                     top: 0,
                     cursor: 'pointer',
                     zIndex: 1
@@ -1589,25 +1982,31 @@ function App() {
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem', maxHeight: '150px', overflowY: 'auto', paddingRight: '4px' }}>
             {activeRanges.length === 0 && <span style={{ color: '#64748b' }}>No active players...</span>}
-            {activeRanges.map((range, idx) => (
+            {activeRanges.map((range, idx) => {
+              const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
+              const bgNormal = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 15%, transparent)` : 'rgba(74, 222, 128, 0.15)';
+              const bgHover = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 30%, transparent)` : 'rgba(74, 222, 128, 0.3)';
+              const borderCol = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 40%, transparent)` : 'rgba(74, 222, 128, 0.4)';
+              
+              return (
               <div 
                 key={idx} 
                 style={{ 
-                  background: 'rgba(74, 222, 128, 0.15)', 
-                  border: '1px solid rgba(74, 222, 128, 0.4)', 
+                  background: bgNormal, 
+                  border: `1px solid ${borderCol}`, 
                   padding: '4px 10px', 
                   borderRadius: '6px', 
                   cursor: 'pointer',
                   transition: 'background 0.2s',
                 }}
-                onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(74, 222, 128, 0.3)'}
-                onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(74, 222, 128, 0.15)'}
+                onMouseEnter={(e) => e.currentTarget.style.background = bgHover}
+                onMouseLeave={(e) => e.currentTarget.style.background = bgNormal}
                 onClick={() => seekToFrame(range.start)}
                 title="Click to jump to this action"
               >
-                <strong style={{ color: '#4ade80' }}>Player {range.trackId}:</strong> {range.start} - {range.end}
+                <strong style={{ color: skillColor }}>Player {range.trackId}:</strong> {range.start} - {range.end}
               </div>
-            ))}
+            )})}
           </div>
         </div>
       </div>
@@ -1620,21 +2019,7 @@ function App() {
             <div><strong>File:</strong> {state.videoMetadata?.filename}</div>
             <div><strong>Resolution:</strong> {state.videoMetadata?.width}x{state.videoMetadata?.height}</div>
             <div>
-              <strong>FPS:</strong> 
-              <input 
-                type="number" 
-                value={state.videoMetadata?.fps || 30} 
-                onChange={(e) => {
-                  const val = parseFloat(e.target.value);
-                  if (val > 0) {
-                    setState(prev => ({
-                      ...prev, 
-                      videoMetadata: { ...prev.videoMetadata!, fps: val, frame_count: Math.floor((prev.videoMetadata?.duration || 0) * val) }
-                    }));
-                  }
-                }}
-                style={{ marginLeft: '0.5rem', width: '60px', background: 'rgba(255,255,255,0.1)', border: 'none', color: 'white', padding: '0.2rem', borderRadius: '4px' }}
-              />
+              <strong>FPS:</strong> <span style={{ marginLeft: '0.5rem', color: '#4ade80' }}>{state.videoMetadata?.fps || 'Detecting...'}</span>
             </div>
           </div>
         </div>
@@ -1656,21 +2041,16 @@ function App() {
         </div>
 
         <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <h2 style={{color: 'red'}}>Annotations (DEBUG LENGTH: {state.events.length})</h2>
-          <div style={{color: 'yellow', fontSize: '10px', wordBreak: 'break-all'}}>
-            {JSON.stringify(state.events.slice(0, 2))}
-          </div>
+          <h2>Annotations</h2>
           
-          {warnings.length > 0 && (
-            <div style={{ marginBottom: '1rem' }}>
-              {warnings.map((w, i) => (
-                <div key={i} className={`validation-warning ${w.type}`}>
-                  {w.type === 'error' ? <AlertCircle size={16} /> : <AlertTriangle size={16} />}
-                  <span>{w.msg}</span>
-                </div>
-              ))}
-            </div>
-          )}
+          <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+            <button className="btn outline" style={{ flex: 1, fontSize: '0.85rem' }} onClick={handleUndo} title="Undo last action">
+              Undo
+            </button>
+            <button className="btn outline" style={{ flex: 1, fontSize: '0.85rem', borderColor: 'var(--color-attack)', color: 'var(--color-attack)' }} onClick={handleResetRally} title="Reset all manual annotations for this video">
+              Reset Rally
+            </button>
+          </div>
 
           <div className="table-container">
             <table>
@@ -1698,10 +2078,12 @@ function App() {
                     <tr key={event.frame} className={state.currentFrame === event.frame ? 'active-row' : ''} onClick={() => seekToFrame(event.frame)} style={{ cursor: 'pointer' }}>
                       <td>{event.frame}</td>
                       <td>
-                        <span className={`badge ${skillName}`}>{skillName}</span>
-                        {event.player_id !== undefined && (
-                           <span style={{ marginLeft: '0.5rem', fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)' }}>ID: {event.player_id}</span>
-                        )}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}>
+                          <span className={`badge ${skillName}`} style={{ flexShrink: 0 }}>{skillName}</span>
+                          {event.player_id !== undefined && (
+                             <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)', flexShrink: 0 }}>ID: {event.player_id}</span>
+                          )}
+                        </div>
                       </td>
                       <td>
                         <div style={{ display: 'flex', gap: '0.25rem' }}>
@@ -1738,79 +2120,6 @@ function App() {
             </table>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-            <input
-              ref={importPredictionsInputRef}
-              type="file"
-              accept="application/json,.json"
-              style={{ display: 'none' }}
-              onChange={(e) => {
-                const file = e.target.files?.[0] || null;
-                void handleImportPredictions(file);
-                e.target.value = '';
-              }}
-            />
-            <button
-              className="btn outline"
-              style={{ flex: 1 }}
-              onClick={() => importPredictionsInputRef.current?.click()}
-            >
-              <Upload size={16} /> Import Predictions (JSON)
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
-            <button
-              className="btn outline"
-              style={{ flex: 1 }}
-              onClick={() => { void runTouchModel(); }}
-              disabled={isRunningTouch || isRunningSkill5}
-            >
-              <Settings size={16} /> {isRunningTouch ? 'Running Touch...' : 'Run Touch Model'}
-            </button>
-            <button
-              className="btn outline"
-              style={{ flex: 1 }}
-              onClick={() => { void runSkill5Model(); }}
-              disabled={isRunningTouch || isRunningSkill5}
-            >
-              <Settings size={16} /> {isRunningSkill5 ? 'Running Skill5...' : 'Run 5-class Skill'}
-            </button>
-          </div>
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
-            <button className="btn outline" style={{ flex: 1 }} onClick={() => {
-              if (state.videoMetadata) exportToXML(state.videoMetadata, state.rally, state.events);
-            }} disabled={!state.videoMetadata || warnings.some(w => w.type === 'error')}>
-              <Download size={16} /> Cur XML
-            </button>
-            {googleTokenRef.current && (
-              <button className="btn outline" style={{ flex: 1 }} onClick={() => {
-                const item = state.playlist[state.currentPlaylistIndex];
-                if (!state.videoMetadata) return;
-                
-                // Update the playlist snapshot so it's fresh
-                saveCurrentVideoState();
-
-                // Generate XML using the CURRENT active state, not the old playlist item
-                const xml = generateXMLString(state.videoMetadata, state.rally, state.events);
-                const xmlBlob = new Blob([xml], { type: 'application/xml' });
-                const xmlFilename = `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml`;
-
-                uploadToDrive(googleTokenRef.current!, item.driveFolderId, xmlFilename, xmlBlob, item.driveXmlId)
-                  .then(xmlId => {
-                    if (xmlId) {
-                      setState(prev => {
-                        const np = [...prev.playlist];
-                        np[state.currentPlaylistIndex] = { ...np[state.currentPlaylistIndex], driveXmlId: xmlId };
-                        return { ...prev, playlist: np };
-                      });
-                      window.alert('Saved to Google Drive!');
-                    }
-                  }).catch(e => { console.error(e); window.alert('Failed to save to Google Drive'); });
-              }}>
-                <FolderArchive size={16} /> Sync Drive
-              </button>
-            )}
-          </div>
         </div>
 
       </div>
