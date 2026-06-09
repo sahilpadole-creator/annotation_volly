@@ -1296,51 +1296,54 @@ function App() {
   if (!isAuthenticated) {
     return (
       <div className="landing-container" style={{ 
+        position: 'relative',
         display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', 
         minHeight: '100vh', padding: '2rem',
-        background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
+        background: 'radial-gradient(circle at 50% 50%, #151e2e 0%, #060913 100%)',
+        overflow: 'hidden'
       }}>
         
-        <div style={{ textAlign: 'center', marginBottom: '2.5rem', animation: 'fadeInDown 0.8s ease-out' }}>
-          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
-            <div style={{ position: 'absolute', top: '50%', left: '50%', width: '120px', height: '120px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(15px)', zIndex: 0 }}></div>
-            <img src={`${import.meta.env.BASE_URL}logo.png?v=5`} alt="Veritas Pro Logo" style={{ width: '80px', height: '80px', position: 'relative', zIndex: 1, mixBlendMode: 'screen' }} />
-          </div>
-          <h1 style={{ fontSize: '2.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', background: 'linear-gradient(135deg, #ffffff 0%, #94a3b8 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+        {/* MASSIVE BACKGROUND LOGO & TEXT */}
+        <div style={{ position: 'absolute', top: '5%', left: '50%', transform: 'translateX(-50%)', display: 'flex', flexDirection: 'column', alignItems: 'center', zIndex: 0, width: '100%', pointerEvents: 'none' }}>
+          <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '100%', maxWidth: '800px', objectFit: 'contain', filter: 'drop-shadow(0 20px 40px rgba(0,0,0,0.5))', marginBottom: '-40px', mixBlendMode: 'screen' }} />
+          
+          <h1 style={{ fontSize: '3.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', color: '#ffffff', textShadow: '0 4px 20px rgba(0,0,0,0.8)' }}>
             Veritas Pro
           </h1>
-          <p style={{ fontSize: '0.75rem', fontWeight: 700, letterSpacing: '3px', margin: 0, color: 'var(--primary)' }}>
-            POWERED BY THELIOS.AI
+          <p style={{ fontSize: '0.85rem', fontWeight: 700, letterSpacing: '4px', margin: 0, color: '#3b82f6', textShadow: '0 2px 10px rgba(0,0,0,0.8)' }}>
+            POWERED BY HEELIOS.AI
           </p>
         </div>
 
+        {/* SECURE LOGIN CARD (Overlapping) */}
         <div style={{ 
-          width: '100%', maxWidth: '400px', padding: '2.5rem', 
-          background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', 
-          borderRadius: '16px', boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)',
-          backdropFilter: 'blur(24px)', WebkitBackdropFilter: 'blur(24px)'
+          position: 'relative', zIndex: 10,
+          width: '100%', maxWidth: '400px', padding: '2.5rem', marginTop: '30vh',
+          background: 'rgba(15, 20, 30, 0.7)', border: '1px solid rgba(255,255,255,0.05)', 
+          borderRadius: '16px', boxShadow: '0 20px 50px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.1)',
+          backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)'
         }}>
-          <p style={{ margin: '0 0 1.5rem 0', color: 'white', fontWeight: 600, fontSize: '1.1rem', textAlign: 'center' }}>Secure Login</p>
+          <p style={{ margin: '0 0 2rem 0', color: 'white', fontWeight: 600, fontSize: '1.2rem', textAlign: 'center' }}>Secure Login</p>
           
-          <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+          <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
             <div>
-              <label htmlFor="username" style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-muted)', fontSize: '0.85rem', fontWeight: 500 }}>Username</label>
+              <label htmlFor="username" style={{ display: 'block', marginBottom: '0.5rem', color: 'rgba(255,255,255,0.6)', fontSize: '0.85rem', fontWeight: 500 }}>Username</label>
               <input 
                 id="username"
                 name="username"
                 type="text" 
                 value={loginUsername}
                 onChange={e => setLoginUsername(e.target.value)}
-                style={{ width: '100%', padding: '0.8rem 1rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.2)', color: 'white', outline: 'none', transition: 'border 0.2s' }}
-                onFocus={(e) => e.target.style.borderColor = 'var(--primary)'}
-                onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                style={{ width: '100%', padding: '0.9rem 1rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', background: 'rgba(0,0,0,0.4)', color: 'white', outline: 'none', transition: 'all 0.2s', fontSize: '0.95rem' }}
+                onFocus={(e) => { e.target.style.borderColor = 'var(--primary)'; e.target.style.boxShadow = '0 0 0 2px rgba(59,130,246,0.2)'; }}
+                onBlur={(e) => { e.target.style.borderColor = 'rgba(255,255,255,0.05)'; e.target.style.boxShadow = 'none'; }}
                 placeholder="admin"
                 autoComplete="username"
                 autoFocus
               />
             </div>
             <div>
-              <label htmlFor="password" style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--text-muted)', fontSize: '0.85rem', fontWeight: 500 }}>Password</label>
+              <label htmlFor="password" style={{ display: 'block', marginBottom: '0.5rem', color: 'rgba(255,255,255,0.6)', fontSize: '0.85rem', fontWeight: 500 }}>Password</label>
               <div style={{ position: 'relative' }}>
                 <input 
                   id="password"
@@ -1348,9 +1351,9 @@ function App() {
                   type={showPassword ? "text" : "password"} 
                   value={loginPassword}
                   onChange={e => setLoginPassword(e.target.value)}
-                  style={{ width: '100%', padding: '0.8rem 1rem', paddingRight: '2.5rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.2)', color: 'white', outline: 'none', transition: 'border 0.2s' }}
-                  onFocus={(e) => e.target.style.borderColor = 'var(--primary)'}
-                  onBlur={(e) => e.target.style.borderColor = 'rgba(255,255,255,0.1)'}
+                  style={{ width: '100%', padding: '0.9rem 1rem', paddingRight: '2.5rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', background: 'rgba(0,0,0,0.4)', color: 'white', outline: 'none', transition: 'all 0.2s', fontSize: '0.95rem' }}
+                  onFocus={(e) => { e.target.style.borderColor = 'var(--primary)'; e.target.style.boxShadow = '0 0 0 2px rgba(59,130,246,0.2)'; }}
+                  onBlur={(e) => { e.target.style.borderColor = 'rgba(255,255,255,0.05)'; e.target.style.boxShadow = 'none'; }}
                   placeholder="••••••••"
                   autoComplete="current-password"
                 />
@@ -1368,7 +1371,9 @@ function App() {
             
             {loginError && <div style={{ color: 'var(--color-attack)', fontSize: '0.85rem', textAlign: 'center', background: 'rgba(239, 68, 68, 0.1)', padding: '0.5rem', borderRadius: '6px' }}>{loginError}</div>}
             
-            <button type="submit" className="btn" style={{ width: '100%', padding: '0.9rem', marginTop: '0.5rem', background: 'var(--primary)', color: 'white', fontWeight: 600, fontSize: '1rem', borderRadius: '8px', boxShadow: '0 4px 14px 0 rgba(59, 130, 246, 0.39)' }}>
+            <button type="submit" className="btn" style={{ width: '100%', padding: '1rem', marginTop: '1rem', background: '#3b82f6', color: 'white', fontWeight: 600, fontSize: '1rem', borderRadius: '8px', boxShadow: '0 4px 20px 0 rgba(59, 130, 246, 0.4)', border: 'none', cursor: 'pointer', transition: 'transform 0.1s, box-shadow 0.2s' }}
+                    onMouseDown={e => e.currentTarget.style.transform = 'scale(0.98)'}
+                    onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}>
               Sign In &rarr;
             </button>
           </form>
@@ -1458,7 +1463,7 @@ Enjoy using Veritas Pro!
         <div style={{ textAlign: 'center', marginBottom: '3rem', animation: 'fadeInDown 0.8s ease-out' }}>
           <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
             <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
-            <img src={`${import.meta.env.BASE_URL}logo.png?v=5`} alt="Veritas Pro Logo" style={{ width: '100px', height: '100px', position: 'relative', zIndex: 1, mixBlendMode: 'screen' }} />
+            <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '100px', height: '100px', position: 'relative', zIndex: 1, mixBlendMode: 'screen' }} />
           </div>
           <h1 style={{ fontSize: '3.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', background: 'linear-gradient(135deg, #ffffff 0%, #94a3b8 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
             Veritas Pro
@@ -1544,7 +1549,7 @@ Enjoy using Veritas Pro!
         
         {/* BRANDING HEADER */}
         <div style={{ flexShrink: 0, paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', paddingLeft: '0.5rem' }}>
-          <img src={`${import.meta.env.BASE_URL}logo.png?v=5`} alt="Veritas Pro Logo" style={{ width: '42px', height: '42px', mixBlendMode: 'screen' }} />
+          <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '42px', height: '42px', mixBlendMode: 'screen' }} />
           <div>
             <h1 style={{ fontSize: '1.2rem', letterSpacing: '1px', textTransform: 'uppercase', margin: 0, fontWeight: 700, lineHeight: 1.1, textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>Veritas Pro</h1>
             <p style={{ fontSize: '0.6rem', color: 'var(--primary)', letterSpacing: '1px', margin: 0, fontWeight: 700, marginTop: '2px', textShadow: '0 1px 2px rgba(0,0,0,0.5)' }}>BY THELIOS.AI</p>
