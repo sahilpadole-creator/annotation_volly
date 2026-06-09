@@ -84,8 +84,8 @@ const VolleyballParticles: React.FC = () => {
         this.baseY += this.vy;
 
         // Bounce off screen edges for the base position
-        if (this.baseX < 0 || this.baseX > canvas.width) this.vx *= -1;
-        if (this.baseY < 0 || this.baseY > canvas.height) this.vy *= -1;
+        if (this.baseX < 0 || this.baseX > window.innerWidth) this.vx *= -1;
+        if (this.baseY < 0 || this.baseY > window.innerHeight) this.vy *= -1;
 
         // Interaction physics
         const dx = mouse.x - this.x;

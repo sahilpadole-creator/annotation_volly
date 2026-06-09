@@ -1316,7 +1316,7 @@ function App() {
             Veritas Pro
           </h1>
           <p style={{ fontSize: '0.75rem', fontWeight: 700, letterSpacing: '4px', margin: 0, color: '#3b82f6', textShadow: '0 1px 5px rgba(0,0,0,0.5)' }}>
-            POWERED BY HEELIOS.AI
+            POWERED BY THELIOS.AI
           </p>
         </div>
 
