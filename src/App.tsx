@@ -1303,25 +1303,29 @@ function App() {
         overflow: 'hidden'
       }}>
         
-        {/* MASSIVE BACKGROUND LOGO & TEXT */}
-        <div style={{ position: 'absolute', top: '5%', left: '50%', transform: 'translateX(-50%)', display: 'flex', flexDirection: 'column', alignItems: 'center', zIndex: 0, width: '100%', pointerEvents: 'none' }}>
-          <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '100%', maxWidth: '800px', objectFit: 'contain', filter: 'drop-shadow(0 20px 40px rgba(0,0,0,0.5))', marginBottom: '-40px', mixBlendMode: 'screen' }} />
+        {/* LOGO & TITLE SECTION */}
+        <div style={{ textAlign: 'center', marginBottom: '2.5rem', animation: 'fadeInDown 0.8s ease-out', position: 'relative', zIndex: 10 }}>
+          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
+            <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.2) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
+            <img src={`${import.meta.env.BASE_URL}logo.png?v=7`} alt="Veritas Pro Logo" style={{ width: '130px', height: '130px', position: 'relative', zIndex: 1, filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.5))', mixBlendMode: 'screen' }} />
+          </div>
           
-          <h1 style={{ fontSize: '3.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', color: '#ffffff', textShadow: '0 4px 20px rgba(0,0,0,0.8)' }}>
+          <h1 style={{ fontSize: '2.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', color: '#ffffff', textShadow: '0 2px 10px rgba(0,0,0,0.5)' }}>
             Veritas Pro
           </h1>
-          <p style={{ fontSize: '0.85rem', fontWeight: 700, letterSpacing: '4px', margin: 0, color: '#3b82f6', textShadow: '0 2px 10px rgba(0,0,0,0.8)' }}>
+          <p style={{ fontSize: '0.75rem', fontWeight: 700, letterSpacing: '4px', margin: 0, color: '#3b82f6', textShadow: '0 1px 5px rgba(0,0,0,0.5)' }}>
             POWERED BY HEELIOS.AI
           </p>
         </div>
 
-        {/* SECURE LOGIN CARD (Overlapping) */}
+        {/* SECURE LOGIN CARD */}
         <div style={{ 
           position: 'relative', zIndex: 10,
-          width: '100%', maxWidth: '400px', padding: '2.5rem', marginTop: '30vh',
+          width: '100%', maxWidth: '400px', padding: '2.5rem',
           background: 'rgba(15, 20, 30, 0.7)', border: '1px solid rgba(255,255,255,0.05)', 
           borderRadius: '16px', boxShadow: '0 20px 50px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.1)',
-          backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)'
+          backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)',
+          animation: 'fadeInUp 0.8s ease-out 0.2s both'
         }}>
           <p style={{ margin: '0 0 2rem 0', color: 'white', fontWeight: 600, fontSize: '1.2rem', textAlign: 'center' }}>Secure Login</p>
           
@@ -1463,7 +1467,7 @@ Enjoy using Veritas Pro!
         <div style={{ textAlign: 'center', marginBottom: '3rem', animation: 'fadeInDown 0.8s ease-out' }}>
           <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
             <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
-            <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '100px', height: '100px', position: 'relative', zIndex: 1, mixBlendMode: 'screen' }} />
+            <img src={`${import.meta.env.BASE_URL}logo.png?v=7`} alt="Veritas Pro Logo" style={{ width: '100px', height: '100px', position: 'relative', zIndex: 1, mixBlendMode: 'screen' }} />
           </div>
           <h1 style={{ fontSize: '3.5rem', fontWeight: 800, margin: '0 0 0.5rem 0', letterSpacing: '-1px', background: 'linear-gradient(135deg, #ffffff 0%, #94a3b8 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
             Veritas Pro
@@ -1549,7 +1553,7 @@ Enjoy using Veritas Pro!
         
         {/* BRANDING HEADER */}
         <div style={{ flexShrink: 0, paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', paddingLeft: '0.5rem' }}>
-          <img src={`${import.meta.env.BASE_URL}logo.png?v=6`} alt="Veritas Pro Logo" style={{ width: '42px', height: '42px', mixBlendMode: 'screen' }} />
+          <img src={`${import.meta.env.BASE_URL}logo.png?v=7`} alt="Veritas Pro Logo" style={{ width: '42px', height: '42px', mixBlendMode: 'screen' }} />
           <div>
             <h1 style={{ fontSize: '1.2rem', letterSpacing: '1px', textTransform: 'uppercase', margin: 0, fontWeight: 700, lineHeight: 1.1, textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>Veritas Pro</h1>
             <p style={{ fontSize: '0.6rem', color: 'var(--primary)', letterSpacing: '1px', margin: 0, fontWeight: 700, marginTop: '2px', textShadow: '0 1px 2px rgba(0,0,0,0.5)' }}>BY THELIOS.AI</p>
