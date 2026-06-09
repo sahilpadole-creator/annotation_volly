@@ -4,6 +4,7 @@ import type { AppState, SkillLabel, PlaylistItem, SkillEvent, PlayerBox } from '
 import { exportAllToZip, generateXMLString } from './utils/exportUtils';
 import { detectVideoFps } from './utils/fpsUtils';
 import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations } from './utils/importUtils';
+import VolleyballParticles from './components/VolleyballParticles';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
@@ -1302,6 +1303,7 @@ function App() {
         background: 'radial-gradient(circle at 50% 50%, #151e2e 0%, #060913 100%)',
         overflow: 'hidden'
       }}>
+        <VolleyballParticles />
         
         {/* LOGO & TITLE SECTION */}
         <div style={{ textAlign: 'center', marginBottom: '2.5rem', animation: 'fadeInDown 0.8s ease-out', position: 'relative', zIndex: 10 }}>
