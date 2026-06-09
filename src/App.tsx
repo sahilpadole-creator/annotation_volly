@@ -1305,7 +1305,7 @@ function App() {
         
         {/* LOGO & TITLE SECTION */}
         <div style={{ textAlign: 'center', marginBottom: '2.5rem', animation: 'fadeInDown 0.8s ease-out', position: 'relative', zIndex: 10 }}>
-          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
+          <div style={{ position: 'relative', display: 'inline-block', marginBottom: '0.5rem' }}>
             <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.2) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
             <img src={`${import.meta.env.BASE_URL}logo.png?v=9`} alt="Veritas Pro Logo" style={{ width: '130px', height: '130px', position: 'relative', zIndex: 1, filter: 'drop-shadow(0 10px 20px rgba(0,0,0,0.5))' }} />
           </div>
