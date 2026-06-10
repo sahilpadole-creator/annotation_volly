@@ -1460,13 +1460,13 @@ Enjoy using Veritas Pro!
 
     return (
       <div className="landing-container" style={{ 
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', 
-        minHeight: '100vh', padding: '2rem',
+        display: 'flex', flexDirection: 'column', alignItems: 'center',
+        minHeight: '100vh', padding: '5vh 2rem 2rem 2rem', overflowY: 'auto',
         background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
       }}>
         
         {/* HEADER SECTION */}
-        <div style={{ textAlign: 'center', marginBottom: '3rem', animation: 'fadeInDown 0.8s ease-out' }}>
+        <div style={{ textAlign: 'center', marginBottom: '2rem', animation: 'fadeInDown 0.8s ease-out' }}>
           <div style={{ position: 'relative', display: 'inline-block', marginBottom: '1.5rem' }}>
             <div style={{ position: 'absolute', top: '50%', left: '50%', width: '150px', height: '150px', background: 'radial-gradient(circle, rgba(59, 130, 246, 0.4) 0%, transparent 70%)', transform: 'translate(-50%, -50%)', filter: 'blur(20px)', zIndex: 0 }}></div>
             <img src={`${import.meta.env.BASE_URL}logo.png?v=9`} alt="Veritas Pro Logo" style={{ width: '100px', height: '100px', position: 'relative', zIndex: 1 }} />
@@ -1489,10 +1489,10 @@ Enjoy using Veritas Pro!
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => { e.preventDefault(); void handlePlaylistFiles(e.dataTransfer.files); }}
           style={{ 
-            width: '100%', maxWidth: '700px', padding: '3rem 2rem', 
+            width: '100%', maxWidth: '700px', padding: '2.5rem 2rem', 
             background: 'rgba(255,255,255,0.02)', border: '1px dashed rgba(255,255,255,0.15)', 
             borderRadius: '16px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.3s ease',
-            boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)', marginBottom: '3rem', position: 'relative', overflow: 'hidden'
+            boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)', marginBottom: '2rem', position: 'relative', overflow: 'hidden'
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.background = 'rgba(59, 130, 246, 0.05)';
