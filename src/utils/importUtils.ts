@@ -74,11 +74,9 @@ export const parseJSONAnnotations = (
           });
         }
       });
-      
-      return { parsed: playerBoxes, rawJsonString: jsonString, videoFps: data.fps || data.video_fps };
-    }
-
-    // Otherwise, process old format: data.players
+      // Do NOT return here, so that manual actions can be processed below
+    } else {
+      // Otherwise, process old format: data.players
     const players = data.players || {};
     for (const [pKey, pData] of Object.entries(players)) {
       const anyData = pData as any;
@@ -144,6 +142,7 @@ export const parseJSONAnnotations = (
             track_id: trackId,
             is_active: activeFrames.has(frame_idx) && !removedFrames.has(frame_idx)
           });
+        }
         }
       }
     }
