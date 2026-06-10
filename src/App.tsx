@@ -257,23 +257,24 @@ function App() {
       return action;
     });
 
-    const activePerFrame = new Map<number, number>();
+    const uniqueActionsMap = new Map<string, any>();
     snappedActions.forEach(action => {
-      if (action.action === 'remove') {
-        if (activePerFrame.get(action.frame) === action.track_id) {
-          activePerFrame.delete(action.frame);
-        }
+      const actType = action.action || 'add';
+      const key = `${action.frame}_${action.track_id}_${actType}`;
+      
+      // If the action is draw_box, we definitely want to store it to keep coordinates
+      if (actType === 'draw_box') {
+        uniqueActionsMap.set(key, action);
       } else {
-        activePerFrame.set(action.frame, action.track_id);
+        // For add/remove, if there's already one of the SAME type, we can skip to deduplicate
+        // But we preserve the object so we don't lose anything else
+        if (!uniqueActionsMap.has(key)) {
+          uniqueActionsMap.set(key, action);
+        }
       }
     });
 
-    const finalActions: { frame: number; track_id: number; action?: 'remove' }[] = [];
-    activePerFrame.forEach((track_id, frame) => {
-      finalActions.push({ frame, track_id });
-    });
-    
-    return finalActions;
+    return Array.from(uniqueActionsMap.values());
   };
 
   const applySkillHeuristics = (events: SkillEvent[]): SkillEvent[] => {
