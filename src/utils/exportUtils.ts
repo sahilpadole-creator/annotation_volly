@@ -1,5 +1,5 @@
 import JSZip from 'jszip';
-import type { SkillEvent, Rally, VideoMetadata, PlaylistItem } from '../types';
+import type { SkillEvent, Rally, VideoMetadata, PlaylistItem, PlayerBox } from '../types';
 
 export const exportToJSON = (
   metadata: VideoMetadata,
