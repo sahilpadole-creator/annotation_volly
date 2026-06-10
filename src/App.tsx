@@ -1661,6 +1661,7 @@ Enjoy using Veritas Pro!
                     ...updatedPlaylist[state.currentPlaylistIndex],
                     rally: state.rally,
                     events: state.events,
+                    playerBoxes: state.playerBoxes,
                   };
                 }
                 

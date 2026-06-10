@@ -151,7 +151,8 @@ export const exportUpdatedJSON = async (
 export const generateXMLString = (
   metadata: VideoMetadata,
   rally: Rally,
-  events: SkillEvent[]
+  events: SkillEvent[],
+  playerBoxes: Record<number, PlayerBox[]> = {}
 ): string => {
   let xml = `<?xml version="1.0" encoding="utf-8"?>\n<annotations>\n  <version>1.1</version>\n`;
 
@@ -210,6 +211,21 @@ export const generateXMLString = (
       xml += `    <tag label="end_rally" source="manual"></tag>\n`;
     }
     
+    // Output bounding boxes for this frame if available
+    const boxes = playerBoxes[frame];
+    if (boxes && boxes.length > 0) {
+      boxes.forEach(box => {
+        // A box is assigned if there is an event on this frame AND the event's player_id matches the box's track_id
+        const isAssigned = (event && event.player_id === box.track_id) ? "true" : "false";
+        const skillAttr = (isAssigned === "true" && event) ? `\n      <attribute name="skill">${event.skill}</attribute>` : "";
+        
+        xml += `    <box label="player" xtl="${box.x_min.toFixed(2)}" ytl="${box.y_min.toFixed(2)}" xbr="${box.x_max.toFixed(2)}" ybr="${box.y_max.toFixed(2)}">\n`;
+        xml += `      <attribute name="track_id">${box.track_id}</attribute>\n`;
+        xml += `      <attribute name="is_assigned">${isAssigned}</attribute>${skillAttr}\n`;
+        xml += `    </box>\n`;
+      });
+    }
+    
     xml += `  </image>\n`;
   }
 
@@ -220,9 +236,10 @@ export const generateXMLString = (
 export const exportToXML = (
   metadata: VideoMetadata,
   rally: Rally,
-  events: SkillEvent[]
+  events: SkillEvent[],
+  playerBoxes: Record<number, PlayerBox[]> = {}
 ) => {
-  const xml = generateXMLString(metadata, rally, events);
+  const xml = generateXMLString(metadata, rally, events, playerBoxes);
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -244,7 +261,7 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
     // Add XML annotations if available
     if (item.rally && item.events && item.events.length > 0) {
       const meta = item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 };
-      const xml = generateXMLString(meta, item.rally, item.events);
+      const xml = generateXMLString(meta, item.rally, item.events, item.playerBoxes || {});
       zip.file(`annotations_${stem}.xml`, xml);
       itemHasData = true;
     }
