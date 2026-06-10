@@ -613,6 +613,7 @@ function App() {
            events: state.events,
            rally: state.rally,
            manualActions: state.manualActions,
+           playerBoxes: state.playerBoxes,
            videoMetadata: state.videoMetadata,
            isCompleted: (state.rally.start_frame !== null && state.rally.end_frame !== null)
         };
@@ -857,6 +858,7 @@ function App() {
           rally: prev.rally,
           events: prev.events,
           manualActions: prev.manualActions,
+          playerBoxes: prev.playerBoxes,
           isCompleted: (prev.rally.start_frame !== null && prev.rally.end_frame !== null)
         };
       }
