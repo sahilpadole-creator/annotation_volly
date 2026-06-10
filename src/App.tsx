@@ -992,11 +992,12 @@ function App() {
       const oldAssignedPlayerId = prev.events.find(e => e.frame === frame)?.player_id;
       const assigningNewPlayer = !isCurrentlyAssigned;
       
-      let newActions = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId));
+      // Filter out existing add/remove actions for this player, but PRESERVE draw_box actions!
+      let newActions = currentActions.filter(m => !(m.frame === frame && m.track_id === trackId && m.action !== 'draw_box'));
       
       if (assigningNewPlayer && oldAssignedPlayerId !== undefined && oldAssignedPlayerId !== trackId) {
-        // Remove the old assigned player from actions
-        newActions = newActions.filter(m => !(m.frame === frame && m.track_id === oldAssignedPlayerId));
+        // Remove the old assigned player from actions (also preserving draw_box if any)
+        newActions = newActions.filter(m => !(m.frame === frame && m.track_id === oldAssignedPlayerId && m.action !== 'draw_box'));
         newActions.push({ frame, track_id: oldAssignedPlayerId, action: 'remove' as const });
       }
 
