@@ -228,11 +228,21 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
         const normalized = tagLabel.toLowerCase();
         const matchedSkill = LABEL_TO_SKILL[normalized];
         if (matchedSkill) {
+          let playerId: number | undefined = undefined;
+          const attributes = tags[j].getElementsByTagName("attribute");
+          for (let k = 0; k < attributes.length; k++) {
+            if (attributes[k].getAttribute("name") === "player_id") {
+              const pid = parseInt(attributes[k].textContent || "", 10);
+              if (!isNaN(pid)) playerId = pid;
+            }
+          }
+          
           events.push({
             frame,
             skill: matchedSkill.label,
             class_id: matchedSkill.classId,
-            confidence: 1.0
+            confidence: 1.0,
+            player_id: playerId
           });
         }
       }
