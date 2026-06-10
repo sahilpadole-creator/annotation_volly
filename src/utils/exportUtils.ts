@@ -49,21 +49,41 @@ export const getUpdatedJSONString = (
     if (data.tracks && Array.isArray(data.tracks)) {
       // New format
       manualActions.forEach(mAct => {
-        const track = data.tracks.find((t: any) => t.track_id === mAct.track_id);
+        let track = data.tracks.find((t: any) => t.track_id === mAct.track_id);
+        
+        // If track doesn't exist and we are drawing a box, create the track!
+        if (!track && (mAct.action === 'draw_box' || mAct.action === 'add' || !mAct.action)) {
+          track = { track_id: mAct.track_id, frames: [] };
+          data.tracks.push(track);
+        }
+
         if (track && track.frames) {
-          const frameObj = track.frames.find((f: any) => f.frame_num === mAct.frame);
-          if (frameObj) {
-            frameObj.ball_carrier = mAct.action === 'remove' ? false : true;
-          } else if (mAct.action !== 'remove') {
-            // Push a dummy frame if it doesn't exist to register the action
-            track.frames.push({
-               frame_num: mAct.frame,
-               x: 0, y: 0, w: 0, h: 0, conf: 1.0,
-               ball_carrier: true
-            });
-            // Sort frames
-            track.frames.sort((a: any, b: any) => a.frame_num - b.frame_num);
-          }
+          // If we are drawing a box, we want to inject it into +-2 frames
+          const framesToProcess = (mAct.action === 'draw_box' || mAct.action === 'add' || !mAct.action)
+            ? [mAct.frame - 2, mAct.frame - 1, mAct.frame, mAct.frame + 1, mAct.frame + 2]
+            : [mAct.frame];
+
+          framesToProcess.forEach(fNum => {
+            const frameObj = track.frames.find((f: any) => f.frame_num === fNum);
+            if (frameObj) {
+              frameObj.ball_carrier = mAct.action === 'remove' ? false : true;
+            } else if (mAct.action !== 'remove') {
+              // Read coordinates from the drawn box, if available
+              const w = mAct.box ? (mAct.box.x_max - mAct.box.x_min) : 0;
+              const h = mAct.box ? (mAct.box.y_max - mAct.box.y_min) : 0;
+              const x = mAct.box ? mAct.box.x_min : 0;
+              const y = mAct.box ? mAct.box.y_min : 0;
+              
+              track.frames.push({
+                 frame_num: fNum,
+                 x: x, y: y, w: w, h: h, conf: 1.0,
+                 ball_carrier: true
+              });
+            }
+          });
+          
+          // Sort frames
+          track.frames.sort((a: any, b: any) => a.frame_num - b.frame_num);
         }
       });
     } else {
