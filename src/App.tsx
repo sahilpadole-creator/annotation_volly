@@ -1460,10 +1460,16 @@ Enjoy using Veritas Pro!
 
     return (
       <div className="landing-container" style={{ 
-        display: 'flex', flexDirection: 'column', alignItems: 'center',
-        minHeight: '100vh', padding: '5vh 2rem 2rem 2rem', overflowY: 'auto',
+        display: 'flex', flexDirection: 'column',
+        minHeight: '100vh', overflowY: 'auto',
         background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
       }}>
+        
+        {/* RESPONSIVE CENTERING WRAPPER */}
+        <div style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          margin: 'auto', padding: '4rem 2rem', width: '100%'
+        }}>
         
         {/* HEADER SECTION */}
         <div style={{ textAlign: 'center', marginBottom: '2rem', animation: 'fadeInDown 0.8s ease-out' }}>
@@ -1543,7 +1549,7 @@ Enjoy using Veritas Pro!
             Download Full Guide (.txt)
           </button>
         </div>
-
+        </div>
       </div>
     );
   }
