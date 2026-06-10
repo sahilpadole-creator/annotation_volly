@@ -986,7 +986,7 @@ function App() {
     saveToHistory(state);
     setState(prev => {
       const currentActions = prev.manualActions || [];
-      const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId && m.action !== 'remove');
+      const isCurrentlyAssigned = currentActions.some(m => m.frame === frame && m.track_id === trackId && (m.action === 'add' || !m.action));
       
       // Find if another player is already assigned to this frame
       const oldAssignedPlayerId = prev.events.find(e => e.frame === frame)?.player_id;
