@@ -1703,7 +1703,13 @@ Enjoy using Veritas Pro!
               onMouseUp={handleSvgMouseUp}
               onMouseLeave={handleSvgMouseUp}
             >
-              {(state.playerBoxes[state.currentFrame] || []).map((box, idx) => {
+              {[...(state.playerBoxes[state.currentFrame] || [])]
+                .sort((a, b) => {
+                  const areaA = (a.x_max - a.x_min) * (a.y_max - a.y_min);
+                  const areaB = (b.x_max - b.x_min) * (b.y_max - b.y_min);
+                  return areaB - areaA; // Sort descending: biggest first, smallest last (on top)
+                })
+                .map((box, idx) => {
                 if (showOnlyActiveBoxes && !box.is_active) return null;
                 const isSelected = selectedTrackId === box.track_id;
                 const color = box.is_active ? '#4ade80' : '#ef4444';
