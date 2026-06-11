@@ -139,6 +139,7 @@ function App() {
   const [showOnlyActiveBoxes, setShowOnlyActiveBoxes] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [drawingBox, setDrawingBox] = useState<{ startX: number, startY: number, currentX: number, currentY: number } | null>(null);
+  const [assigningEventFrame, setAssigningEventFrame] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
   const cyclePlaybackRate = () => {
@@ -2115,19 +2116,46 @@ Enjoy using Veritas Pro!
                       </td>
                       <td>
                         <div style={{ display: 'flex', gap: '0.25rem' }}>
-                          <button 
-                            className="btn icon-only outline" 
-                            title="Assign selected player to this skill"
-                            onClick={(e) => { 
-                              e.stopPropagation(); 
-                              if (selectedTrackId !== null) {
-                                handleAssignPlayer(event.frame, selectedTrackId);
-                              } else {
-                                window.alert("Please click a red player bounding box on the video first to select a player!");
-                              }
-                            }}>
-                            <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
-                          </button>
+                          {assigningEventFrame === event.frame ? (
+                            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: '140px', alignItems: 'center' }}>
+                              <span style={{ fontSize: '9px', color: '#999', width: '100%' }}>Select ID:</span>
+                              {Array.from(new Set((state.playerBoxes[event.frame] || []).map(b => b.track_id))).sort((a,b) => a-b).map(id => (
+                                <button 
+                                  key={id}
+                                  className="btn outline"
+                                  style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto' }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleAssignPlayer(event.frame, id);
+                                    setAssigningEventFrame(null);
+                                  }}
+                                >
+                                  {id}
+                                </button>
+                              ))}
+                              {(!state.playerBoxes[event.frame] || state.playerBoxes[event.frame].length === 0) && (
+                                <span style={{ fontSize: '10px', color: '#ef4444' }}>No players detected</span>
+                              )}
+                              <button 
+                                className="btn outline" 
+                                style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto', borderColor: 'transparent', color: '#999' }}
+                                onClick={(e) => { e.stopPropagation(); setAssigningEventFrame(null); }}
+                              >
+                                ×
+                              </button>
+                            </div>
+                          ) : (
+                            <button 
+                              className="btn icon-only outline" 
+                              title="Assign a player from this frame to this skill"
+                              onClick={(e) => { 
+                                e.stopPropagation(); 
+                                seekToFrame(event.frame);
+                                setAssigningEventFrame(event.frame);
+                              }}>
+                              <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
+                            </button>
+                          )}
                           <button className="btn icon-only outline" onClick={(e) => { e.stopPropagation(); setState(prev => ({ ...prev, events: prev.events.filter(ev => ev.frame !== event.frame) })) }}><Trash2 size={14} /></button>
                         </div>
                       </td>
