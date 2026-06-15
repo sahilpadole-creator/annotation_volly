@@ -498,15 +498,49 @@ function App() {
                 return hc;
               });
 
-              // 2. Generate active player boxes for +/- 2 frames
+              // 2. Generate active and inactive player boxes for +/- 2 frames
               assignEvents.forEach((ev: any) => {
-                if (ev.pred_box_xyxy && ev.pred_box_xyxy.length === 4) {
+                const activeTrackId = ev.track_ids && ev.track_ids.length > 0 ? ev.track_ids[0] : null;
+
+                // Process candidates if available (to show all players)
+                let addedActive = false;
+                if (ev.candidates && Array.isArray(ev.candidates)) {
+                  ev.candidates.forEach((cand: any) => {
+                    if (cand.box && cand.box.length === 4) {
+                      const box = cand.box;
+                      const trackId = cand.tid;
+                      const isActive = trackId === activeTrackId;
+                      if (isActive) addedActive = true;
+
+                      for (let f = ev.frame - 2; f <= ev.frame + 2; f++) {
+                        if (!newPlayerBoxes[f]) newPlayerBoxes[f] = [];
+                        
+                        const existingBox = newPlayerBoxes[f].find(b => b.track_id === trackId);
+                        if (!existingBox) {
+                          newPlayerBoxes[f].push({
+                            x_min: box[0],
+                            y_min: box[1],
+                            x_max: box[2],
+                            y_max: box[3],
+                            track_id: trackId,
+                            is_active: isActive
+                          });
+                        } else if (isActive) {
+                          // Upgrade to active if already exists
+                          existingBox.is_active = true;
+                        }
+                      }
+                    }
+                  });
+                }
+                
+                if (!addedActive && ev.pred_box_xyxy && ev.pred_box_xyxy.length === 4) {
+                  // Fallback if candidates are missing but active box exists
                   const box = ev.pred_box_xyxy;
-                  const trackId = ev.track_ids && ev.track_ids.length > 0 ? ev.track_ids[0] : 0;
+                  const trackId = activeTrackId !== null ? activeTrackId : 0;
                   
                   for (let f = ev.frame - 2; f <= ev.frame + 2; f++) {
                     if (!newPlayerBoxes[f]) newPlayerBoxes[f] = [];
-                    // Ensure we don't add duplicate track IDs for the same frame if they somehow exist
                     if (!newPlayerBoxes[f].some(b => b.track_id === trackId)) {
                       newPlayerBoxes[f].push({
                         x_min: box[0],
@@ -517,7 +551,6 @@ function App() {
                         is_active: true
                       });
                     } else {
-                      // Just set active if already there
                       const existingBox = newPlayerBoxes[f].find(b => b.track_id === trackId);
                       if (existingBox) existingBox.is_active = true;
                     }
