@@ -368,9 +368,25 @@ function App() {
       body: formData,
     });
     if (!res.ok) {
-      throw new Error(`Inference failed (${res.status})`);
+      const err = await res.text();
+      throw new Error(`Inference failed: ${err}`);
     }
-    return await res.json();
+    return res.json();
+  };
+
+  const inferAssignPlayer = async (file: File, events: SkillEvent[]) => {
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('skill_events', JSON.stringify(events));
+    const res = await fetch(`${INFERENCE_API_BASE}/api/infer/assign_player`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Assign player inference failed: ${err}`);
+    }
+    return res.json();
   };
 
   const uploadToDrive = async (token: string, folderId: string | undefined, filename: string, blob: Blob, existingId?: string) => {
@@ -464,14 +480,61 @@ function App() {
           const payload = await inferSingleVideo(fileToInfer!);
           const { events, startFrame, endFrame } = parsePredictionsFile(payload);
           
-          const heuristicallyCorrected = applySkillHeuristics(events);
+          let heuristicallyCorrected = applySkillHeuristics(events);
           console.log(`[batch] Original events: ${events.length}, Corrected events: ${heuristicallyCorrected.length}`);
+          
+          let newPlayerBoxes = { ...item.playerBoxes };
+          try {
+            if (heuristicallyCorrected.length > 0) {
+              const assignPayload = await inferAssignPlayer(fileToInfer!, heuristicallyCorrected);
+              const assignEvents = assignPayload.events || [];
+              
+              // 1. Update heuristicallyCorrected with player_id
+              heuristicallyCorrected = heuristicallyCorrected.map(hc => {
+                const assignment = assignEvents.find((e: any) => e.frame === hc.frame);
+                if (assignment && assignment.track_ids && assignment.track_ids.length > 0) {
+                  return { ...hc, player_id: assignment.track_ids[0] };
+                }
+                return hc;
+              });
+
+              // 2. Generate active player boxes for +/- 2 frames
+              assignEvents.forEach((ev: any) => {
+                if (ev.pred_box_xyxy && ev.pred_box_xyxy.length === 4) {
+                  const box = ev.pred_box_xyxy;
+                  const trackId = ev.track_ids && ev.track_ids.length > 0 ? ev.track_ids[0] : 0;
+                  
+                  for (let f = ev.frame - 2; f <= ev.frame + 2; f++) {
+                    if (!newPlayerBoxes[f]) newPlayerBoxes[f] = [];
+                    // Ensure we don't add duplicate track IDs for the same frame if they somehow exist
+                    if (!newPlayerBoxes[f].some(b => b.track_id === trackId)) {
+                      newPlayerBoxes[f].push({
+                        x_min: box[0],
+                        y_min: box[1],
+                        x_max: box[2],
+                        y_max: box[3],
+                        track_id: trackId,
+                        is_active: true
+                      });
+                    } else {
+                      // Just set active if already there
+                      const existingBox = newPlayerBoxes[f].find(b => b.track_id === trackId);
+                      if (existingBox) existingBox.is_active = true;
+                    }
+                  }
+                }
+              });
+            }
+          } catch (err) {
+            console.error('Touch player assignment failed for', item.name, err);
+            // Non-fatal, we just won't have auto-assignments
+          }
           
           const videoFps = (payload as any).video_fps;
           
           const alignedManualActions = alignManualActionsToEvents(item.manualActions || [], heuristicallyCorrected, 5);
-          let newPlayerBoxes = item.playerBoxes;
           if (alignedManualActions.length > 0 && item.rawJsonString) {
+             // Re-apply any manual overrides
              newPlayerBoxes = parseJSONAnnotations(item.rawJsonString, alignedManualActions).parsed;
           }
 
@@ -502,7 +565,8 @@ function App() {
                 ...prev,
                 playlist: newPlaylist,
                 events: heuristicallyCorrected,
-                rally: updatedItem.rally
+                rally: updatedItem.rally,
+                playerBoxes: newPlayerBoxes
               };
             }
             console.log(`[batch] NOT updating main state events! Mismatch index.`);

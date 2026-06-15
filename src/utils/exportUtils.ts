@@ -38,13 +38,15 @@ export const exportToJSON = (
 };
 
 export const getUpdatedJSONString = (
-  rawJsonString: string,
+  rawJsonString: string | undefined | null,
   manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[],
   events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
 ): string | null => {
   try {
-    const data = JSON.parse(rawJsonString);
-    if (!data.players && !data.tracks) return null;
+    let data: any = {};
+    if (rawJsonString) {
+      data = JSON.parse(rawJsonString);
+    }
     
     if (data.tracks && Array.isArray(data.tracks)) {
       // New format
@@ -128,7 +130,7 @@ export const getUpdatedJSONString = (
 };
 
 export const exportUpdatedJSON = async (
-  rawJsonString: string,
+  rawJsonString: string | undefined | null,
   manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[],
   filename: string,
   includeMp4: boolean = false,
@@ -286,8 +288,8 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
       itemHasData = true;
     }
     
-    // Add updated JSON if available
-    if (item.rawJsonString) {
+    // Add updated JSON if we have events, even without raw tracking data
+    if (item.rawJsonString || (item.events && item.events.length > 0)) {
       const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || [], item.events);
       if (updatedJsonString) {
         zip.file(`${stem}_updated.json`, updatedJsonString);
