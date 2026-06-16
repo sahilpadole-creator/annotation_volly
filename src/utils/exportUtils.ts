@@ -40,12 +40,49 @@ export const exportToJSON = (
 export const getUpdatedJSONString = (
   rawJsonString: string | undefined | null,
   manualActions: { frame: number; track_id: number; action?: 'add' | 'remove' | 'draw_box'; box?: any }[],
-  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
+  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[],
+  playerBoxes?: Record<number, PlayerBox[]>
 ): string | null => {
   try {
     let data: any = {};
     if (rawJsonString) {
       data = JSON.parse(rawJsonString);
+    }
+
+    if (!data.tracks || !Array.isArray(data.tracks)) {
+      data.tracks = [];
+    }
+
+    // Embed current player boxes into the tracks structure so they are correctly exported
+    if (playerBoxes && Object.keys(playerBoxes).length > 0) {
+      Object.entries(playerBoxes).forEach(([frameStr, boxes]) => {
+        const frameNum = parseInt(frameStr, 10);
+        boxes.forEach(b => {
+          let track = data.tracks.find((t: any) => t.track_id === b.track_id);
+          if (!track) {
+            track = { track_id: b.track_id, frames: [] };
+            data.tracks.push(track);
+          }
+          const existingFrame = track.frames.find((f: any) => f.frame_num === frameNum);
+          if (existingFrame) {
+            existingFrame.ball_carrier = b.is_active || false;
+            existingFrame.x = b.x_min;
+            existingFrame.y = b.y_min;
+            existingFrame.w = b.x_max - b.x_min;
+            existingFrame.h = b.y_max - b.y_min;
+          } else {
+            track.frames.push({
+              frame_num: frameNum,
+              x: b.x_min,
+              y: b.y_min,
+              w: b.x_max - b.x_min,
+              h: b.y_max - b.y_min,
+              conf: 1.0,
+              ball_carrier: b.is_active || false
+            });
+          }
+        });
+      });
     }
     
     if (data.tracks && Array.isArray(data.tracks)) {
@@ -135,10 +172,11 @@ export const exportUpdatedJSON = async (
   filename: string,
   includeMp4: boolean = false,
   videoFile?: File,
-  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[]
+  events?: { frame: number; skill?: string; player_id?: number; [key: string]: any }[],
+  playerBoxes?: Record<number, PlayerBox[]>
 ) => {
   try {
-    const updatedJsonString = getUpdatedJSONString(rawJsonString, manualActions, events);
+    const updatedJsonString = getUpdatedJSONString(rawJsonString, manualActions, events, playerBoxes);
     if (!updatedJsonString) return;
 
     const stem = filename.replace(/\.[^/.]+$/, "");
@@ -289,8 +327,8 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
     }
     
     // Add updated JSON if we have events, even without raw tracking data
-    if (item.rawJsonString || (item.events && item.events.length > 0)) {
-      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || [], item.events);
+    if (item.rawJsonString || (item.events && item.events.length > 0) || (item.playerBoxes && Object.keys(item.playerBoxes).length > 0)) {
+      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || [], item.events, item.playerBoxes);
       if (updatedJsonString) {
         zip.file(`${stem}_updated.json`, updatedJsonString);
         itemHasData = true;
