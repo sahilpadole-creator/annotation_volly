@@ -1144,6 +1144,29 @@ function App() {
     setSelectedTrackId(null);
   };
 
+  const handleDeleteEvent = (frame: number) => {
+    saveToHistory(state);
+    setState(prev => {
+      const eventToDelete = prev.events.find(ev => ev.frame === frame);
+      const newEvents = prev.events.filter(ev => ev.frame !== frame);
+      
+      // If the event had a player assigned, we should un-assign them so the green highlight and timeline grid goes away
+      let updatedBoxes = prev.playerBoxes;
+      if (eventToDelete && eventToDelete.player_id !== undefined) {
+        updatedBoxes = { ...prev.playerBoxes };
+        for (let f = frame - 2; f <= frame + 2; f++) {
+          if (updatedBoxes[f]) {
+            updatedBoxes[f] = updatedBoxes[f].map(b => 
+              b.track_id === eventToDelete.player_id ? { ...b, is_active: false } : b
+            );
+          }
+        }
+      }
+      
+      return { ...prev, events: newEvents, playerBoxes: updatedBoxes };
+    });
+  };
+
   const handleDeleteBox = (trackIdToDelete: number) => {
     saveToHistory(state);
     setState(prev => {
@@ -2253,7 +2276,16 @@ Enjoy using Veritas Pro!
                               <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
                             </button>
                           )}
-                          <button className="btn icon-only outline" onClick={(e) => { e.stopPropagation(); setState(prev => ({ ...prev, events: prev.events.filter(ev => ev.frame !== event.frame) })) }}><Trash2 size={14} /></button>
+                          <button 
+                            className="btn icon-only outline" 
+                            title="Delete this skill"
+                            onClick={(e) => { 
+                              e.stopPropagation(); 
+                              handleDeleteEvent(event.frame);
+                            }}
+                          >
+                            <Trash2 size={14} />
+                          </button>
                         </div>
                       </td>
                     </tr>
