@@ -1070,6 +1070,19 @@ function App() {
     setState(prev => {
       const isStart = prev.rally.start_frame === prev.currentFrame;
       const isEnd = prev.rally.end_frame === prev.currentFrame;
+      const eventToDelete = prev.events.find(e => e.frame === prev.currentFrame);
+      
+      let updatedBoxes = prev.playerBoxes;
+      if (eventToDelete && eventToDelete.player_id !== undefined) {
+        updatedBoxes = { ...prev.playerBoxes };
+        for (let f = prev.currentFrame - 5; f <= prev.currentFrame + 5; f++) {
+          if (updatedBoxes[f]) {
+            updatedBoxes[f] = updatedBoxes[f].map(b => 
+              String(b.track_id) === String(eventToDelete.player_id) ? { ...b, is_active: false } : b
+            );
+          }
+        }
+      }
       
       return {
         ...prev,
@@ -1077,7 +1090,8 @@ function App() {
           start_frame: isStart ? null : prev.rally.start_frame,
           end_frame: isEnd ? null : prev.rally.end_frame,
         },
-        events: prev.events.filter(e => e.frame !== prev.currentFrame)
+        events: prev.events.filter(e => e.frame !== prev.currentFrame),
+        playerBoxes: updatedBoxes
       };
     });
   };
@@ -1154,10 +1168,10 @@ function App() {
       let updatedBoxes = prev.playerBoxes;
       if (eventToDelete && eventToDelete.player_id !== undefined) {
         updatedBoxes = { ...prev.playerBoxes };
-        for (let f = frame - 2; f <= frame + 2; f++) {
+        for (let f = frame - 5; f <= frame + 5; f++) {
           if (updatedBoxes[f]) {
             updatedBoxes[f] = updatedBoxes[f].map(b => 
-              b.track_id === eventToDelete.player_id ? { ...b, is_active: false } : b
+              String(b.track_id) === String(eventToDelete.player_id) ? { ...b, is_active: false } : b
             );
           }
         }
