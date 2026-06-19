@@ -477,11 +477,22 @@ function App() {
             fileToInfer = new File([blob], item.name, { type: 'video/mp4' });
           }
           
-          const payload = await inferSingleVideo(fileToInfer!);
-          const { events, startFrame, endFrame } = parsePredictionsFile(payload);
-          
-          let heuristicallyCorrected = applySkillHeuristics(events);
-          console.log(`[batch] Original events: ${events.length}, Corrected events: ${heuristicallyCorrected.length}`);
+          let payload: any = null;
+          let heuristicallyCorrected: any[] = [];
+          let startFrame = item.rally?.start_frame ?? null;
+          let endFrame = item.rally?.end_frame ?? null;
+
+          if (item.events && item.events.length > 0) {
+            console.log(`[batch] Skipping skill inference for ${item.name} as events already exist. Using existing events for player assignment.`);
+            heuristicallyCorrected = [...item.events];
+          } else {
+            payload = await inferSingleVideo(fileToInfer!);
+            const parsed = parsePredictionsFile(payload);
+            heuristicallyCorrected = applySkillHeuristics(parsed.events);
+            startFrame = parsed.startFrame ?? startFrame;
+            endFrame = parsed.endFrame ?? endFrame;
+            console.log(`[batch] Original events: ${parsed.events.length}, Corrected events: ${heuristicallyCorrected.length}`);
+          }
           
           let newPlayerBoxes = { ...item.playerBoxes };
           try {
@@ -563,12 +574,20 @@ function App() {
             // Non-fatal, we just won't have auto-assignments
           }
           
-          const videoFps = (payload as any).video_fps;
+          const videoFps = payload ? (payload as any).video_fps : null;
           
           const alignedManualActions = alignManualActionsToEvents(item.manualActions || [], heuristicallyCorrected, 5);
           if (alignedManualActions.length > 0 && item.rawJsonString) {
-             // Re-apply any manual overrides
-             newPlayerBoxes = parseJSONAnnotations(item.rawJsonString, alignedManualActions).parsed;
+             // Re-apply any manual overrides but preserve the new AI tracking boxes
+             const oldBoxes = parseJSONAnnotations(item.rawJsonString, alignedManualActions).parsed;
+             for (const [frameStr, boxes] of Object.entries(oldBoxes)) {
+               const f = parseInt(frameStr, 10);
+               if (!newPlayerBoxes[f]) {
+                 newPlayerBoxes[f] = boxes;
+               } else {
+                 // For frames that have AI predictions, we keep the AI boxes as they have the is_active status
+               }
+             }
           }
 
           const updatedItem = {
@@ -629,8 +648,8 @@ function App() {
 
           }
           
-          const fps = (payload as any).inference_fps || 0;
-          const inferenceTime = (payload as any).inference_time_sec || 0;
+          const fps = payload ? ((payload as any).inference_fps || 0) : 0;
+          const inferenceTime = payload ? ((payload as any).inference_time_sec || 0) : 0;
           setBatchProgress(prev => {
              const newCompleted = prev.completed + 1;
              const newAvg = prev.avgTimeSec === 0 ? inferenceTime : ((prev.avgTimeSec * prev.completed) + inferenceTime) / newCompleted;
@@ -842,7 +861,8 @@ function App() {
         if (!existing || (!existing.isSkillAlgorithmApplied && (!existing.events || existing.events.length === 0))) {
           itemEvents = parsedAnnotations[stem].events;
           itemRally = parsedAnnotations[stem].rally;
-          isApplied = true;
+          // Set to false so the batch processor picks it up to run inferAssignPlayer
+          isApplied = false;
         }
       }
       
@@ -929,6 +949,10 @@ function App() {
       }));
     } else {
       const item = newPlaylistItems[0];
+      if (item.file) {
+        const url = URL.createObjectURL(item.file);
+        setVideoUrl(url);
+      }
       const isRestoring = stateRef.current.videoMetadata?.filename === item.name;
       const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
       
@@ -994,6 +1018,8 @@ function App() {
       if (state.currentFrame > 0) {
         v.currentTime = state.currentFrame / fps;
       }
+      
+      v.playbackRate = playbackRate;
       
       setState(prev => ({
         ...prev,
