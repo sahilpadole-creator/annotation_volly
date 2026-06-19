@@ -1299,32 +1299,35 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [state.currentFrame, seekToFrame, selectedTrackId]);
 
+  const getMousePos = (e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    let pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    pt = pt.matrixTransform(ctm.inverse());
+    return { x: pt.x, y: pt.y };
+  };
+
   const handleSvgMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if (!state.videoMetadata) return;
-    const rect = svgRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    const pos = getMousePos(e);
+    if (!pos) return;
     
-    const scaleX = state.videoMetadata.width / rect.width;
-    const scaleY = state.videoMetadata.height / rect.height;
+    // Prevent default browser drag-and-drop behavior from hijacking mousemove
+    e.preventDefault();
     
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-    
-    setDrawingBox({ startX: x, startY: y, currentX: x, currentY: y });
+    setDrawingBox({ startX: pos.x, startY: pos.y, currentX: pos.x, currentY: pos.y });
   };
 
   const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     if (!drawingBox || !state.videoMetadata) return;
-    const rect = svgRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    const pos = getMousePos(e);
+    if (!pos) return;
     
-    const scaleX = state.videoMetadata.width / rect.width;
-    const scaleY = state.videoMetadata.height / rect.height;
-    
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-    
-    setDrawingBox(prev => prev ? { ...prev, currentX: x, currentY: y } : null);
+    setDrawingBox(prev => prev ? { ...prev, currentX: pos.x, currentY: pos.y } : null);
   };
 
   const handleSvgMouseUp = () => {
