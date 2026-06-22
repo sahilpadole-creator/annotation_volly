@@ -10,10 +10,10 @@ export const detectVideoFps = (file: File): Promise<number | null> => {
       }
     };
 
-    // Safety timeout: if we can't parse the FPS within 500ms, just fallback to default
+    // Safety timeout: if we can't parse the FPS within 2000ms, just fallback to default
     setTimeout(() => {
       safeResolve(null);
-    }, 500);
+    }, 2000);
 
     const mp4boxfile = MP4Box.createFile();
     
@@ -46,9 +46,8 @@ export const detectVideoFps = (file: File): Promise<number | null> => {
       }
     };
     
-    // Read up to 5MB which is enough to catch the moov atom if it's at the start.
-    // If it's at the end, the 500ms timeout will catch it and fallback to 30 FPS.
-    const slice = file.slice(0, 5 * 1024 * 1024);
-    reader.readAsArrayBuffer(slice);
+    // For short rally clips (typically <20MB), we can safely read the entire file
+    // to guarantee we find the moov atom even if it's at the end of the file.
+    reader.readAsArrayBuffer(file);
   });
 };
