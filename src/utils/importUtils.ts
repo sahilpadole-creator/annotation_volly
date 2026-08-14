@@ -5,6 +5,7 @@ import { normalizeAnnotationStem } from './exportUtils';
 export interface ParsedAnnotations {
   rally: Rally;
   events: SkillEvent[];
+  playerBoxes?: Record<number, PlayerBox[]>;
 }
 
 export const parseJSONAnnotations = (
@@ -14,6 +15,50 @@ export const parseJSONAnnotations = (
   try {
     const data = JSON.parse(jsonString);
     const playerBoxes: Record<number, PlayerBox[]> = {};
+
+    if (Array.isArray(data.ball_tracking)) {
+      data.ball_tracking.forEach((entry: any) => {
+        const frame = Number(entry?.frame);
+        if (Number.isNaN(frame)) return;
+        let x_min: number | undefined;
+        let y_min: number | undefined;
+        let x_max: number | undefined;
+        let y_max: number | undefined;
+        if (Array.isArray(entry.box) && entry.box.length >= 4) {
+          [x_min, y_min, x_max, y_max] = entry.box.map((v: unknown) => Number(v));
+        } else if (
+          entry.x_min !== undefined &&
+          entry.y_min !== undefined &&
+          entry.x_max !== undefined &&
+          entry.y_max !== undefined
+        ) {
+          x_min = Number(entry.x_min);
+          y_min = Number(entry.y_min);
+          x_max = Number(entry.x_max);
+          y_max = Number(entry.y_max);
+        }
+        if (
+          x_min === undefined ||
+          y_min === undefined ||
+          x_max === undefined ||
+          y_max === undefined ||
+          !(x_max > x_min && y_max > y_min)
+        ) {
+          return;
+        }
+        playerBoxes[frame] = [{
+          x_min,
+          y_min,
+          x_max,
+          y_max,
+          track_id: 1,
+          is_active: true,
+          conf: Number(entry.conf) || 0,
+          source: 'inference',
+        }];
+      });
+      return { parsed: playerBoxes, rawJsonString: jsonString, videoFps: data.fps || data.video_fps };
+    }
     
     // Check if new format with 'tracks' array
     if (data.tracks && Array.isArray(data.tracks)) {
@@ -258,6 +303,7 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
   
   const rally: Rally = { start_frame: null, end_frame: null };
   const events: SkillEvent[] = [];
+  const playerBoxes: Record<number, PlayerBox[]> = {};
   
   const LABEL_TO_SKILL: Record<string, { label: SkillLabel; classId: number }> = {
     toss: { label: 'toss', classId: 0 },
@@ -313,9 +359,47 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
         }
       }
     }
+
+    const boxes = imageNode.getElementsByTagName("box");
+    for (let j = 0; j < boxes.length; j++) {
+      const boxNode = boxes[j];
+      const label = (boxNode.getAttribute("label") || "").toLowerCase();
+      const xtl = Number(boxNode.getAttribute("xtl"));
+      const ytl = Number(boxNode.getAttribute("ytl"));
+      const xbr = Number(boxNode.getAttribute("xbr"));
+      const ybr = Number(boxNode.getAttribute("ybr"));
+      if (!(xbr > xtl && ybr > ytl)) continue;
+
+      let conf: number | undefined;
+      let trackId = label === "ball" ? 1 : -1;
+      const attributes = boxNode.getElementsByTagName("attribute");
+      for (let k = 0; k < attributes.length; k++) {
+        const attrName = attributes[k].getAttribute("name");
+        const attrValue = attributes[k].textContent || "";
+        if (attrName === "conf") {
+          const parsedConf = Number(attrValue);
+          if (!Number.isNaN(parsedConf)) conf = parsedConf;
+        } else if (attrName === "track_id") {
+          const parsedId = Number(attrValue);
+          if (!Number.isNaN(parsedId)) trackId = parsedId;
+        }
+      }
+
+      if (!playerBoxes[frame]) playerBoxes[frame] = [];
+      playerBoxes[frame].push({
+        x_min: xtl,
+        y_min: ytl,
+        x_max: xbr,
+        y_max: ybr,
+        track_id: trackId,
+        is_active: label === "ball" || true,
+        conf,
+        source: "inference",
+      });
+    }
   }
   
-  return { rally, events };
+  return { rally, events, playerBoxes };
 };
 
 export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations: Record<string, ParsedAnnotations>, jsonAnnotations: Record<string, {parsed: Record<number, PlayerBox[]>, rawJsonString: string}>, videos: File[] }> => {
@@ -351,7 +435,8 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
     } else if (filename.toLowerCase().endsWith('.mp4') || filename.toLowerCase().endsWith('.mov') || filename.toLowerCase().endsWith('.avi')) {
       try {
         const blob = await file.async("blob");
-        const videoFile = new File([blob], filename, { type: 'video/mp4' });
+        const basename = filename.split("/").pop() || filename;
+        const videoFile = new File([blob], basename, { type: "video/mp4" });
         videos.push(videoFile);
       } catch (err) {
         console.error(`Failed to extract video from ZIP: ${filename}`, err);

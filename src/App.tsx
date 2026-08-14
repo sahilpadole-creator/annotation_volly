@@ -1890,17 +1890,30 @@ function App() {
       let itemPlayerBoxes = workflowMode === 'ball' ? {} : (existing?.playerBoxes || {});
       let itemRawJson = workflowMode === 'ball' ? undefined : (existing?.rawJsonString || undefined);
       let itemManualActions = workflowMode === 'ball' ? [] : (existing?.manualActions || []);
+      let jsonFps: number | undefined = undefined;
 
       const nativeFps = await detectVideoFps(file);
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
-      let xmlKey = stem;
-      if (!parsedAnnotations[xmlKey]) {
-        const possibleXmlKey = Object.keys(parsedAnnotations).find(
-          (k) => k.startsWith(stem + '_') || stem.startsWith(k + '_'),
-        );
-        if (possibleXmlKey) xmlKey = possibleXmlKey;
-      }
+      const matchAnnotationKey = (keys: string[]): string => {
+        if (keys.includes(stem)) return stem;
+        const stemBase = stem.split('/').pop() || stem;
+        const found = keys.find((k) => {
+          const kBase = k.split('/').pop() || k;
+          return (
+            k === stem ||
+            kBase === stem ||
+            kBase === stemBase ||
+            k.startsWith(stem + '_') ||
+            stem.startsWith(k + '_') ||
+            kBase.startsWith(stemBase + '_') ||
+            stemBase.startsWith(kBase + '_')
+          );
+        });
+        return found || stem;
+      };
+      const xmlKey = matchAnnotationKey(Object.keys(parsedAnnotations));
+      const jsonKey = matchAnnotationKey(Object.keys(parsedJsonAnnotations));
 
       if (workflowMode === 'touch' && parsedAnnotations[xmlKey]) {
         if (!existing || (!isItemAlgorithmApplied(existing, workflowMode) && (!existing.events || existing.events.length === 0))) {
@@ -1914,19 +1927,21 @@ function App() {
         itemEvents = parsedAnnotations[xmlKey].events;
         itemRally = parsedAnnotations[xmlKey].rally;
         isApplied = OFFLINE_REVIEW_ONLY || itemEvents.length > 0;
-      }
-      
-      let jsonKey = stem;
-      if (!parsedJsonAnnotations[jsonKey]) {
-        const possibleKey = Object.keys(parsedJsonAnnotations).find(k => k.startsWith(stem + '_') || stem.startsWith(k + '_'));
-        if (possibleKey) jsonKey = possibleKey;
+      } else if (workflowMode === 'ball') {
+        if (parsedJsonAnnotations[jsonKey]?.parsed && Object.keys(parsedJsonAnnotations[jsonKey].parsed).length > 0) {
+          itemPlayerBoxes = parsedJsonAnnotations[jsonKey].parsed;
+          itemRawJson = parsedJsonAnnotations[jsonKey].rawJsonString;
+          jsonFps = parsedJsonAnnotations[jsonKey].videoFps;
+          isApplied = true;
+        } else if (parsedAnnotations[xmlKey]?.playerBoxes && Object.keys(parsedAnnotations[xmlKey].playerBoxes).length > 0) {
+          itemPlayerBoxes = parsedAnnotations[xmlKey].playerBoxes;
+          isApplied = true;
+        }
       }
 
       if (itemEvents.length > 0 && itemManualActions.length > 0) {
         itemManualActions = alignManualActionsToEvents(itemManualActions, itemEvents, 5);
       }
-
-      let jsonFps: number | undefined = undefined;
 
       if (workflowMode === 'touch' && parsedJsonAnnotations[jsonKey]) {
         const parsedResult = itemManualActions.length > 0 
@@ -1954,6 +1969,7 @@ function App() {
         events: itemEvents,
         rally: itemRally,
         playerBoxes: itemPlayerBoxes,
+        inferenceBallBoxes: workflowMode === 'ball' ? cloneBallBoxes(itemPlayerBoxes) : existing?.inferenceBallBoxes,
         rawJsonString: itemRawJson,
         manualActions: itemManualActions,
         isTouchAlgorithmApplied: workflowMode === 'touch' ? isApplied : existing?.isTouchAlgorithmApplied,
