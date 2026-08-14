@@ -1,6 +1,99 @@
 import JSZip from 'jszip';
 import type { SkillEvent, Rally, VideoMetadata, PlaylistItem, PlayerBox } from '../types';
 
+const getVideoStem = (filename: string): string => filename.replace(/\.[^/.]+$/, '');
+
+export const getXmlExportFilename = (stem: string, appMode: 'touch' | 'ball' | 'vnl' = 'touch'): string =>
+  appMode === 'ball' ? `ball_tracking_${stem}.xml` : `annotations_${stem}.xml`;
+
+export const getJsonExportFilename = (stem: string, appMode: 'touch' | 'ball' | 'vnl' = 'touch'): string =>
+  appMode === 'ball' ? `${stem}_ball_tracking.json` : `${stem}_updated.json`;
+
+export const getBatchZipFilename = (appMode: 'touch' | 'ball' | 'vnl' = 'touch'): string =>
+  appMode === 'ball' ? 'ball_tracking_batch.zip' : appMode === 'vnl' ? 'vnl_annotations_batch.zip' : 'volleyball_annotations_batch.zip';
+
+/** Strip export prefixes/suffixes so annotations match the video stem again. */
+export const normalizeAnnotationStem = (stem: string): string => {
+  const lastSlash = stem.lastIndexOf('/');
+  const path = lastSlash >= 0 ? stem.substring(0, lastSlash + 1) : '';
+  const name = lastSlash >= 0 ? stem.substring(lastSlash + 1) : stem;
+  const normalized = name
+    .replace(/^annotations_/, '')
+    .replace(/^ball_tracking_/, '')
+    .replace(/_updated$/, '')
+    .replace(/_ball_tracking$/, '')
+    .replace(/_skill_annotations$/, '');
+  return `${path}${normalized}`;
+};
+
+const cloneBallBoxes = (boxes: Record<number, PlayerBox[]>): Record<number, PlayerBox[]> => {
+  const out: Record<number, PlayerBox[]> = {};
+  for (const [frameStr, frameBoxes] of Object.entries(boxes)) {
+    out[Number(frameStr)] = frameBoxes.map((b) => ({ ...b }));
+  }
+  return out;
+};
+
+export const mergeBallBoxesForExport = (
+  inference: Record<number, PlayerBox[]> | undefined,
+  edits: Record<number, PlayerBox[]> | undefined,
+): Record<number, PlayerBox[]> => {
+  const merged = cloneBallBoxes(inference ?? {});
+  if (!edits) return merged;
+  for (const [frameStr, boxes] of Object.entries(edits)) {
+    const frame = Number(frameStr);
+    if (Number.isNaN(frame)) continue;
+    if (boxes.length === 0) {
+      delete merged[frame];
+      continue;
+    }
+    const hasManual = boxes.some((b) => b.source === 'manual');
+    const inferenceMissing = !merged[frame]?.length;
+    if (hasManual || inferenceMissing) {
+      merged[frame] = boxes.map((b) => ({ ...b }));
+    }
+  }
+  return merged;
+};
+
+export const generateBallTrackingJSONString = (
+  metadata: VideoMetadata,
+  playerBoxes: Record<number, PlayerBox[]>,
+): string => {
+  const ballTracking = Object.entries(playerBoxes)
+    .map(([frameStr, boxes]) => {
+      const frame = Number(frameStr);
+      if (Number.isNaN(frame) || boxes.length === 0) return null;
+      const box = boxes[0];
+      return {
+        frame,
+        box: [
+          Number(box.x_min.toFixed(2)),
+          Number(box.y_min.toFixed(2)),
+          Number(box.x_max.toFixed(2)),
+          Number(box.y_max.toFixed(2)),
+        ],
+        conf: box.conf ?? 1,
+        source: box.source ?? 'inference',
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+    .sort((a, b) => a.frame - b.frame);
+
+  const payload = {
+    video: metadata.filename,
+    fps: metadata.fps,
+    width: metadata.width,
+    height: metadata.height,
+    frame_count: metadata.frame_count,
+    frame_index_base: 0,
+    ball_tracking: ballTracking,
+    exported_at: new Date().toISOString(),
+  };
+
+  return JSON.stringify(payload, null, 2);
+};
+
 export const exportToJSON = (
   metadata: VideoMetadata,
   rally: Rally,
@@ -31,8 +124,8 @@ export const exportToJSON = (
   const a = document.createElement('a');
   a.href = url;
   // stem
-  const stem = metadata.filename.replace(/\.[^/.]+$/, "");
-  a.download = `${stem}_skill_annotations.json`;
+  const stem = getVideoStem(metadata.filename);
+  a.download = getJsonExportFilename(stem, 'touch');
   a.click();
   URL.revokeObjectURL(url);
 };
@@ -212,7 +305,8 @@ export const generateXMLString = (
   metadata: VideoMetadata,
   rally: Rally,
   events: SkillEvent[],
-  playerBoxes: Record<number, PlayerBox[]> = {}
+  playerBoxes: Record<number, PlayerBox[]> = {},
+  appMode: 'touch' | 'ball' | 'vnl' = 'touch'
 ): string => {
   let xml = `<?xml version="1.0" encoding="utf-8"?>\n<annotations>\n  <version>1.1</version>\n`;
 
@@ -220,30 +314,43 @@ export const generateXMLString = (
   const eventsByFrame = new Map<number, SkillEvent>();
   // If multiple events on same frame (which validation should prevent, but just in case),
   // requirement says keep highest priority: toss < serve < reception < set < dig < attack/block
-  const priority = { toss: 0, serve: 1, reception: 2, set: 3, dig: 4, attack: 5, block: 5 };
+  const priority = { toss: 0, serve: 1, reception: 2, receive: 2, set: 3, dig: 4, attack: 5, spike: 5, block: 6, score: 7 };
   
-  events.forEach(e => {
-    if (!eventsByFrame.has(e.frame)) {
-      eventsByFrame.set(e.frame, e);
-    } else {
-      const existing = eventsByFrame.get(e.frame)!;
-      // @ts-ignore
-      if (priority[e.skill] > priority[existing.skill]) {
+  if (appMode !== 'ball') {
+    events.forEach(e => {
+      if (!eventsByFrame.has(e.frame)) {
         eventsByFrame.set(e.frame, e);
+      } else {
+        const existing = eventsByFrame.get(e.frame)!;
+        // @ts-ignore
+        if (priority[e.skill] > priority[existing.skill]) {
+          eventsByFrame.set(e.frame, e);
+        }
       }
-    }
-  });
+    });
+  }
 
   const framesToOutput = new Set<number>();
-  if (rally.start_frame !== null) framesToOutput.add(rally.start_frame);
-  if (rally.end_frame !== null) framesToOutput.add(rally.end_frame);
-  eventsByFrame.forEach((_, frame) => framesToOutput.add(frame));
+  if (appMode !== 'ball') {
+    if (appMode !== 'vnl') {
+      if (rally.start_frame !== null) framesToOutput.add(rally.start_frame);
+      if (rally.end_frame !== null) framesToOutput.add(rally.end_frame);
+    }
+    eventsByFrame.forEach((_, frame) => framesToOutput.add(frame));
+  }
+  
+  // Add all frames that have bounding boxes
+  Object.entries(playerBoxes).forEach(([frameStr, boxes]) => {
+    if (boxes && boxes.length > 0) {
+      framesToOutput.add(parseInt(frameStr, 10));
+    }
+  });
 
   const sortedFrames = Array.from(framesToOutput).sort((a, b) => a - b);
 
   for (const frame of sortedFrames) {
-    const isStartRally = rally.start_frame === frame;
-    const isEndRally = rally.end_frame === frame;
+    const isStartRally = appMode !== 'ball' && appMode !== 'vnl' && rally.start_frame === frame;
+    const isEndRally = appMode !== 'ball' && appMode !== 'vnl' && rally.end_frame === frame;
     const event = eventsByFrame.get(frame);
 
     const padFrame = frame.toString().padStart(6, '0');
@@ -261,9 +368,28 @@ export const generateXMLString = (
       if (event.player_id !== undefined) {
         xml += `    <tag label="${event.skill}" source="${src}">\n`;
         xml += `      <attribute name="player_id">${event.player_id}</attribute>\n`;
+        if (event.confidence !== undefined) {
+          xml += `      <attribute name="score">${event.confidence.toFixed(4)}</attribute>\n`;
+        }
+        if (event.xy) {
+          xml += `      <attribute name="x">${event.xy[0].toFixed(4)}</attribute>\n`;
+          xml += `      <attribute name="y">${event.xy[1].toFixed(4)}</attribute>\n`;
+        }
         xml += `    </tag>\n`;
       } else {
-        xml += `    <tag label="${event.skill}" source="${src}"></tag>\n`;
+        if (event.confidence !== undefined || event.xy) {
+          xml += `    <tag label="${event.skill}" source="${src}">\n`;
+          if (event.confidence !== undefined) {
+            xml += `      <attribute name="score">${event.confidence.toFixed(4)}</attribute>\n`;
+          }
+          if (event.xy) {
+            xml += `      <attribute name="x">${event.xy[0].toFixed(4)}</attribute>\n`;
+            xml += `      <attribute name="y">${event.xy[1].toFixed(4)}</attribute>\n`;
+          }
+          xml += `    </tag>\n`;
+        } else {
+          xml += `    <tag label="${event.skill}" source="${src}"></tag>\n`;
+        }
       }
     }
     
@@ -275,14 +401,22 @@ export const generateXMLString = (
     const boxes = playerBoxes[frame];
     if (boxes && boxes.length > 0) {
       boxes.forEach(box => {
-        // A box is assigned if there is an event on this frame AND the event's player_id matches the box's track_id
-        const isAssigned = (event && event.player_id === box.track_id) ? "true" : "false";
-        const skillAttr = (isAssigned === "true" && event) ? `\n      <attribute name="skill">${event.skill}</attribute>` : "";
-        
-        xml += `    <box label="player" xtl="${box.x_min.toFixed(2)}" ytl="${box.y_min.toFixed(2)}" xbr="${box.x_max.toFixed(2)}" ybr="${box.y_max.toFixed(2)}">\n`;
-        xml += `      <attribute name="track_id">${box.track_id}</attribute>\n`;
-        xml += `      <attribute name="is_assigned">${isAssigned}</attribute>${skillAttr}\n`;
-        xml += `    </box>\n`;
+        if (appMode === 'ball') {
+          xml += `    <box label="ball" xtl="${box.x_min.toFixed(2)}" ytl="${box.y_min.toFixed(2)}" xbr="${box.x_max.toFixed(2)}" ybr="${box.y_max.toFixed(2)}">\n`;
+          if (box.conf !== undefined) {
+             xml += `      <attribute name="conf">${box.conf.toFixed(3)}</attribute>\n`;
+          }
+          xml += `    </box>\n`;
+        } else {
+          // A box is assigned if there is an event on this frame AND the event's player_id matches the box's track_id
+          const isAssigned = (event && event.player_id !== undefined && Number(event.player_id) === Number(box.track_id)) ? "true" : "false";
+          const skillAttr = (isAssigned === "true" && event) ? `\n      <attribute name="skill">${event.skill}</attribute>` : "";
+          
+          xml += `    <box label="player" xtl="${box.x_min.toFixed(2)}" ytl="${box.y_min.toFixed(2)}" xbr="${box.x_max.toFixed(2)}" ybr="${box.y_max.toFixed(2)}">\n`;
+          xml += `      <attribute name="track_id">${box.track_id}</attribute>\n`;
+          xml += `      <attribute name="is_assigned">${isAssigned}</attribute>${skillAttr}\n`;
+          xml += `    </box>\n`;
+        }
       });
     }
     
@@ -297,40 +431,62 @@ export const exportToXML = (
   metadata: VideoMetadata,
   rally: Rally,
   events: SkillEvent[],
-  playerBoxes: Record<number, PlayerBox[]> = {}
+  playerBoxes: Record<number, PlayerBox[]> = {},
+  appMode: 'touch' | 'ball' | 'vnl' = 'touch',
 ) => {
-  const xml = generateXMLString(metadata, rally, events, playerBoxes);
+  const xml = generateXMLString(metadata, rally, events, playerBoxes, appMode);
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const stem = metadata.filename.replace(/\.[^/.]+$/, "");
-  a.download = `annotations_${stem}.xml`;
+  const stem = getVideoStem(metadata.filename);
+  a.download = getXmlExportFilename(stem, appMode);
   a.click();
   URL.revokeObjectURL(url);
 };
 
-export const exportAllToZip = async (playlist: PlaylistItem[], download = true, includeMp4 = false): Promise<Blob | null> => {
+export const exportAllToZip = async (playlist: PlaylistItem[], download = true, includeMp4 = false, appMode: 'touch' | 'ball' | 'vnl' = 'touch'): Promise<Blob | null> => {
   const zip = new JSZip();
 
   let hasData = false;
   playlist.forEach(item => {
     let itemHasData = false;
-    const stem = item.name.replace(/\.[^/.]+$/, "");
-    
-    // Add XML annotations if available
-    if (item.rally && item.events && item.events.length > 0) {
-      const meta = item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 };
-      const xml = generateXMLString(meta, item.rally, item.events, item.playerBoxes || {});
-      zip.file(`annotations_${stem}.xml`, xml);
+    const stem = getVideoStem(item.name);
+    const hasEvents = item.events && item.events.length > 0;
+    const hasBoxes = item.playerBoxes && Object.keys(item.playerBoxes).length > 0;
+    const ballBoxes = appMode === 'ball'
+      ? mergeBallBoxesForExport(item.inferenceBallBoxes, item.playerBoxes)
+      : (item.playerBoxes || {});
+    const hasBallBoxes = Object.keys(ballBoxes).length > 0;
+    const meta = item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 };
+
+    if (hasEvents || (appMode === 'ball' && hasBallBoxes)) {
+      const xml = generateXMLString(
+        meta,
+        item.rally || { start_frame: null, end_frame: null },
+        item.events || [],
+        appMode === 'ball' ? ballBoxes : (item.playerBoxes || {}),
+        appMode,
+      );
+      zip.file(getXmlExportFilename(stem, appMode), xml);
       itemHasData = true;
     }
-    
-    // Add updated JSON if we have events, even without raw tracking data
-    if (item.rawJsonString || (item.events && item.events.length > 0) || (item.playerBoxes && Object.keys(item.playerBoxes).length > 0)) {
-      const updatedJsonString = getUpdatedJSONString(item.rawJsonString, item.manualActions || [], item.events, item.playerBoxes);
+
+    if (appMode === 'ball' && hasBallBoxes) {
+      zip.file(
+        getJsonExportFilename(stem, appMode),
+        generateBallTrackingJSONString(meta, ballBoxes),
+      );
+      itemHasData = true;
+    } else if (item.rawJsonString || hasEvents || hasBoxes) {
+      const updatedJsonString = getUpdatedJSONString(
+        item.rawJsonString,
+        item.manualActions || [],
+        item.events,
+        item.playerBoxes,
+      );
       if (updatedJsonString) {
-        zip.file(`${stem}_updated.json`, updatedJsonString);
+        zip.file(getJsonExportFilename(stem, appMode), updatedJsonString);
         itemHasData = true;
       }
     }
@@ -355,7 +511,7 @@ export const exportAllToZip = async (playlist: PlaylistItem[], download = true, 
     const url = URL.createObjectURL(content);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `volleyball_annotations_batch.zip`;
+    a.download = getBatchZipFilename(appMode);
     a.click();
     URL.revokeObjectURL(url);
   }

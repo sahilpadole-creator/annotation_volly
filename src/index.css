@@ -20,6 +20,10 @@
   --color-set: #06b6d4;
   --color-dig: #10b981;
   --color-attack: #f59e0b;
+  --color-block: #ef4444;
+  --color-receive: #3b82f6;
+  --color-score: #a855f7;
+  --color-spike: #f59e0b;
   --color-rally: #ef4444;
 
   --border-radius: 16px;
@@ -145,17 +149,14 @@ body {
 /* Specific components will be styled in their own files or here if small */
 .video-wrapper {
   flex: 1;
+  min-height: 0;
   position: relative;
   border-radius: var(--border-radius);
   overflow: hidden;
   display: flex;
-  align-items: center;
-  justify-content: center;
   background: #000;
 }
 .video-wrapper video {
-  max-width: 100%;
-  max-height: 100%;
   object-fit: contain;
 }
 .video-overlay {
@@ -362,10 +363,13 @@ tr.active-row td {
 .badge.toss { background: var(--color-toss); }
 .badge.serve { background: var(--color-serve); }
 .badge.reception { background: var(--color-reception); }
+.badge.receive { background: var(--color-receive); }
 .badge.set { background: var(--color-set); }
 .badge.dig { background: var(--color-dig); }
 .badge.attack { background: var(--color-attack); }
-.badge.block { background: var(--color-attack); }
+.badge.block { background: var(--color-block); }
+.badge.score { background: var(--color-score); }
+.badge.spike { background: var(--color-attack); }
 
 .hotkey-legend {
   font-size: 0.8rem;

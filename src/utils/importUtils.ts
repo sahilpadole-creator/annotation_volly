@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import type { SkillEvent, Rally, SkillLabel, PlayerBox } from '../types';
+import { normalizeAnnotationStem } from './exportUtils';
 
 export interface ParsedAnnotations {
   rally: Rally;
@@ -53,10 +54,21 @@ export const parseJSONAnnotations = (
         if (track.frames && Array.isArray(track.frames)) {
           track.frames.forEach((f: any) => {
              const frame_idx = f.frame_num;
-             const x_min = f.x;
-             const y_min = f.y;
-             const x_max = f.x + f.w;
-             const y_max = f.y + f.h;
+             
+             let x_min = 0, y_min = 0, x_max = 0, y_max = 0;
+             // Priority 1: standard XYXY native
+             if (f.x_min !== undefined && f.y_min !== undefined && f.x_max !== undefined && f.y_max !== undefined) {
+               x_min = f.x_min; y_min = f.y_min; x_max = f.x_max; y_max = f.y_max;
+             } 
+             // Priority 2: x, y, x2, y2
+             else if (f.x !== undefined && f.y !== undefined && f.x2 !== undefined && f.y2 !== undefined) {
+               x_min = f.x; y_min = f.y; x_max = f.x2; y_max = f.y2;
+             }
+             // Priority 3: standard XYWH (BoTSORT native)
+             else if (f.x !== undefined && f.y !== undefined && f.w !== undefined && f.h !== undefined) {
+               x_min = f.x; y_min = f.y; x_max = f.x + f.w; y_max = f.y + f.h;
+             }
+             
              if (x_max > x_min && y_max > y_min) {
                if (!playerBoxes[frame_idx]) {
                  playerBoxes[frame_idx] = [];
@@ -188,6 +200,58 @@ export const parseJSONAnnotations = (
 };
 
 
+/** Extend partial tracking JSON to cover a longer video (forward/back-fill per track). */
+export const extendPlayerBoxesToFrameCount = (
+  playerBoxes: Record<number, PlayerBox[]>,
+  frameCount: number,
+): Record<number, PlayerBox[]> => {
+  if (frameCount <= 0 || Object.keys(playerBoxes).length === 0) {
+    return playerBoxes;
+  }
+
+  const trackFrames: Record<number, Record<number, PlayerBox>> = {};
+  for (const [frameStr, boxes] of Object.entries(playerBoxes)) {
+    const frame = parseInt(frameStr, 10);
+    if (Number.isNaN(frame)) continue;
+    for (const box of boxes) {
+      if (!trackFrames[box.track_id]) trackFrames[box.track_id] = {};
+      trackFrames[box.track_id][frame] = { ...box };
+    }
+  }
+
+  const out: Record<number, PlayerBox[]> = {};
+  for (const frames of Object.values(trackFrames)) {
+    const sorted = Object.keys(frames).map(Number).sort((a, b) => a - b);
+    if (sorted.length === 0) continue;
+
+    const firstF = sorted[0];
+    const lastF = sorted[sorted.length - 1];
+    const firstBox = frames[firstF];
+    const lastBox = frames[lastF];
+    let prevF = firstF;
+
+    for (let f = 0; f < frameCount; f++) {
+      let box: PlayerBox;
+      if (frames[f]) {
+        box = { ...frames[f] };
+        prevF = f;
+      } else if (f < firstF) {
+        box = { ...firstBox, is_active: false };
+      } else if (f > lastF) {
+        box = { ...lastBox, is_active: false };
+      } else {
+        box = { ...frames[prevF], is_active: false };
+      }
+
+      if (!out[f]) out[f] = [];
+      out[f].push(box);
+    }
+  }
+
+  return out;
+};
+
+
 export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
   const parser = new DOMParser();
   const xmlDoc = parser.parseFromString(xmlString, "text/xml");
@@ -199,12 +263,14 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
     toss: { label: 'toss', classId: 0 },
     serve: { label: 'serve', classId: 1 },
     reception: { label: 'reception', classId: 2 },
-    receive: { label: 'reception', classId: 2 },
     set: { label: 'set', classId: 3 },
     dig: { label: 'dig', classId: 4 },
     attack: { label: 'attack', classId: 5 },
-    block: { label: 'block', classId: 5 },
-    'attack/block': { label: 'attack', classId: 5 },
+    block: { label: 'block', classId: 6 },
+    receive: { label: 'receive', classId: 2 },
+    score: { label: 'score', classId: 3 },
+    spike: { label: 'spike', classId: 6 },
+    'reception/dig': { label: 'reception', classId: 2 },
   };
 
   const images = xmlDoc.getElementsByTagName("image");
@@ -268,16 +334,7 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
       const xmlString = await file.async("string");
       try {
         const parsed = parseXMLAnnotations(xmlString);
-        let stem = filename.replace(/\.xml$/i, '');
-        const lastSlash = stem.lastIndexOf('/');
-        if (lastSlash >= 0) {
-          const path = stem.substring(0, lastSlash + 1);
-          let base = stem.substring(lastSlash + 1);
-          if (base.startsWith('annotations_')) base = base.replace(/^annotations_/, '');
-          stem = path + base;
-        } else {
-          if (stem.startsWith('annotations_')) stem = stem.replace(/^annotations_/, '');
-        }
+        let stem = normalizeAnnotationStem(filename.replace(/\.xml$/i, ''));
         annotations[stem] = parsed;
       } catch (err) {
         console.error(`Failed to parse XML from ZIP: ${filename}`, err);
@@ -286,16 +343,7 @@ export const parseZIPAnnotations = async (zipFile: File): Promise<{ annotations:
       const jsonString = await file.async("string");
       try {
         const result = parseJSONAnnotations(jsonString);
-        let stem = filename.replace(/\.json$/i, '');
-        const lastSlash = stem.lastIndexOf('/');
-        if (lastSlash >= 0) {
-          const path = stem.substring(0, lastSlash + 1);
-          let base = stem.substring(lastSlash + 1);
-          if (base.startsWith('annotations_')) base = base.replace(/^annotations_/, '');
-          stem = path + base;
-        } else {
-          if (stem.startsWith('annotations_')) stem = stem.replace(/^annotations_/, '');
-        }
+        let stem = normalizeAnnotationStem(filename.replace(/\.json$/i, ''));
         jsonAnnotations[stem] = result;
       } catch (err) {
         console.error(`Failed to parse JSON from ZIP: ${filename}`, err);

@@ -1,31 +1,50 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, ArrowRight, ArrowLeft, CheckCircle, Eye, EyeOff } from 'lucide-react';
-import type { AppState, SkillLabel, PlaylistItem, SkillEvent, PlayerBox } from './types';
-import { exportAllToZip, generateXMLString } from './utils/exportUtils';
+import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, ArrowRight, ArrowLeft, CheckCircle, Eye, EyeOff, Maximize, Minimize, MousePointer2, Search, Pencil, Zap } from 'lucide-react';
+import type { AppState, SkillLabel, PlaylistItem, SkillEvent, PlayerBox, InferenceVideoMeta, Rally, VideoMetadata } from './types';
+import { exportAllToZip, generateXMLString, getXmlExportFilename, getBatchZipFilename, normalizeAnnotationStem } from './utils/exportUtils';
 import { detectVideoFps } from './utils/fpsUtils';
-import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations } from './utils/importUtils';
+import { applyBallPostprocess } from './utils/ballPostprocess';
+import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations, extendPlayerBoxesToFrameCount } from './utils/importUtils';
+import {
+  APP_MODE_STORAGE_KEY,
+  EMPTY_APP_STATE,
+  isItemAlgorithmApplied,
+  loadWorkflowState,
+  persistWorkflowState,
+  withAlgorithmApplied,
+  workflowFromAppMode,
+  type WorkflowMode,
+} from './utils/workflowMode';
+import { parseVnlPredictionsToSkillEvents, VNL_LABEL_DEFS } from './utils/vnlAnnotation';
+import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
+import { ensureGpuH264File, mapWithConcurrency } from './utils/videoPreview';
 import VolleyballParticles from './components/VolleyballParticles';
+import BlockClipAnnotator from './components/BlockClipAnnotator';
 import './index.css';
 
 const SKILL_MAP: Record<string, { label: SkillLabel; classId: number }> = {
-  '1': { label: 'toss', classId: 0 },
-  '2': { label: 'serve', classId: 1 },
-  '3': { label: 'reception', classId: 2 },
-  '4': { label: 'set', classId: 3 },
-  '5': { label: 'dig', classId: 4 },
-  '6': { label: 'attack', classId: 5 } // Combined attack/block
+  '1': { label: 'toss', classId: SKILL_CLASS_IDS.toss },
+  '2': { label: 'serve', classId: SKILL_CLASS_IDS.serve },
+  '3': { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+  '4': { label: 'set', classId: SKILL_CLASS_IDS.set },
+  '5': { label: 'dig', classId: SKILL_CLASS_IDS.dig },
+  '6': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+  '7': { label: 'block', classId: SKILL_CLASS_IDS.block },
 };
 
 const LABEL_TO_SKILL: Record<string, { label: SkillLabel; classId: number }> = {
-  toss: { label: 'toss', classId: 0 },
-  serve: { label: 'serve', classId: 1 },
-  reception: { label: 'reception', classId: 2 },
-  receive: { label: 'reception', classId: 2 },
-  set: { label: 'set', classId: 3 },
-  dig: { label: 'dig', classId: 4 },
-  attack: { label: 'attack', classId: 5 },
-  block: { label: 'block', classId: 5 },
-  'attack/block': { label: 'attack', classId: 5 },
+  toss: { label: 'toss', classId: SKILL_CLASS_IDS.toss },
+  serve: { label: 'serve', classId: SKILL_CLASS_IDS.serve },
+  reception: { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+  receive: { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+  'reception/dig': { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+  set: { label: 'set', classId: SKILL_CLASS_IDS.set },
+  dig: { label: 'dig', classId: SKILL_CLASS_IDS.dig },
+  attack: { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+  block: { label: 'block', classId: SKILL_CLASS_IDS.block },
+  'attack/block': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+  score: { label: 'score', classId: 7 },
+  spike: { label: 'attack', classId: SKILL_CLASS_IDS.attack },
 };
 
 type PredictionLike = { frame?: number | string; label?: string; skill?: string; class_id?: number; confidence?: number };
@@ -40,11 +59,468 @@ type PredictionImportPayload = {
 };
 
 const INFERENCE_API_BASE = import.meta.env.VITE_INFERENCE_API_BASE || 'http://localhost:8000';
+const OFFLINE_REVIEW_ONLY =
+  import.meta.env.VITE_OFFLINE_REVIEW_ONLY === 'true' ||
+  window.location.hostname.endsWith('.github.io');
+
+type AssignPlayerResult = {
+  frame?: number | string;
+  track_ids?: (number | string)[];
+  touch_player?: string;
+  pred_box_xyxy?: number[] | null;
+  candidates?: { tid?: number | string; box?: number[]; [key: string]: unknown }[];
+};
+
+const parseTouchPlayerId = (touchPlayer: unknown): number | undefined => {
+  if (typeof touchPlayer !== 'string' || !touchPlayer.trim()) return undefined;
+  const match = touchPlayer.match(/t?(\d+)/i);
+  if (!match) return undefined;
+  const id = Number(match[1]);
+  return Number.isNaN(id) ? undefined : id;
+};
+
+const extractAssignedTrackId = (assignment: AssignPlayerResult | undefined): number | undefined => {
+  if (!assignment) return undefined;
+  if (assignment.track_ids && assignment.track_ids.length > 0) {
+    const id = Number(assignment.track_ids[0]);
+    if (!Number.isNaN(id)) return id;
+  }
+  return parseTouchPlayerId(assignment.touch_player);
+};
+
+const findAssignmentForFrame = (assignEvents: AssignPlayerResult[], frame: number) =>
+  assignEvents.find((e) => Number(e.frame) === Number(frame));
+
+/** Match OpenCV frame indexing: frame N starts at time N/fps. */
+const timeToFrame = (timeSec: number, fps: number, maxFrame?: number): number => {
+  const frame = Math.floor(timeSec * fps + 1e-4);
+  if (maxFrame !== undefined) return Math.max(0, Math.min(frame, maxFrame));
+  return Math.max(0, frame);
+};
+
+const frameToTime = (frame: number, fps: number, seekToFrameCenter: boolean = false): number =>
+  seekToFrameCenter ? (frame + 0.5) / fps : frame / fps;
+
+/**
+ * Duration-based frame mapping is more robust than fps-based mapping across
+ * rallies with slightly different encoded timing characteristics.
+ */
+const timeToFrameByDuration = (timeSec: number, durationSec: number, frameCount: number): number => {
+  if (!(durationSec > 0) || !(frameCount > 0)) return 0;
+  const ratio = Math.max(0, Math.min(1, timeSec / durationSec));
+  return Math.max(0, Math.min(frameCount - 1, Math.floor(ratio * frameCount)));
+};
+
+const frameToTimeByDuration = (frame: number, durationSec: number, frameCount: number): number => {
+  if (!(durationSec > 0) || !(frameCount > 0)) return 0;
+  const safeFrame = Math.max(0, Math.min(frameCount - 1, frame));
+  return ((safeFrame + 0.5) / frameCount) * durationSec;
+};
+
+/** VNL: map inference frame index → browser media time (preview may differ in duration from original). */
+const vnlMapFrameToTime = (
+  frame: number,
+  inferenceFrameCount: number,
+  videoDurationSec: number,
+  fps: number,
+): number => {
+  if (videoDurationSec > 0 && inferenceFrameCount > 0) {
+    return frameToTimeByDuration(frame, videoDurationSec, inferenceFrameCount);
+  }
+  return frameToTime(frame, fps, false);
+};
+
+/** VNL: map browser media time → inference frame index. */
+const vnlMapTimeToFrame = (
+  timeSec: number,
+  inferenceFrameCount: number,
+  videoDurationSec: number,
+  fps: number,
+): number => {
+  if (videoDurationSec > 0 && inferenceFrameCount > 0) {
+    return timeToFrameByDuration(timeSec, videoDurationSec, inferenceFrameCount);
+  }
+  return timeToFrame(timeSec, fps, inferenceFrameCount > 0 ? inferenceFrameCount - 1 : undefined);
+};
+
+const estimateBrowserFrameCount = (durationSec: number, fps: number): number => {
+  if (!(durationSec > 0) || !(fps > 0)) return 0;
+  return Math.max(1, Math.ceil(durationSec * fps));
+};
+
+/**
+ * Frame<->time mapping anchored to the video's real first-frame PTS (`baseTime`).
+ *
+ * OpenCV/the preview pipeline index frames by DECODE ORDER (frame 0,1,2,...),
+ * but an MP4 can carry a container start-time offset (e.g. 0.033s ≈ 1 frame).
+ * The browser keeps that offset in the media timeline, so `frame/fps` seeks land
+ * ~1 frame away from the box's frame — invisible for a slow ball, obvious for a
+ * fast one. Anchoring every conversion to `baseTime` (the PTS of decode-frame 0,
+ * measured at runtime via requestVideoFrameCallback) makes the annotator's frame
+ * index identical to the inference's decode index for every rally.
+ */
+const frameToMediaTime = (frame: number, fps: number, baseTime: number): number =>
+  baseTime + (Math.max(0, frame) + 0.5) / fps;
+
+const mediaTimeToFrame = (
+  timeSec: number,
+  fps: number,
+  baseTime: number,
+  maxFrame: number,
+): number => {
+  // floor pairs with frame-center seeks: seek lands at (N+0.5)/fps → frame N.
+  const frame = Math.floor((timeSec - baseTime) * fps + 1e-4);
+  return Math.max(0, Math.min(maxFrame, frame));
+};
+
+/** Map a screen click to normalized [x,y] on the video picture (letterbox-aware). */
+const getNormalizedVideoClick = (
+  video: HTMLVideoElement,
+  clientX: number,
+  clientY: number,
+): [number, number] | null => {
+  const videoW = video.videoWidth;
+  const videoH = video.videoHeight;
+  if (!videoW || !videoH) return null;
+
+  const rect = video.getBoundingClientRect();
+  const elementW = rect.width;
+  const elementH = rect.height;
+  if (elementW <= 0 || elementH <= 0) return null;
+
+  const videoAspect = videoW / videoH;
+  const elementAspect = elementW / elementH;
+  let displayW: number;
+  let displayH: number;
+  let offsetX: number;
+  let offsetY: number;
+
+  if (elementAspect > videoAspect) {
+    displayH = elementH;
+    displayW = elementH * videoAspect;
+    offsetX = (elementW - displayW) / 2;
+    offsetY = 0;
+  } else {
+    displayW = elementW;
+    displayH = elementW / videoAspect;
+    offsetX = 0;
+    offsetY = (elementH - displayH) / 2;
+  }
+
+  const x = (clientX - rect.left - offsetX) / displayW;
+  const y = (clientY - rect.top - offsetY) / displayH;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+  return [Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))];
+};
+
+const getVideoLetterboxLayout = (
+  video: HTMLVideoElement,
+): { displayW: number; displayH: number; offsetX: number; offsetY: number } | null => {
+  const videoW = video.videoWidth;
+  const videoH = video.videoHeight;
+  if (!videoW || !videoH) return null;
+
+  const rect = video.getBoundingClientRect();
+  const elementW = rect.width;
+  const elementH = rect.height;
+  if (elementW <= 0 || elementH <= 0) return null;
+
+  const videoAspect = videoW / videoH;
+  const elementAspect = elementW / elementH;
+  if (elementAspect > videoAspect) {
+    const displayH = elementH;
+    const displayW = elementH * videoAspect;
+    return { displayW, displayH, offsetX: (elementW - displayW) / 2, offsetY: 0 };
+  }
+  const displayW = elementW;
+  const displayH = elementW / videoAspect;
+  return { displayW, displayH, offsetX: 0, offsetY: (elementH - displayH) / 2 };
+};
+
+const normalizedVideoPointToContainerPercent = (
+  xy: [number, number],
+  video: HTMLVideoElement,
+  container: HTMLElement,
+): { left: number; top: number } | null => {
+  const layout = getVideoLetterboxLayout(video);
+  if (!layout) return null;
+  const videoRect = video.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  if (containerRect.width <= 0 || containerRect.height <= 0) return null;
+
+  const px = videoRect.left + layout.offsetX + xy[0] * layout.displayW;
+  const py = videoRect.top + layout.offsetY + xy[1] * layout.displayH;
+  return {
+    left: ((px - containerRect.left) / containerRect.width) * 100,
+    top: ((py - containerRect.top) / containerRect.height) * 100,
+  };
+};
+
+const cloneBallBoxes = (boxes: Record<number, PlayerBox[]>): Record<number, PlayerBox[]> => {
+  const out: Record<number, PlayerBox[]> = {};
+  for (const [frameStr, frameBoxes] of Object.entries(boxes)) {
+    out[Number(frameStr)] = frameBoxes.map((b) => ({ ...b }));
+  }
+  return out;
+};
+
+const buildInferenceVideoMeta = (payload: {
+  video_fps?: number;
+  frame_count?: number;
+  width?: number;
+  height?: number;
+}): InferenceVideoMeta | undefined => {
+  const fps = Number(payload.video_fps);
+  const frame_count = Number(payload.frame_count);
+  const width = Number(payload.width);
+  const height = Number(payload.height);
+  if (!fps || !frame_count) return undefined;
+  return {
+    fps,
+    frame_count,
+    width: width || 1280,
+    height: height || 720,
+  };
+};
+
+const buildVideoMetadataFromInference = (
+  filename: string,
+  payload: { video_fps?: number; frame_count?: number; width?: number; height?: number } | null | undefined,
+  fallback?: VideoMetadata | null,
+): VideoMetadata | null => {
+  const inferenceMeta = buildInferenceVideoMeta(payload ?? {});
+  if (inferenceMeta) {
+    return {
+      filename,
+      fps: inferenceMeta.fps,
+      frame_count: inferenceMeta.frame_count,
+      width: inferenceMeta.width,
+      height: inferenceMeta.height,
+      duration: inferenceMeta.frame_count / inferenceMeta.fps,
+    };
+  }
+  if (fallback) {
+    const fps = Number(payload?.video_fps) || fallback.fps;
+    return { ...fallback, fps };
+  }
+  return fallback ?? null;
+};
+
+const getPlaybackTiming = (
+  meta: { fps: number; frame_count: number; width: number; height: number } | null | undefined,
+  inferenceMeta?: InferenceVideoMeta,
+) => {
+  if (inferenceMeta) return inferenceMeta;
+  return {
+    fps: meta?.fps ?? 30,
+    frame_count: meta?.frame_count ?? 0,
+    width: meta?.width ?? 1280,
+    height: meta?.height ?? 720,
+  };
+};
+
+/** Ball mode: inference frame_count (OpenCV) is often short — allow stepping through full browser video. */
+const getBallPlaybackTiming = (
+  meta: { fps: number; frame_count: number; width: number; height: number; duration?: number } | null | undefined,
+  inferenceMeta?: InferenceVideoMeta,
+) => {
+  const base = inferenceMeta ?? {
+    fps: meta?.fps ?? 30,
+    frame_count: meta?.frame_count ?? 0,
+    width: meta?.width ?? 1280,
+    height: meta?.height ?? 720,
+  };
+  const browserFrames = meta?.duration && base.fps > 0
+    ? Math.ceil(meta.duration * base.fps)
+    : 0;
+  return {
+    ...base,
+    width: meta?.width || base.width,
+    height: meta?.height || base.height,
+    frame_count: Math.max(base.frame_count, browserFrames, meta?.frame_count ?? 0),
+  };
+};
+
+const getTimingForMode = (
+  appMode: 'home' | 'touch' | 'ball' | 'block_clip' | 'vnl',
+  meta: { fps: number; frame_count: number; width: number; height: number; duration?: number } | null | undefined,
+  inferenceMeta?: InferenceVideoMeta,
+) => {
+  if (appMode === 'vnl' && inferenceMeta) {
+    return {
+      fps: inferenceMeta.fps,
+      frame_count: inferenceMeta.frame_count,
+      width: inferenceMeta.width,
+      height: inferenceMeta.height,
+    };
+  }
+  if (appMode === 'ball') {
+    return getBallPlaybackTiming(meta, inferenceMeta);
+  }
+  return getPlaybackTiming(meta, inferenceMeta);
+};
+
+const parseBallBox = (
+  raw: any,
+  videoWidth?: number,
+  videoHeight?: number,
+): [number, number, number, number] | null => {
+  // Support multiple backend shapes: box[x1,y1,x2,y2], xyxy, or x/y/w/h.
+  let x1: number | undefined;
+  let y1: number | undefined;
+  let x2: number | undefined;
+  let y2: number | undefined;
+
+  if (Array.isArray(raw?.box) && raw.box.length >= 4) {
+    [x1, y1, x2, y2] = raw.box.map((v: unknown) => Number(v));
+  } else if (Array.isArray(raw?.xyxy) && raw.xyxy.length >= 4) {
+    [x1, y1, x2, y2] = raw.xyxy.map((v: unknown) => Number(v));
+  } else if (
+    raw?.x_min !== undefined &&
+    raw?.y_min !== undefined &&
+    raw?.x_max !== undefined &&
+    raw?.y_max !== undefined
+  ) {
+    x1 = Number(raw.x_min);
+    y1 = Number(raw.y_min);
+    x2 = Number(raw.x_max);
+    y2 = Number(raw.y_max);
+  } else if (
+    raw?.x !== undefined &&
+    raw?.y !== undefined &&
+    raw?.w !== undefined &&
+    raw?.h !== undefined
+  ) {
+    const x = Number(raw.x);
+    const y = Number(raw.y);
+    const w = Number(raw.w);
+    const h = Number(raw.h);
+    x1 = x;
+    y1 = y;
+    x2 = x + w;
+    y2 = y + h;
+  }
+
+  if ([x1, y1, x2, y2].some((v) => v === undefined || Number.isNaN(v as number))) return null;
+
+  let out: [number, number, number, number] = [x1 as number, y1 as number, x2 as number, y2 as number];
+
+  // Normalize support: if all coordinates are [0..1], scale to pixels.
+  const isNormalized = out.every((v) => v >= 0 && v <= 1);
+  if (isNormalized && videoWidth && videoHeight) {
+    out = [out[0] * videoWidth, out[1] * videoHeight, out[2] * videoWidth, out[3] * videoHeight];
+  }
+
+  if (out[2] <= out[0] || out[3] <= out[1]) return null;
+  return out;
+};
+
+const ballPredictionToPlayerBox = (
+  b: { frame?: number; box?: unknown; conf?: number; rejectReason?: string },
+  videoWidth?: number,
+  videoHeight?: number,
+  rejected = false,
+): { frame: number; box: PlayerBox } | null => {
+  const frame = Number(b.frame);
+  if (Number.isNaN(frame)) return null;
+  const parsedBox = parseBallBox(b, videoWidth, videoHeight);
+  if (!parsedBox) return null;
+  return {
+    frame,
+    box: {
+      x_min: parsedBox[0],
+      y_min: parsedBox[1],
+      x_max: parsedBox[2],
+      y_max: parsedBox[3],
+      track_id: rejected ? 0 : 1,
+      is_active: !rejected,
+      conf: Number(b.conf) || 0,
+      source: 'inference',
+      postprocess_rejected: rejected || undefined,
+      reject_reason: rejected ? (b.rejectReason || 'removed') : undefined,
+    },
+  };
+};
+
+const predictionsToBallBoxMap = (
+  predictions: Array<{ frame?: number; box?: unknown; conf?: number; rejectReason?: string }>,
+  videoWidth?: number,
+  videoHeight?: number,
+  rejected = false,
+): Record<number, PlayerBox[]> => {
+  const out: Record<number, PlayerBox[]> = {};
+  for (const pred of predictions) {
+    const parsed = ballPredictionToPlayerBox(pred, videoWidth, videoHeight, rejected);
+    if (!parsed) continue;
+    out[parsed.frame] = [parsed.box];
+  }
+  return out;
+};
+
+const mergeBallBoxes = (
+  inference: Record<number, PlayerBox[]> | undefined,
+  edits: Record<number, PlayerBox[]> | undefined,
+): Record<number, PlayerBox[]> => {
+  const merged = cloneBallBoxes(inference ?? {});
+  if (!edits) return merged;
+  for (const [frameStr, boxes] of Object.entries(edits)) {
+    const frame = Number(frameStr);
+    if (Number.isNaN(frame)) continue;
+    if (boxes.length === 0) {
+      delete merged[frame];
+      continue;
+    }
+    // Any saved edit for this frame replaces inference (draw, move, resize).
+    merged[frame] = boxes.map((b) => ({ ...b }));
+  }
+  return merged;
+};
+
+const getTrackingCoverage = (playerBoxes?: Record<number, PlayerBox[]>) => {
+  if (!playerBoxes) return { frameCount: 0, maxFrame: -1 };
+  const frameKeys = Object.keys(playerBoxes)
+    .map((f) => parseInt(f, 10))
+    .filter((f) => !Number.isNaN(f));
+  return {
+    frameCount: frameKeys.length,
+    maxFrame: frameKeys.length > 0 ? Math.max(...frameKeys) : -1,
+  };
+};
+
+const hasTouchTrackingData = (item: Pick<PlaylistItem, 'rawJsonString' | 'playerBoxes'>) =>
+  Boolean(item.rawJsonString?.trim()) ||
+  Boolean(item.playerBoxes && Object.keys(item.playerBoxes).length > 0);
+
+const markActivePlayerOnFrames = (
+  playerBoxes: Record<number, PlayerBox[]>,
+  frame: number,
+  trackId: number,
+  predBox?: number[] | null
+) => {
+  for (let f = frame - 2; f <= frame + 2; f++) {
+    if (!playerBoxes[f]) playerBoxes[f] = [];
+    const existingBox = playerBoxes[f].find((b) => Number(b.track_id) === trackId);
+    if (existingBox) {
+      existingBox.is_active = true;
+    } else if (predBox && predBox.length === 4) {
+      playerBoxes[f].push({
+        x_min: predBox[0],
+        y_min: predBox[1],
+        x_max: predBox[2],
+        y_max: predBox[3],
+        track_id: trackId,
+        is_active: true,
+      });
+    }
+  }
+};
 
 function App() {
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
   const [includeMp4InZip, setIncludeMp4InZip] = useState(false);
+  const [inferenceEngine, setInferenceEngine] = useState<"slowfast" | "yolo">("slowfast");
+  const [appMode, setAppMode] = useState<'home' | 'touch' | 'ball' | 'block_clip' | 'vnl'>('home');
   const googleTokenRef = useRef<string | null>(null);
   
   const [state, setState] = useState<AppState>({
@@ -136,11 +612,175 @@ function App() {
 
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [showBoundingBoxes, setShowBoundingBoxes] = useState(true);
+  const [ballEditMode, setBallEditMode] = useState(false);
   const [showOnlyActiveBoxes, setShowOnlyActiveBoxes] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
-  const [drawingBox, setDrawingBox] = useState<{ startX: number, startY: number, currentX: number, currentY: number } | null>(null);
+  const [ballFrameStepFps, setBallFrameStepFps] = useState(5);
+  const [isAutoStepping, setIsAutoStepping] = useState(false);
+  const [drawingBox, setDrawingBox] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  const [draggingBox, setDraggingBox] = useState<{ trackId: number; startX: number; startY: number; initialBox: PlayerBox } | null>(null);
+  const [resizingBox, setResizingBox] = useState<{ trackId: number; startX: number; startY: number; initialBox: PlayerBox; corner: 'tl' | 'tr' | 'bl' | 'br' } | null>(null);
+  const [ballEngine, setBallEngine] = useState<'yolo26' | 'side_view' | 'triplet'>('yolo26');
+  const [backendHealth, setBackendHealth] = useState<Record<string, string> | null>(null);
+  const [ballPostprocessEnabled, setBallPostprocessEnabled] = useState(true);
+  const [showRejectedBallBoxes, setShowRejectedBallBoxes] = useState(true);
+  
+  // Fullscreen & Zoom Features
+  const [interactionMode, setInteractionMode] = useState<'draw' | 'zoom'>('draw');
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [viewTransform, setViewTransform] = useState({ zoom: 1, tx: 0, ty: 0 });
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const fullscreenRef = useRef<HTMLDivElement>(null);
   const [assigningEventFrame, setAssigningEventFrame] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
+  const isSeekingRef = useRef(false);
+  const pendingSeekFrameRef = useRef<number | null>(null);
+  const seekTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoUrlRef = useRef<string>('');
+  const videoFileKeyRef = useRef<string>('');
+  const gpuFileReadyRef = useRef<Map<string, File>>(new Map());
+  const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
+  const [videoTranscoding, setVideoTranscoding] = useState(false);
+  const [gpuPrepProgress, setGpuPrepProgress] = useState({ active: false, done: 0, total: 0 });
+  const [videoPlaybackKind, setVideoPlaybackKind] = useState<'direct' | 'h264' | null>(null);
+
+  const clearVideoUrl = useCallback(() => {
+    const prev = videoUrlRef.current;
+    if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+    videoUrlRef.current = '';
+    videoFileKeyRef.current = '';
+    setVideoUrl('');
+    setVideoPlaybackError(null);
+    setVideoPlaybackKind(null);
+  }, []);
+
+  const assignVideoUrlFromFile = useCallback((file: File) => {
+    const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+    if (videoFileKeyRef.current === fileKey && videoUrlRef.current.startsWith('blob:')) {
+      return;
+    }
+    const prev = videoUrlRef.current;
+    const url = URL.createObjectURL(file);
+    videoUrlRef.current = url;
+    videoFileKeyRef.current = fileKey;
+    setVideoUrl(url);
+    setVideoPlaybackError(null);
+    setVideoPlaybackKind('direct');
+    if (prev.startsWith('blob:') && prev !== url) {
+      window.setTimeout(() => URL.revokeObjectURL(prev), 10_000);
+    }
+  }, []);
+
+  const assignVideoUrlFromRemote = useCallback((url: string) => {
+    const prev = videoUrlRef.current;
+    if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+    videoUrlRef.current = url;
+    videoFileKeyRef.current = url;
+    setVideoUrl(url);
+    setVideoPlaybackError(null);
+    setVideoPlaybackKind('direct');
+  }, []);
+
+  const prepareVideoPlayback = useCallback(async (file: File) => {
+    setVideoTranscoding(true);
+    setVideoPlaybackError(null);
+    try {
+      const ready = await ensureGpuH264File(file, INFERENCE_API_BASE);
+      assignVideoUrlFromFile(ready);
+      setVideoPlaybackKind(ready === file ? 'direct' : 'h264');
+      return ready;
+    } catch (err) {
+      console.error('Video preparation failed:', err);
+      setVideoPlaybackError(
+        `Cannot prepare video on GPU. Run ./connect_gpu.sh then re-upload. ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return file;
+    } finally {
+      setVideoTranscoding(false);
+    }
+  }, [assignVideoUrlFromFile]);
+
+  /** Ensure playlist file is GPU H.264 (cached). Used before inference and in background prep. */
+  const ensureItemGpuFile = useCallback(async (item: PlaylistItem): Promise<File> => {
+    if (!item.file) {
+      throw new Error(`No file loaded for ${item.name}`);
+    }
+    if (OFFLINE_REVIEW_ONLY) return item.file;
+    const cached = gpuFileReadyRef.current.get(item.id);
+    if (cached) return cached;
+
+    const ready = await ensureGpuH264File(item.file, INFERENCE_API_BASE);
+    gpuFileReadyRef.current.set(item.id, ready);
+    if (ready !== item.file) {
+      setState((prev) => {
+        const playlist = [...prev.playlist];
+        const idx = playlist.findIndex((p) => p.id === item.id);
+        if (idx >= 0) {
+          playlist[idx] = { ...playlist[idx], file: ready };
+        }
+        const next = { ...prev, playlist };
+        stateRef.current = next;
+        return next;
+      });
+      if (
+        stateRef.current.currentPlaylistIndex === stateRef.current.playlist.findIndex((p) => p.id === item.id)
+      ) {
+        assignVideoUrlFromFile(ready);
+        setVideoPlaybackKind('h264');
+      }
+    }
+    return ready;
+  }, [assignVideoUrlFromFile]);
+
+  const runBackgroundGpuPrep = useCallback((originalFiles: File[], itemIds: string[]) => {
+    if (OFFLINE_REVIEW_ONLY) return;
+    if (originalFiles.length === 0) return;
+    setGpuPrepProgress({ active: true, done: 0, total: originalFiles.length });
+    void mapWithConcurrency(originalFiles, 2, async (file, idx) => {
+      const itemId = itemIds[idx];
+      try {
+        const ready = await ensureGpuH264File(file, INFERENCE_API_BASE);
+        gpuFileReadyRef.current.set(itemId, ready);
+        setState((prev) => {
+          const playlist = [...prev.playlist];
+          const i = playlist.findIndex((p) => p.id === itemId);
+          if (i >= 0) {
+            playlist[i] = { ...playlist[i], file: ready };
+          }
+          const next = { ...prev, playlist };
+          stateRef.current = next;
+          return next;
+        });
+        const currentIdx = stateRef.current.currentPlaylistIndex;
+        const currentItem = stateRef.current.playlist[currentIdx];
+        if (currentItem?.id === itemId) {
+          assignVideoUrlFromFile(ready);
+          setVideoPlaybackKind(ready === file ? 'direct' : 'h264');
+        }
+      } catch (err) {
+        console.error(`GPU H.264 convert failed for ${file.name}`, err);
+      } finally {
+        setGpuPrepProgress((prev) => ({ ...prev, done: prev.done + 1 }));
+      }
+    }).finally(() => {
+      setGpuPrepProgress({ active: false, done: 0, total: 0 });
+    });
+  }, [assignVideoUrlFromFile]);
+  // Frame the <video> is ACTUALLY presenting (tracked via requestVideoFrameCallback).
+  // The ball overlay is drawn against this so the box always sits on the visible ball,
+  // even on fast-motion frames where an HTML5 seek can land a frame away from the target.
+  const [presentedBallFrame, setPresentedBallFrame] = useState<number | null>(null);
+  // PTS (seconds) of decode-frame 0, measured at runtime. Anchors frame<->time
+  // math to the video's real timeline so box index == inference decode index.
+  const ballBaseTimeRef = useRef<number | null>(null);
+  const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const autoStepIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const ballFrameStepFpsRef = useRef(5);
+  const stateRef = useRef(state);
+  const processingRef = useRef(false);
+  const appModeRef = useRef(appMode);
 
   const cyclePlaybackRate = () => {
     const rates = [0.25, 0.5, 1, 1.5, 2];
@@ -149,14 +789,137 @@ function App() {
     setPlaybackRate(rates[nextIndex]);
   };
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const seekIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const stateRef = useRef(state);
-  const processingRef = useRef(false);
+  const clampBallFrameStepFps = (value: number) => Math.min(60, Math.max(1, Math.round(value) || 1));
+
+  const handleBallFrameStepFpsChange = (raw: string) => {
+    const parsed = parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return;
+    setBallFrameStepFps(clampBallFrameStepFps(parsed));
+  };
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(() => {
+    appModeRef.current = appMode;
+  }, [appMode]);
+
+  useEffect(() => {
+    ballFrameStepFpsRef.current = ballFrameStepFps;
+  }, [ballFrameStepFps]);
+
+  useEffect(() => {
+    return () => {
+      if (seekIntervalRef.current) clearInterval(seekIntervalRef.current);
+      if (autoStepIntervalRef.current) clearInterval(autoStepIntervalRef.current);
+      if (seekTimeoutRef.current) clearTimeout(seekTimeoutRef.current);
+    };
+  }, []);
+
+  // Continuously track the frame the browser actually presents (ball mode only),
+  // so the overlay box is always drawn for the visible frame, not the requested one.
+  // A new video means the calibrated base PTS is stale.
+  useEffect(() => {
+    ballBaseTimeRef.current = null;
+  }, [videoUrl]);
+
+  useEffect(() => {
+    if (appMode !== 'ball') {
+      setPresentedBallFrame(null);
+      return;
+    }
+    const video = videoRef.current as unknown as {
+      requestVideoFrameCallback?: (cb: (now: number, meta: { mediaTime: number }) => void) => number;
+      cancelVideoFrameCallback?: (handle: number) => void;
+    } | null;
+    if (!video || typeof video.requestVideoFrameCallback !== 'function') return;
+
+    let handle = 0;
+    let cancelled = false;
+    const loop = (_now: number, meta: { mediaTime: number }) => {
+      if (cancelled) return;
+      const s = stateRef.current;
+      const it = s.playlist[s.currentPlaylistIndex];
+      const t = getBallPlaybackTiming(s.videoMetadata, it?.inferenceVideoMeta);
+      const base = ballBaseTimeRef.current ?? 0;
+      const f = mediaTimeToFrame(meta.mediaTime, t.fps, base, t.frame_count - 1);
+      setPresentedBallFrame((prev) => (prev === f ? prev : f));
+      // Keep the frame label in sync with the pixels the browser is actually showing.
+      if (!isSeekingRef.current && appModeRef.current === 'ball') {
+        setState((prev) => (prev.currentFrame === f ? prev : { ...prev, currentFrame: f }));
+      }
+      handle = video.requestVideoFrameCallback!(loop);
+    };
+    handle = video.requestVideoFrameCallback(loop);
+    return () => {
+      cancelled = true;
+      if (typeof video.cancelVideoFrameCallback === 'function' && handle) {
+        video.cancelVideoFrameCallback(handle);
+      }
+    };
+  }, [appMode, videoUrl]);
+
+  useEffect(() => {
+    if (OFFLINE_REVIEW_ONLY) {
+      setBackendHealth(null);
+      return;
+    }
+    if (appMode !== 'touch' && appMode !== 'ball' && appMode !== 'vnl') return;
+    fetch(`${INFERENCE_API_BASE}/api/health`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((health) => {
+        if (!health) return;
+        setBackendHealth(health);
+        if (appMode === 'ball') {
+          if (health.ball_triplet_configured !== 'true' && ballEngine === 'triplet') {
+            setBallEngine('yolo26');
+          }
+          if (health.ball_sideview_configured !== 'true' && ballEngine === 'side_view') {
+            setBallEngine('yolo26');
+          }
+        }
+      })
+      .catch((err) => console.warn('Backend health check failed:', err));
+  }, [appMode]);
+
+  const resetPlayerState = useCallback(() => {
+    setState(EMPTY_APP_STATE);
+    clearVideoUrl();
+    setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+    processingRef.current = false;
+  }, [clearVideoUrl]);
+
+  const switchWorkflowMode = useCallback((mode: WorkflowMode) => {
+    const prev = workflowFromAppMode(appModeRef.current);
+    if (prev) {
+      persistWorkflowState(prev, stateRef.current);
+    }
+
+    setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+    processingRef.current = false;
+    clearVideoUrl();
+
+    const restored = loadWorkflowState(mode);
+    if (restored) {
+      setState(restored);
+    } else {
+      setState(EMPTY_APP_STATE);
+    }
+
+    setAppMode(mode);
+    localStorage.setItem(APP_MODE_STORAGE_KEY, mode);
+  }, [clearVideoUrl]);
+
+  const returnToHome = useCallback(() => {
+    const prev = workflowFromAppMode(appModeRef.current);
+    if (prev) {
+      persistWorkflowState(prev, stateRef.current);
+    }
+    localStorage.removeItem(APP_MODE_STORAGE_KEY);
+    resetPlayerState();
+    setAppMode('home');
+  }, [resetPlayerState]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -198,7 +961,7 @@ function App() {
         }
 
         const classId = item?.class_id;
-        if (typeof classId === 'number' && classId >= 0 && classId <= 5) {
+        if (typeof classId === 'number' && classId >= 0 && classId <= 6) {
           const match = Object.values(SKILL_MAP).find((s) => s.classId === classId);
           if (!match) return null;
           return {
@@ -278,10 +1041,11 @@ function App() {
     return Array.from(uniqueActionsMap.values());
   };
 
-  const applySkillHeuristics = (events: SkillEvent[]): SkillEvent[] => {
+  const applySkillHeuristics = (events: SkillEvent[], rally: Rally = { start_frame: null, end_frame: null }, frameCount = 0): SkillEvent[] => {
     if (events.length === 0) return events;
 
-    let modified = JSON.parse(JSON.stringify(events)) as SkillEvent[];
+    let modified = applySixSkillPostprocess(events, rally, frameCount);
+    modified = JSON.parse(JSON.stringify(modified)) as SkillEvent[];
 
     // Helper to update skill and its associated class_id
     const updateSkill = (event: SkillEvent, newSkill: string) => {
@@ -291,7 +1055,7 @@ function App() {
       }
     };
 
-    // Rule 4: Remove consecutive duplicates of toss, serve, attack/block
+    // Rule 4: Remove consecutive duplicates of toss, serve, attack, block (same label only)
     let i = 0;
     while (i < modified.length - 1) {
       const current = modified[i];
@@ -360,33 +1124,102 @@ function App() {
   };
 
 
-  const inferSingleVideo = async (file: File) => {
+  const inferSingleVideo = async (
+    file: File,
+    mode: 'touch' | 'ball' | 'vnl',
+    engine: 'yolo26' | 'side_view' | 'triplet' = 'yolo26',
+  ) => {
     const formData = new FormData();
     formData.append('video', file);
-    const res = await fetch(`${INFERENCE_API_BASE}/api/infer/skill5`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Inference failed: ${err}`);
+    if (mode === 'ball') {
+      let selected = engine;
+      if (selected === 'triplet' && backendHealth?.ball_triplet_configured !== 'true') {
+        selected = 'yolo26';
+      }
+      if (selected === 'side_view' && backendHealth?.ball_sideview_configured !== 'true') {
+        selected = 'yolo26';
+      }
+      formData.append('ball_model', selected);
+      formData.append('use_triplet', selected === 'triplet' ? 'true' : 'false');
     }
-    return res.json();
+    const endpoint =
+      mode === 'ball' ? '/api/infer/ball' : mode === 'vnl' ? '/api/infer/vnl' : '/api/infer/skill5';
+    // VNL while sharing GPU with training can take much longer than solo GPU runs.
+    const timeoutMs = mode === 'vnl' ? 1_800_000 : 900_000; // 30m VNL / 15m others
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${INFERENCE_API_BASE}${endpoint}`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Inference failed: ${err}`);
+      }
+      return res.json();
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(
+          `Inference timed out after ${Math.round(timeoutMs / 60000)} min. ` +
+          `If training is sharing the GPU, wait longer or retry. Backend: ${INFERENCE_API_BASE}`,
+        );
+      }
+      if (err instanceof TypeError) {
+        throw new Error(
+          `Cannot reach inference backend at ${INFERENCE_API_BASE}. Run ./connect_gpu.sh on your laptop.`,
+        );
+      }
+      throw err;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
   };
 
-  const inferAssignPlayer = async (file: File, events: SkillEvent[]) => {
-    const formData = new FormData();
-    formData.append('video', file);
-    formData.append('skill_events', JSON.stringify(events));
-    const res = await fetch(`${INFERENCE_API_BASE}/api/infer/assign_player`, {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Assign player inference failed: ${err}`);
+  const inferAssignPlayer = async (
+    file: File,
+    events: SkillEvent[],
+    trackingBoxes?: Record<number, PlayerBox[]>,
+    engine: 'slowfast' | 'yolo' = 'slowfast',
+    rawTrackingJson?: string,
+  ) => {
+    try {
+      const formData = new FormData();
+      formData.append('video', file);
+      formData.append('skill_events', JSON.stringify(events));
+      formData.append('engine', engine);
+      if (rawTrackingJson && rawTrackingJson.trim()) {
+        formData.append(
+          'tracking_json_file',
+          new Blob([rawTrackingJson], { type: 'application/json' }),
+          'tracking.json',
+        );
+      } else if (trackingBoxes && Object.keys(trackingBoxes).length > 0) {
+        const serialized = JSON.stringify(trackingBoxes);
+        if (serialized.length > 900_000) {
+          formData.append(
+            'tracking_json_file',
+            new Blob([serialized], { type: 'application/json' }),
+            'tracking_boxes.json',
+          );
+        } else {
+          formData.append('tracking_boxes', serialized);
+        }
+      }
+      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/assign_player`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Assign player inference failed: ${err}`);
+      }
+      return res.json();
+    } catch (err) {
+      console.error('Assign player inference failed:', err);
+      throw err;
     }
-    return res.json();
   };
 
   const uploadToDrive = async (token: string, folderId: string | undefined, filename: string, blob: Blob, existingId?: string) => {
@@ -425,24 +1258,35 @@ function App() {
   };
 
   useEffect(() => {
+    if (OFFLINE_REVIEW_ONLY) {
+      if (batchProgress.isRunning) {
+        processingRef.current = false;
+        setBatchProgress((prev) => ({ ...prev, isRunning: false }));
+      }
+      return;
+    }
     if (batchProgress.isRunning && !processingRef.current) {
       processingRef.current = true;
       const processedIds = new Set<string>();
 
       const processNextRecursive = async () => {
         const currentPlaylist = stateRef.current.playlist;
-        const nextIndex = currentPlaylist.findIndex(p => !p.isSkillAlgorithmApplied && !processedIds.has(p.id) && (p.file || p.driveUrl));
+        const workflowMode: WorkflowMode =
+          appModeRef.current === 'ball' ? 'ball' : appModeRef.current === 'vnl' ? 'vnl' : 'touch';
+        const nextIndex = currentPlaylist.findIndex(
+          (p) => !isItemAlgorithmApplied(p, workflowMode) && !processedIds.has(p.id) && (p.file || p.driveUrl),
+        );
         
         if (nextIndex === -1) {
           processingRef.current = false;
           setBatchProgress(prev => ({ ...prev, isRunning: false }));
           
           // Automatically download the batch ZIP when finished!
-          const annotated = currentPlaylist.filter(p => p.isSkillAlgorithmApplied);
+          const annotated = currentPlaylist.filter((p) => isItemAlgorithmApplied(p, workflowMode));
           if (annotated.length > 0) {
-            exportAllToZip(annotated, true, includeMp4InZip).then(blob => {
+            exportAllToZip(annotated, true, includeMp4InZip, workflowMode).then(blob => {
               if (blob && googleTokenRef.current) {
-                const metadata = { name: `volleyball_annotations_batch_${Date.now()}.zip`, mimeType: 'application/zip' };
+                const metadata = { name: `${getBatchZipFilename(workflowMode).replace('.zip', '')}_${Date.now()}.zip`, mimeType: 'application/zip' };
                 const form = new FormData();
                 form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
                 form.append('file', blob);
@@ -476,57 +1320,173 @@ function App() {
             const blob = await res.blob();
             fileToInfer = new File([blob], item.name, { type: 'video/mp4' });
           }
+
+          if (fileToInfer) {
+            fileToInfer = await ensureItemGpuFile({ ...item, file: fileToInfer });
+          }
           
           let payload: any = null;
           let heuristicallyCorrected: any[] = [];
           let startFrame = item.rally?.start_frame ?? null;
           let endFrame = item.rally?.end_frame ?? null;
+          let newPlayerBoxes: Record<number, PlayerBox[]> = {};
+          let rejectedBallBoxes: Record<number, PlayerBox[]> = {};
+          let touchAssignSucceeded = workflowMode !== 'touch';
 
-          if (item.events && item.events.length > 0) {
-            console.log(`[batch] Skipping skill inference for ${item.name} as events already exist. Using existing events for player assignment.`);
-            heuristicallyCorrected = [...item.events];
-          } else {
-            payload = await inferSingleVideo(fileToInfer!);
-            const parsed = parsePredictionsFile(payload);
-            heuristicallyCorrected = applySkillHeuristics(parsed.events);
-            startFrame = parsed.startFrame ?? startFrame;
-            endFrame = parsed.endFrame ?? endFrame;
-            console.log(`[batch] Original events: ${parsed.events.length}, Corrected events: ${heuristicallyCorrected.length}`);
-          }
-          
-          let newPlayerBoxes = { ...item.playerBoxes };
-          try {
-            if (heuristicallyCorrected.length > 0) {
-              const assignPayload = await inferAssignPlayer(fileToInfer!, heuristicallyCorrected);
-              const assignEvents = assignPayload.events || [];
-              
-              // 1. Update heuristicallyCorrected with player_id
-              heuristicallyCorrected = heuristicallyCorrected.map(hc => {
-                const assignment = assignEvents.find((e: any) => e.frame === hc.frame);
-                if (assignment && assignment.track_ids && assignment.track_ids.length > 0) {
-                  return { ...hc, player_id: assignment.track_ids[0] };
-                }
-                return hc;
+          if (workflowMode === 'ball') {
+            payload = await inferSingleVideo(fileToInfer!, 'ball', ballEngine);
+
+            let ballTrackingData = payload.ball_tracking || payload.predictions;
+            const payloadWidth = Number(payload?.width) || undefined;
+            const payloadHeight = Number(payload?.height) || undefined;
+
+            // YOLO26 only: filter false positives (static / outliers / legs).
+            // Side View Ball: keep every raw detection — no pink "removed" overlay.
+            if (ballEngine === 'yolo26' && ballTrackingData && Array.isArray(ballTrackingData)) {
+              const { predictions: filtered, rejected, stats } = applyBallPostprocess(ballTrackingData, {
+                frameWidth: payloadWidth || 1280,
+                frameHeight: payloadHeight || 720,
               });
+              ballTrackingData = filtered;
+              rejectedBallBoxes = predictionsToBallBoxMap(rejected, payloadWidth, payloadHeight, true);
+              setBallPostprocessEnabled(true);
+              console.log(`[ball postprocess] ${item.name}:`, stats);
+            } else {
+              setBallPostprocessEnabled(false);
+              rejectedBallBoxes = {};
+            }
+            
+            if (ballTrackingData && Array.isArray(ballTrackingData)) {
+              newPlayerBoxes = predictionsToBallBoxMap(ballTrackingData, payloadWidth, payloadHeight, false);
+            }
+            startFrame = 0;
+            endFrame = payload.frame_count > 0 ? payload.frame_count - 1 : 999999;
+            console.log(`[batch] Ball tracking events parsed: ${ballTrackingData?.length || 0}`);
+            setBallEditMode(false);
+          } else if (workflowMode === 'vnl') {
+            if (item.isVnlAlgorithmApplied && item.events && item.events.length > 0) {
+              console.log(`[batch] Skipping VNL inference for ${item.name} — using existing events.`);
+              heuristicallyCorrected = [...item.events];
+            } else {
+              payload = await inferSingleVideo(fileToInfer!, 'vnl');
+              heuristicallyCorrected = parseVnlPredictionsToSkillEvents(payload.predictions ?? payload);
+              console.log(`[batch] VNL events parsed: ${heuristicallyCorrected.length}`);
+            }
+          } else {
+            if (item.events && item.events.length > 0) {
+              console.log(
+                `[batch] Skipping skill inference for ${item.name} — using existing events for player assignment.`,
+              );
+              heuristicallyCorrected = [...item.events];
+            } else {
+              payload = await inferSingleVideo(fileToInfer!, 'touch');
+              const parsed = parsePredictionsFile(payload);
+              heuristicallyCorrected = applySkillHeuristics(
+                parsed.events,
+                { start_frame: parsed.startFrame, end_frame: parsed.endFrame },
+                payload?.frame_count ?? item.videoMetadata?.frame_count ?? 0,
+              );
+              startFrame = parsed.startFrame ?? startFrame;
+              endFrame = parsed.endFrame ?? endFrame;
+              console.log(
+                `[batch] Original events: ${parsed.events.length}, Corrected events: ${heuristicallyCorrected.length}`,
+              );
+            }
 
-              // 2. Generate active and inactive player boxes for +/- 2 frames
-              assignEvents.forEach((ev: any) => {
-                const activeTrackId = ev.track_ids && ev.track_ids.length > 0 ? ev.track_ids[0] : null;
+            // Pass pre-existing player boxes as tracking JSON to bypass SparseRCNN.
+            // Send the original (compact) JSON to the API; backend extends to full video length.
+            const trackingBoxesForApi = (item.playerBoxes && Object.keys(item.playerBoxes).length > 0) 
+              ? item.playerBoxes 
+              : undefined;
+            const videoFrameCount =
+              (payload as { frame_count?: number } | null)?.frame_count ??
+              item.videoMetadata?.frame_count ??
+              0;
+            const originalTrackingCoverage = getTrackingCoverage(trackingBoxesForApi);
+            let displayPlayerBoxes = trackingBoxesForApi;
+            if (trackingBoxesForApi && videoFrameCount > 0) {
+              if (originalTrackingCoverage.maxFrame >= 0 && videoFrameCount > originalTrackingCoverage.maxFrame + 1) {
+                console.log(
+                  `[batch] Extending tracking for ${item.name}: ` +
+                  `${originalTrackingCoverage.maxFrame + 1} tracked frames -> ${videoFrameCount} video frames (backend will extend for inference)`
+                );
+                displayPlayerBoxes = extendPlayerBoxesToFrameCount(trackingBoxesForApi, videoFrameCount);
+              }
+            }
+            const eventsBeyondOriginalTracking = heuristicallyCorrected.filter(
+              (ev) => originalTrackingCoverage.maxFrame >= 0 && ev.frame > originalTrackingCoverage.maxFrame
+            );
 
-                // Process candidates if available (to show all players)
-                let addedActive = false;
-                if (ev.candidates && Array.isArray(ev.candidates)) {
-                  ev.candidates.forEach((cand: any) => {
-                    if (cand.box && cand.box.length === 4) {
-                      const box = cand.box;
-                      const trackId = cand.tid;
+            if (eventsBeyondOriginalTracking.length > 0) {
+              console.warn(
+                `[batch] ${eventsBeyondOriginalTracking.length} skill event(s) are beyond original tracking coverage ` +
+                `for ${item.name}; backend will extend boxes for assignment`
+              );
+            }
+
+            // Deep clone the player boxes to avoid React state mutation issues
+            if (displayPlayerBoxes) {
+              for (const [fStr, boxes] of Object.entries(displayPlayerBoxes)) {
+                newPlayerBoxes[parseInt(fStr, 10)] = boxes.map(b => ({ ...b }));
+              }
+            } else if (item.playerBoxes) {
+              for (const [fStr, boxes] of Object.entries(item.playerBoxes)) {
+                newPlayerBoxes[parseInt(fStr, 10)] = boxes.map(b => ({ ...b }));
+              }
+            }
+            
+            touchAssignSucceeded = heuristicallyCorrected.length === 0;
+
+            try {
+              if (heuristicallyCorrected.length > 0) {
+                if (!hasTouchTrackingData(item)) {
+                  const stem = item.name.replace(/\.[^/.]+$/, '');
+                  touchAssignSucceeded = false;
+                  window.alert(
+                    `Touch player assignment skipped for "${item.name}".\n\n` +
+                    `No player tracking JSON was loaded. Upload the matching tracking JSON with the video ` +
+                    `(for example "${stem}_resync_v2.json") in the same batch, then run inference again.`
+                  );
+                } else {
+                const assignPayload = await inferAssignPlayer(
+                  fileToInfer!,
+                  heuristicallyCorrected,
+                  trackingBoxesForApi,
+                  inferenceEngine,
+                  item.rawJsonString,
+                );
+                const assignEvents: AssignPlayerResult[] = assignPayload.events || [];
+                touchAssignSucceeded = true;
+                
+                // 1. Update heuristicallyCorrected with player_id
+                heuristicallyCorrected = heuristicallyCorrected.map(hc => {
+                  const playerId = extractAssignedTrackId(findAssignmentForFrame(assignEvents, hc.frame));
+                  return playerId !== undefined ? { ...hc, player_id: playerId } : hc;
+                });
+
+                // 2. Mark active player boxes for +/- 2 frames around each touch
+                assignEvents.forEach((ev) => {
+                  const frame = Number(ev.frame);
+                  if (Number.isNaN(frame)) return;
+
+                  const activeTrackId = extractAssignedTrackId(ev);
+                  if (activeTrackId === undefined) return;
+
+                  // Always activate the assigned track on existing tracking JSON boxes
+                  markActivePlayerOnFrames(newPlayerBoxes, frame, activeTrackId, ev.pred_box_xyxy);
+
+                  // Process candidates when SparseRCNN returns per-player boxes
+                  if (ev.candidates && Array.isArray(ev.candidates)) {
+                    ev.candidates.forEach((cand) => {
+                      if (!cand.box || cand.box.length !== 4 || cand.tid === undefined) return;
+                      const trackId = Number(cand.tid);
+                      if (Number.isNaN(trackId)) return;
                       const isActive = trackId === activeTrackId;
-                      if (isActive) addedActive = true;
+                      const box = cand.box;
 
-                      for (let f = ev.frame - 2; f <= ev.frame + 2; f++) {
+                      for (let f = frame - 2; f <= frame + 2; f++) {
                         if (!newPlayerBoxes[f]) newPlayerBoxes[f] = [];
-                        
-                        const existingBox = newPlayerBoxes[f].find(b => b.track_id === trackId);
+                        const existingBox = newPlayerBoxes[f].find((b) => Number(b.track_id) === trackId);
                         if (!existingBox) {
                           newPlayerBoxes[f].push({
                             x_min: box[0],
@@ -534,47 +1494,80 @@ function App() {
                             x_max: box[2],
                             y_max: box[3],
                             track_id: trackId,
-                            is_active: isActive
+                            is_active: isActive,
                           });
                         } else if (isActive) {
-                          // Upgrade to active if already exists
                           existingBox.is_active = true;
                         }
                       }
-                    }
-                  });
-                }
-                
-                if (!addedActive && ev.pred_box_xyxy && ev.pred_box_xyxy.length === 4) {
-                  // Fallback if candidates are missing but active box exists
-                  const box = ev.pred_box_xyxy;
-                  const trackId = activeTrackId !== null ? activeTrackId : 0;
-                  
-                  for (let f = ev.frame - 2; f <= ev.frame + 2; f++) {
-                    if (!newPlayerBoxes[f]) newPlayerBoxes[f] = [];
-                    if (!newPlayerBoxes[f].some(b => b.track_id === trackId)) {
-                      newPlayerBoxes[f].push({
-                        x_min: box[0],
-                        y_min: box[1],
-                        x_max: box[2],
-                        y_max: box[3],
-                        track_id: trackId,
-                        is_active: true
-                      });
-                    } else {
-                      const existingBox = newPlayerBoxes[f].find(b => b.track_id === trackId);
-                      if (existingBox) existingBox.is_active = true;
-                    }
+                    });
                   }
+                });
                 }
-              });
+              }
+            } catch (err) {
+              touchAssignSucceeded = false;
+              console.error('Touch player assignment failed for', item.name, err);
+              const errText = err instanceof Error ? err.message : String(err);
+              const payloadTooLarge = /exceeded maximum size|1024KB/i.test(errText);
+              let guidance =
+                'Check that the backend is running and the touch-player model is configured.';
+              if (payloadTooLarge) {
+                guidance =
+                  'The tracking JSON upload was too large for the backend. Refresh the page and retry — ' +
+                  'the app now sends compact tracking data and extends it on the server.';
+              } else if (!hasTouchTrackingData(item)) {
+                const stem = item.name.replace(/\.[^/.]+$/, '');
+                guidance =
+                  `Upload a matching tracking JSON alongside the video (for example "${stem}_resync_v2.json") ` +
+                  `in the same batch upload, then run again.`;
+              }
+              window.alert(
+                `Touch player assignment failed for "${item.name}". Skills were detected, but no players were auto-assigned.\n\n` +
+                `${guidance}\n\n` +
+                `Error: ${errText}`
+              );
             }
-          } catch (err) {
-            console.error('Touch player assignment failed for', item.name, err);
-            // Non-fatal, we just won't have auto-assignments
           }
           
           const videoFps = payload ? (payload as any).video_fps : null;
+          const inferenceVideoMeta =
+            workflowMode === 'ball' || workflowMode === 'vnl'
+              ? buildInferenceVideoMeta(payload ?? {}) ?? item.inferenceVideoMeta
+              : item.inferenceVideoMeta;
+          const updatedVideoMetadata = (() => {
+            if (workflowMode === 'ball' && inferenceVideoMeta) {
+              return {
+                filename: item.name,
+                fps: inferenceVideoMeta.fps,
+                frame_count: inferenceVideoMeta.frame_count,
+                width: inferenceVideoMeta.width,
+                height: inferenceVideoMeta.height,
+                duration: inferenceVideoMeta.frame_count / inferenceVideoMeta.fps,
+              };
+            }
+            if (workflowMode === 'vnl') {
+              const inferred = buildVideoMetadataFromInference(item.name, payload, item.videoMetadata);
+              if (!inferred) return item.videoMetadata ?? null;
+              const browserDuration =
+                videoRef.current && Number.isFinite(videoRef.current.duration) && videoRef.current.duration > 0
+                  ? videoRef.current.duration
+                  : item.videoMetadata?.duration ?? inferred.duration;
+              return {
+                ...inferred,
+                duration: browserDuration,
+                width: videoRef.current?.videoWidth || inferred.width,
+                height: videoRef.current?.videoHeight || inferred.height,
+              };
+            }
+            if (item.videoMetadata) {
+              return {
+                ...item.videoMetadata,
+                fps: videoFps ?? item.videoMetadata.fps,
+              };
+            }
+            return item.videoMetadata ?? null;
+          })();
           
           const alignedManualActions = alignManualActionsToEvents(item.manualActions || [], heuristicallyCorrected, 5);
           if (alignedManualActions.length > 0 && item.rawJsonString) {
@@ -590,21 +1583,37 @@ function App() {
              }
           }
 
-          const updatedItem = {
+          const updatedItem = (workflowMode === 'touch' && !touchAssignSucceeded)
+            ? {
+                ...item,
+                events: heuristicallyCorrected,
+                manualActions: alignedManualActions,
+                playerBoxes: newPlayerBoxes,
+                rally: {
+                  start_frame: startFrame ?? item.rally?.start_frame ?? null,
+                  end_frame: endFrame ?? item.rally?.end_frame ?? null,
+                },
+                videoMetadata: updatedVideoMetadata,
+                isTouchAlgorithmApplied: false,
+                isSkillAlgorithmApplied: false,
+              }
+            : withAlgorithmApplied({
             ...item,
             events: heuristicallyCorrected,
             manualActions: alignedManualActions,
             playerBoxes: newPlayerBoxes,
+            inferenceBallBoxes: workflowMode === 'ball' ? cloneBallBoxes(newPlayerBoxes) : item.inferenceBallBoxes,
+            rejectedBallBoxes: workflowMode === 'ball' ? rejectedBallBoxes : item.rejectedBallBoxes,
+            inferenceVideoMeta:
+              workflowMode === 'ball' || workflowMode === 'vnl'
+                ? inferenceVideoMeta
+                : item.inferenceVideoMeta,
             rally: {
               start_frame: startFrame ?? item.rally?.start_frame ?? null,
               end_frame: endFrame ?? item.rally?.end_frame ?? null
             },
-            videoMetadata: item.videoMetadata ? {
-              ...item.videoMetadata,
-              fps: videoFps ?? item.videoMetadata.fps,
-            } : null,
-            isSkillAlgorithmApplied: true
-          };
+            videoMetadata: updatedVideoMetadata,
+          }, workflowMode);
 
           setState(prev => {
             console.log(`[batch] setState callback. prev.currentPlaylistIndex=${prev.currentPlaylistIndex}, nextIndex=${nextIndex}`);
@@ -613,27 +1622,35 @@ function App() {
             
             if (prev.currentPlaylistIndex === nextIndex) {
               console.log(`[batch] Updating main state events to length: ${heuristicallyCorrected.length}`);
-              return {
+              const next = {
                 ...prev,
                 playlist: newPlaylist,
                 events: heuristicallyCorrected,
-                rally: updatedItem.rally,
-                playerBoxes: newPlayerBoxes
+                rally: updatedItem.rally ?? prev.rally,
+                playerBoxes: newPlayerBoxes,
+                videoMetadata: updatedItem.videoMetadata ?? prev.videoMetadata,
               };
+              stateRef.current = next;
+              return next;
             }
             console.log(`[batch] NOT updating main state events! Mismatch index.`);
-            return { ...prev, playlist: newPlaylist };
+            const next = { ...prev, playlist: newPlaylist };
+            stateRef.current = next;
+            return next;
           });
 
           // Upload individual XML back to Google Drive
           if (googleTokenRef.current && (item.driveFolderId || item.driveXmlId)) {
             const xml = generateXMLString(
               item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
-              updatedItem.rally,
-              heuristicallyCorrected
+              updatedItem.rally ?? { start_frame: null, end_frame: null },
+              heuristicallyCorrected,
+              newPlayerBoxes,
+              workflowMode,
             );
             const xmlBlob = new Blob([xml], { type: 'application/xml' });
-            const xmlFilename = `annotations_${item.name.replace(/\.[^/.]+$/, '')}.xml`;
+            const xmlStem = item.name.replace(/\.[^/.]+$/, '');
+            const xmlFilename = getXmlExportFilename(xmlStem, workflowMode);
 
             uploadToDrive(googleTokenRef.current!, item.driveFolderId, xmlFilename, xmlBlob, item.driveXmlId)
               .then(xmlId => {
@@ -657,7 +1674,16 @@ function App() {
           });
         } catch (err) {
           console.error('Batch inference failed for', currentPlaylist[nextIndex].name, err);
-          window.alert(`Failed to apply algorithm to ${currentPlaylist[nextIndex].name}. Is your backend server running at ${INFERENCE_API_BASE}?`);
+          const pipelineLabel = appModeRef.current === 'ball'
+            ? 'Ball tracking'
+            : appModeRef.current === 'vnl'
+              ? 'VNL event spotting'
+              : 'Touch skill / player assignment';
+          window.alert(
+            `Failed to run ${pipelineLabel} for ${currentPlaylist[nextIndex].name}. ` +
+            `Is your backend server running at ${INFERENCE_API_BASE}?\n\n` +
+            `Error details: ${err}`,
+          );
           processingRef.current = false;
           setBatchProgress(prev => ({ ...prev, isRunning: false }));
           return;
@@ -672,118 +1698,117 @@ function App() {
   }, [batchProgress.isRunning]);
 
   useEffect(() => {
-    if (!batchProgress.isRunning && batchProgress.total > 0 && batchProgress.completed === batchProgress.total && state.playlist.length > 0 && !videoUrl) {
-      const item = state.playlist[0];
-      if (item.file) {
-        setVideoUrl(URL.createObjectURL(item.file));
-      } else if (item.driveUrl) {
-        setVideoUrl(item.driveUrl);
+    if (!batchProgress.isRunning) {
+      processingRef.current = false;
+    }
+  }, [batchProgress.isRunning]);
+
+  useEffect(() => {
+    if (!batchProgress.isRunning && batchProgress.total > 0 && batchProgress.completed === batchProgress.total && state.playlist.length > 0) {
+      const index = state.currentPlaylistIndex;
+      const item = state.playlist[index];
+      if (!videoUrlRef.current && item?.file) {
+        assignVideoUrlFromFile(item.file);
+      }
+      if ((item.videoMetadata?.frame_count ?? 0) > 0 || (item.events?.length ?? 0) > 0) {
+        setState((prev) => ({
+          ...prev,
+          events: item.events ?? prev.events,
+          rally: item.rally ?? prev.rally,
+          videoMetadata: item.videoMetadata ?? prev.videoMetadata,
+        }));
       }
     }
-  }, [batchProgress.isRunning, batchProgress.completed, batchProgress.total, state.playlist, videoUrl]);
+  }, [batchProgress.isRunning, batchProgress.completed, batchProgress.total, state.playlist, state.currentPlaylistIndex, assignVideoUrlFromFile]);
 
-  // Load from localStorage on mount
+  // Autosave per workflow mode (touch and ball stay isolated)
   useEffect(() => {
-    const saved = localStorage.getItem('volleyball_annotations');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.state) {
-          // Sanitize any duplicated manual actions that were saved previously
-          const cleanedActions = alignManualActionsToEvents(
-            parsed.state.manualActions || [], 
-            parsed.state.events || [], 
-            5
-          );
-          
-          let newBoxes = parsed.state.playerBoxes;
-          if (parsed.state.playlist && parsed.state.playlist.length > 0) {
-            const currentItem = parsed.state.playlist[parsed.state.currentPlaylistIndex || 0];
-            if (currentItem && currentItem.rawJsonString) {
-              const res = parseJSONAnnotations(currentItem.rawJsonString, cleanedActions);
-              newBoxes = res.parsed;
-            }
-          }
+    if (appMode !== 'touch' && appMode !== 'ball' && appMode !== 'vnl') return;
+    if (state.playlist.length === 0 && !state.videoMetadata) return;
 
-          setState({ 
-            ...parsed.state, 
-            currentFrame: parsed.state.currentFrame || 0,
-            manualActions: cleanedActions,
-            playerBoxes: newBoxes
-          });
-        }
-      } catch (e) {
-        console.error("Failed to parse local storage", e);
-      }
-    }
-  }, []);
-
-  // Autosave
-  useEffect(() => {
     console.log(`[DEBUG] state.events changed! Length: ${state.events.length}`);
-    if (state.playlist.length > 0 || state.videoMetadata) {
-      // Keep playlist in sync with current events before saving
-      const currentPlaylist = [...state.playlist];
-      if (currentPlaylist.length > 0 && currentPlaylist[state.currentPlaylistIndex]) {
-        currentPlaylist[state.currentPlaylistIndex] = {
-           ...currentPlaylist[state.currentPlaylistIndex],
-           events: state.events,
-           rally: state.rally,
-           manualActions: state.manualActions,
-           playerBoxes: state.playerBoxes,
-           videoMetadata: state.videoMetadata,
-           isCompleted: (state.rally.start_frame !== null && state.rally.end_frame !== null)
-        };
-      }
-
-      // Don't save Object URLs, File objects, or large JSON data to localStorage
-      const stateToSave = {
-        ...state,
-        playerBoxes: {}, // Exclude from autosave
-        playlist: currentPlaylist.map(item => ({ 
-          ...item, 
-          file: undefined,
-          rawJsonString: undefined, // Exclude from autosave
-          playerBoxes: undefined, // Exclude from autosave
-        }))
+    const currentPlaylist = [...state.playlist];
+    if (currentPlaylist.length > 0 && currentPlaylist[state.currentPlaylistIndex]) {
+      currentPlaylist[state.currentPlaylistIndex] = {
+        ...currentPlaylist[state.currentPlaylistIndex],
+        events: state.events,
+        rally: state.rally,
+        manualActions: state.manualActions,
+        playerBoxes: state.playerBoxes,
+        videoMetadata: state.videoMetadata,
+        isCompleted: (state.rally.start_frame !== null && state.rally.end_frame !== null),
       };
-      localStorage.setItem('volleyball_annotations', JSON.stringify({ state: stateToSave }));
     }
-  }, [state]);
+
+    persistWorkflowState(appMode, {
+      ...state,
+      playlist: currentPlaylist,
+    });
+  }, [state, appMode]);
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
     if (item.file) {
-      const url = URL.createObjectURL(item.file);
-      setVideoUrl(url);
+      prepareVideoPlayback(item.file);
     } else if (item.driveUrl) {
       if (googleTokenRef.current) {
-        // Appending the access token allows the <video> element to authenticate
-        setVideoUrl(`${item.driveUrl}&access_token=${googleTokenRef.current}`);
+        assignVideoUrlFromRemote(`${item.driveUrl}&access_token=${googleTokenRef.current}`);
       } else {
-        setVideoUrl(item.driveUrl);
+        assignVideoUrlFromRemote(item.driveUrl);
       }
+    } else {
+      setVideoPlaybackError('Video file not in memory. Re-upload the MP4 to view playback.');
     }
+
+    const itemMeta = item.inferenceVideoMeta;
+    const baseMetadata = item.videoMetadata || {
+      filename: item.name,
+      fps: 30,
+      width: 0,
+      height: 0,
+      duration: 0,
+      frame_count: 0,
+    };
+    const syncedMetadata =
+      (appMode === 'ball' || appMode === 'vnl') && itemMeta
+        ? {
+            filename: item.name,
+            fps: itemMeta.fps,
+            frame_count: itemMeta.frame_count,
+            width: itemMeta.width,
+            height: itemMeta.height,
+            duration: itemMeta.frame_count / itemMeta.fps,
+          }
+        : baseMetadata;
+
+    const repairedMetadata =
+      appMode === 'vnl' && syncedMetadata.frame_count === 0 && (item.events?.length ?? 0) > 0
+        ? {
+            ...syncedMetadata,
+            frame_count: Math.max(
+              item.rally?.end_frame ?? 0,
+              ...item.events!.map((e) => e.frame),
+            ) + 1,
+          }
+        : syncedMetadata;
 
     setState(prev => ({
       ...prev,
-      videoMetadata: item.videoMetadata || {
-        filename: item.name,
-        fps: 30, // Default
-        width: 0,
-        height: 0,
-        duration: 0,
-        frame_count: 0
-      },
+      videoMetadata: repairedMetadata,
       rally: item.rally || { start_frame: null, end_frame: null },
       events: item.events || [],
       playerBoxes: item.playerBoxes || {},
       manualActions: item.manualActions || [],
       currentFrame: 0
     }));
+    setBallEditMode(false);
+    stopAutoStep();
   };
 
   const handlePlaylistFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+
+    const workflowMode: WorkflowMode =
+      appModeRef.current === 'ball' ? 'ball' : appModeRef.current === 'vnl' ? 'vnl' : 'touch';
     
     const fileArray = Array.from(files);
     const videoFiles = fileArray.filter(f => f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mp4'));
@@ -812,10 +1837,7 @@ function App() {
       try {
         const text = await jsonFile.text();
         const result = parseJSONAnnotations(text, []);
-        let stem = jsonFile.name.replace(/\.json$/i, '');
-        if (stem.startsWith('annotations_')) {
-          stem = stem.replace(/^annotations_/, '');
-        }
+        let stem = normalizeAnnotationStem(jsonFile.name.replace(/\.json$/i, ''));
         parsedJsonAnnotations[stem] = result;
       } catch (err) {
         console.error(`Failed to parse standalone JSON: ${jsonFile.name}`, err);
@@ -826,10 +1848,7 @@ function App() {
       try {
         const text = await xmlFile.text();
         const parsed = parseXMLAnnotations(text);
-        let stem = xmlFile.name.replace(/\.xml$/i, '');
-        if (stem.startsWith('annotations_')) {
-          stem = stem.replace(/^annotations_/, '');
-        }
+        let stem = normalizeAnnotationStem(xmlFile.name.replace(/\.xml$/i, ''));
         parsedAnnotations[stem] = parsed;
       } catch (err) {
         console.error(`Failed to parse standalone XML: ${xmlFile.name}`, err);
@@ -842,28 +1861,59 @@ function App() {
       window.alert("No video files found! Please upload MP4 videos along with your ZIP file, or ensure your ZIP contains MP4s.");
       return;
     }
+    if (
+      OFFLINE_REVIEW_ONLY &&
+      Object.keys(parsedAnnotations).length === 0 &&
+      Object.keys(parsedJsonAnnotations).length === 0
+    ) {
+      window.alert(
+        "No XML or JSON annotations were found. The videos will open without predictions; no inference runs on the hosted website.",
+      );
+    }
 
-    const newPlaylistItems: PlaylistItem[] = await Promise.all(allVideoFiles.map(async file => {
-      let existing = stateRef.current.playlist.find(p => p.name === file.name);
+    gpuFileReadyRef.current.clear();
+
+    const newPlaylistItems: PlaylistItem[] = await Promise.all(allVideoFiles.map(async (file) => {
+      const displayName = file.name;
+      let existing = stateRef.current.playlist.find((p) => p.name === displayName);
       
-      let itemEvents = existing?.events || [];
+      let itemEvents = workflowMode === 'ball' ? [] : (existing?.events || []);
       let itemRally = existing?.rally || { start_frame: null, end_frame: null };
-      let isApplied = existing?.isSkillAlgorithmApplied || false;
-      let itemPlayerBoxes = existing?.playerBoxes || {};
-      let itemRawJson = existing?.rawJsonString || undefined;
-      let itemManualActions = existing?.manualActions || [];
+      const fileId = file.name + file.lastModified;
+      const isNewUpload = !existing || existing.id !== fileId;
+      let isApplied = existing && !isNewUpload ? isItemAlgorithmApplied(existing, workflowMode) : false;
+      if (workflowMode === 'vnl') {
+        // Default to re-infer unless we import usable VNL events from ZIP/XML.
+        isApplied = false;
+        itemEvents = [];
+      }
+      let itemPlayerBoxes = workflowMode === 'ball' ? {} : (existing?.playerBoxes || {});
+      let itemRawJson = workflowMode === 'ball' ? undefined : (existing?.rawJsonString || undefined);
+      let itemManualActions = workflowMode === 'ball' ? [] : (existing?.manualActions || []);
 
-      // Detect native video FPS using MP4Box
       const nativeFps = await detectVideoFps(file);
 
       const stem = file.name.replace(/\.[^/.]+$/, '');
-      if (parsedAnnotations[stem]) {
-        if (!existing || (!existing.isSkillAlgorithmApplied && (!existing.events || existing.events.length === 0))) {
-          itemEvents = parsedAnnotations[stem].events;
-          itemRally = parsedAnnotations[stem].rally;
-          // Set to false so the batch processor picks it up to run inferAssignPlayer
-          isApplied = false;
+      let xmlKey = stem;
+      if (!parsedAnnotations[xmlKey]) {
+        const possibleXmlKey = Object.keys(parsedAnnotations).find(
+          (k) => k.startsWith(stem + '_') || stem.startsWith(k + '_'),
+        );
+        if (possibleXmlKey) xmlKey = possibleXmlKey;
+      }
+
+      if (workflowMode === 'touch' && parsedAnnotations[xmlKey]) {
+        if (!existing || (!isItemAlgorithmApplied(existing, workflowMode) && (!existing.events || existing.events.length === 0))) {
+          itemEvents = parsedAnnotations[xmlKey].events;
+          itemRally = parsedAnnotations[xmlKey].rally;
+          // GitHub Pages is review-only: imported XML is the prediction source.
+          isApplied = OFFLINE_REVIEW_ONLY;
         }
+      } else if (workflowMode === 'vnl' && parsedAnnotations[xmlKey]) {
+        // For VNL imports, trust existing XML events and bypass re-inference.
+        itemEvents = parsedAnnotations[xmlKey].events;
+        itemRally = parsedAnnotations[xmlKey].rally;
+        isApplied = OFFLINE_REVIEW_ONLY || itemEvents.length > 0;
       }
       
       let jsonKey = stem;
@@ -878,7 +1928,7 @@ function App() {
 
       let jsonFps: number | undefined = undefined;
 
-      if (parsedJsonAnnotations[jsonKey]) {
+      if (workflowMode === 'touch' && parsedJsonAnnotations[jsonKey]) {
         const parsedResult = itemManualActions.length > 0 
           ? parseJSONAnnotations(parsedJsonAnnotations[jsonKey].rawJsonString, itemManualActions)
           : parsedJsonAnnotations[jsonKey];
@@ -888,10 +1938,8 @@ function App() {
         jsonFps = parsedResult.videoFps;
       }
       
-      // Determine the best available FPS
       const finalFps = nativeFps || jsonFps || existing?.videoMetadata?.fps || 30;
 
-      // Update or create videoMetadata with the correct FPS
       let newVideoMetadata = existing?.videoMetadata || null;
       if (newVideoMetadata) {
         newVideoMetadata = { ...newVideoMetadata, fps: finalFps };
@@ -900,72 +1948,70 @@ function App() {
       }
 
       return {
-        id: file.name + file.lastModified,
-        name: file.name,
-        file: file,
+        id: displayName + file.lastModified,
+        name: displayName,
+        file,
         events: itemEvents,
         rally: itemRally,
         playerBoxes: itemPlayerBoxes,
         rawJsonString: itemRawJson,
         manualActions: itemManualActions,
-        isSkillAlgorithmApplied: isApplied,
+        isTouchAlgorithmApplied: workflowMode === 'touch' ? isApplied : existing?.isTouchAlgorithmApplied,
+        isBallAlgorithmApplied: workflowMode === 'ball' ? isApplied : existing?.isBallAlgorithmApplied,
+        isSkillAlgorithmApplied: workflowMode === 'touch' ? isApplied : existing?.isSkillAlgorithmApplied,
+        isVnlAlgorithmApplied: workflowMode === 'vnl' ? isApplied : existing?.isVnlAlgorithmApplied,
         videoMetadata: newVideoMetadata,
         isCompleted: existing?.isCompleted || false
       };
     }));
 
     const total = newPlaylistItems.length;
-    const completed = newPlaylistItems.filter(p => p.isSkillAlgorithmApplied).length;
-    
+    // Hosted builds never call localhost or run inference. Even unmatched videos
+    // remain available for manual correction instead of starting the batch worker.
+    const completed = OFFLINE_REVIEW_ONLY
+      ? total
+      : newPlaylistItems.filter((p) => isItemAlgorithmApplied(p, workflowMode)).length;
+
+    const syncItem = newPlaylistItems[0];
+    const isRestoring = stateRef.current.videoMetadata?.filename === syncItem?.name;
+    const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
+    const syncedState: AppState = {
+      ...stateRef.current,
+      playlist: newPlaylistItems,
+      currentPlaylistIndex: 0,
+      videoMetadata: syncItem?.videoMetadata || {
+        filename: syncItem?.name ?? '',
+        fps: 30,
+        width: 0,
+        height: 0,
+        duration: 0,
+        frame_count: 0,
+      },
+      rally: syncItem?.rally || { start_frame: null, end_frame: null },
+      events: syncItem?.events || [],
+      playerBoxes: syncItem?.playerBoxes || {},
+      currentFrame: savedFrame,
+    };
+    stateRef.current = syncedState;
+    setState(syncedState);
+
+    if (syncItem?.file) {
+      assignVideoUrlFromFile(syncItem.file);
+    }
+
+    if (!OFFLINE_REVIEW_ONLY) {
+      runBackgroundGpuPrep(allVideoFiles, newPlaylistItems.map((p) => p.id));
+    }
+
     if (total > 0) {
+      processingRef.current = false;
       setBatchProgress({
         isRunning: completed < total,
         completed,
         total,
         lastFps: 0,
-        avgTimeSec: 0
+        avgTimeSec: 0,
       });
-    }
-
-    if (completed === total && total > 0) {
-      const item = newPlaylistItems[0];
-      if (item.file) {
-        const url = URL.createObjectURL(item.file);
-        setVideoUrl(url);
-      }
-      
-      const isRestoring = stateRef.current.videoMetadata?.filename === item.name;
-      const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
-      
-      setState(prev => ({
-        ...prev,
-        playlist: newPlaylistItems,
-        currentPlaylistIndex: 0,
-        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
-        rally: item.rally || { start_frame: null, end_frame: null },
-        events: item.events || [],
-        playerBoxes: item.playerBoxes || {},
-        currentFrame: savedFrame
-      }));
-    } else {
-      const item = newPlaylistItems[0];
-      if (item.file) {
-        const url = URL.createObjectURL(item.file);
-        setVideoUrl(url);
-      }
-      const isRestoring = stateRef.current.videoMetadata?.filename === item.name;
-      const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
-      
-      setState(prev => ({
-        ...prev,
-        playlist: newPlaylistItems,
-        currentPlaylistIndex: 0,
-        videoMetadata: item.videoMetadata || { filename: item.name, fps: 30, width: 0, height: 0, duration: 0, frame_count: 0 },
-        rally: item.rally || { start_frame: null, end_frame: null },
-        events: item.events || [],
-        playerBoxes: item.playerBoxes || {},
-        currentFrame: savedFrame
-      }));
     }
   };
 
@@ -1006,68 +2052,441 @@ function App() {
     }
   };
 
+  const currentPlaylistItem = state.playlist[state.currentPlaylistIndex];
+  const playbackTiming = useMemo(
+    () => getTimingForMode(
+      appMode,
+      state.videoMetadata,
+      (appMode === 'ball' || appMode === 'vnl') ? currentPlaylistItem?.inferenceVideoMeta : undefined,
+    ),
+    [state.videoMetadata, appMode, currentPlaylistItem?.inferenceVideoMeta],
+  );
+
   const handleVideoLoaded = () => {
-    if (videoRef.current && state.videoMetadata) {
-      const v = videoRef.current;
-      const duration = v.duration;
-      // If we don't have valid duration yet
-      if (isNaN(duration)) return;
-      
-      const fps = state.videoMetadata.fps;
-      
-      if (state.currentFrame > 0) {
-        v.currentTime = state.currentFrame / fps;
+    const v = videoRef.current;
+    if (!v) return;
+    const duration = v.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    const currentState = stateRef.current;
+    const item = currentState.playlist[currentState.currentPlaylistIndex];
+    const currentMeta = currentState.videoMetadata;
+    const mode = appModeRef.current;
+    const timing = getTimingForMode(
+      mode,
+      currentMeta,
+      (mode === 'ball' || mode === 'vnl') ? item?.inferenceVideoMeta : undefined,
+    );
+
+    if (mode === 'ball') {
+      const rvfc = (v as unknown as {
+        requestVideoFrameCallback?: (cb: (now: number, meta: { mediaTime: number }) => void) => number;
+      }).requestVideoFrameCallback?.bind(v);
+      const targetFrame = currentState.currentFrame;
+      const seekToTarget = () => {
+        if (targetFrame > 0) {
+          v.currentTime = frameToMediaTime(targetFrame, timing.fps, ballBaseTimeRef.current ?? 0);
+        }
+      };
+      if (rvfc) {
+        if (v.currentTime !== 0) v.currentTime = 0;
+        rvfc((_now, meta) => {
+          ballBaseTimeRef.current = meta.mediaTime;
+          seekToTarget();
+        });
+      } else {
+        ballBaseTimeRef.current = 0;
+        seekToTarget();
       }
-      
-      v.playbackRate = playbackRate;
-      
-      setState(prev => ({
+    } else if (mode === 'vnl' && item?.inferenceVideoMeta) {
+      if (currentState.currentFrame > 0) {
+        v.currentTime = vnlMapFrameToTime(
+          currentState.currentFrame,
+          item.inferenceVideoMeta.frame_count,
+          duration,
+          item.inferenceVideoMeta.fps,
+        );
+      }
+    } else if (currentState.currentFrame > 0) {
+      v.currentTime = frameToTime(currentState.currentFrame, timing.fps, false);
+    }
+
+    v.playbackRate = playbackRate;
+
+    setState((prev) => {
+      const prevItem = prev.playlist[prev.currentPlaylistIndex];
+      const inferMeta = prevItem?.inferenceVideoMeta;
+      const filename = prev.videoMetadata?.filename ?? prevItem?.name ?? 'video.mp4';
+      if (mode === 'vnl' && inferMeta) {
+        return {
+          ...prev,
+          videoMetadata: {
+            filename,
+            width: v.videoWidth || inferMeta.width || prev.videoMetadata?.width || 1280,
+            height: v.videoHeight || inferMeta.height || prev.videoMetadata?.height || 720,
+            duration,
+            fps: inferMeta.fps,
+            frame_count: inferMeta.frame_count,
+          },
+        };
+      }
+      const prevTiming = getBallPlaybackTiming(
+        prev.videoMetadata,
+        mode === 'ball' ? inferMeta : undefined,
+      );
+      const keepInferenceTiming = mode === 'ball' && !!inferMeta;
+      const browserFrameCount = Math.ceil(duration * prevTiming.fps);
+      return {
         ...prev,
         videoMetadata: {
-          ...prev.videoMetadata!,
-          width: v.videoWidth,
-          height: v.videoHeight,
-          duration: duration,
-          frame_count: Math.floor(duration * fps)
-        }
-      }));
-    }
+          filename,
+          width: v.videoWidth || prev.videoMetadata?.width || prevTiming.width,
+          height: v.videoHeight || prev.videoMetadata?.height || prevTiming.height,
+          duration,
+          fps: prevTiming.fps,
+          frame_count: keepInferenceTiming
+            ? Math.max(inferMeta!.frame_count, browserFrameCount)
+            : Math.max(browserFrameCount, prev.videoMetadata?.frame_count ?? 0),
+        },
+      };
+    });
   };
 
   const seekToFrame = useCallback((frame: number) => {
-    if (!videoRef.current || !state.videoMetadata) return;
-    const maxFrame = state.videoMetadata.frame_count - 1;
+    if (!videoRef.current) return;
+    const item = state.playlist[state.currentPlaylistIndex];
+    const timing = getTimingForMode(
+      appMode,
+      state.videoMetadata,
+      (appMode === 'ball' || appMode === 'vnl') ? item?.inferenceVideoMeta : undefined,
+    );
+    const maxFrame = Math.max(0, timing.frame_count - 1);
     const safeFrame = Math.max(0, Math.min(frame, maxFrame));
-    
-    const time = safeFrame / state.videoMetadata.fps;
-    videoRef.current.currentTime = time;
-    setState(prev => ({ ...prev, currentFrame: safeFrame }));
-  }, [state.videoMetadata]);
+    const video = videoRef.current;
 
-  const startContinuousSeek = (delta: number) => {
-    // Initial jump
-    seekToFrame(state.currentFrame + delta);
-    
-    seekIntervalRef.current = setInterval(() => {
-      if (!videoRef.current || !state.videoMetadata) return;
-      const currentActualFrame = Math.round(videoRef.current.currentTime * state.videoMetadata.fps);
-      seekToFrame(currentActualFrame + delta);
-    }, 100);
+    let targetTime: number;
+    // In ball mode, anchor frame->time to the calibrated base PTS so the seek
+    // lands on the exact frame the inference indexed (decode order), for every rally.
+    if (appMode === 'ball') {
+      targetTime = ballBaseTimeRef.current !== null
+        ? frameToMediaTime(safeFrame, timing.fps, ballBaseTimeRef.current)
+        : frameToTimeByDuration(safeFrame, video.duration, timing.frame_count);
+    } else if (appMode === 'vnl' && item?.inferenceVideoMeta && video.duration > 0) {
+      targetTime = vnlMapFrameToTime(
+        safeFrame,
+        item.inferenceVideoMeta.frame_count,
+        video.duration,
+        item.inferenceVideoMeta.fps,
+      );
+    } else {
+      targetTime = frameToTime(safeFrame, timing.fps, false);
+    }
+
+    if (!Number.isFinite(targetTime)) return;
+
+    // While step-play / hold-seek is active, wait for each seek to land before
+    // requesting the next frame. Updating currentTime faster than decode freezes
+    // the picture while the frame counter keeps racing ahead.
+    const stepping =
+      autoStepIntervalRef.current !== null || seekIntervalRef.current !== null;
+
+    if (seekTimeoutRef.current) {
+      clearTimeout(seekTimeoutRef.current);
+      seekTimeoutRef.current = null;
+    }
+
+    const alreadyThere = Math.abs(video.currentTime - targetTime) < 1e-4;
+    if (!alreadyThere) {
+      isSeekingRef.current = true;
+      pendingSeekFrameRef.current = safeFrame;
+      video.currentTime = targetTime;
+      // Some browsers skip 'seeked' when the assigned time rounds to the same media time.
+      seekTimeoutRef.current = setTimeout(() => {
+        if (pendingSeekFrameRef.current === safeFrame) {
+          isSeekingRef.current = false;
+          pendingSeekFrameRef.current = null;
+        }
+        seekTimeoutRef.current = null;
+      }, 350);
+    } else {
+      isSeekingRef.current = false;
+      pendingSeekFrameRef.current = null;
+    }
+
+    setState(prev => {
+      let newBoxes = prev.playerBoxes;
+
+      if (appMode === 'ball' && ballEditMode && safeFrame === prev.currentFrame + 1) {
+        const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
+        const nextBoxes = prev.playerBoxes[safeFrame] || [];
+        if (currentBoxes.length > 0 && nextBoxes.length === 0) {
+          newBoxes = {
+            ...prev.playerBoxes,
+            [safeFrame]: [{ ...currentBoxes[0], source: 'manual' as const }],
+          };
+        }
+      } else if (appMode !== 'ball' && safeFrame === prev.currentFrame + 1) {
+        const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
+        const nextBoxes = prev.playerBoxes[safeFrame] || [];
+        const missingBoxes = currentBoxes.filter(
+          cb => !nextBoxes.some(nb => nb.track_id === cb.track_id)
+        );
+
+        if (missingBoxes.length > 0) {
+          const copiedBoxes = missingBoxes.map(b => ({ ...b }));
+          newBoxes = {
+            ...prev.playerBoxes,
+            [safeFrame]: [...nextBoxes, ...copiedBoxes]
+          };
+        }
+      }
+
+      // During step-play, let onSeeked / presented-frame drive currentFrame so the
+      // counter cannot outrun the pixels on screen.
+      const frameUpdate =
+        video.paused && !stepping ? { currentFrame: safeFrame } : {};
+      if (newBoxes !== prev.playerBoxes) {
+        return { ...prev, ...frameUpdate, playerBoxes: newBoxes };
+      }
+      if (video.paused && !stepping && safeFrame !== prev.currentFrame) {
+        return { ...prev, currentFrame: safeFrame };
+      }
+      // Still bump the counter when already on the target (seeked may not fire).
+      if (video.paused && stepping && alreadyThere && safeFrame !== prev.currentFrame) {
+        return { ...prev, currentFrame: safeFrame };
+      }
+      return prev;
+    });
+  }, [state.videoMetadata, state.playlist, state.currentPlaylistIndex, appMode, ballEditMode]);
+
+  // Re-align playback when VNL inference metadata arrives (after batch) or preview source changes.
+  useEffect(() => {
+    if (appMode !== 'vnl' || !currentPlaylistItem?.inferenceVideoMeta?.frame_count) return;
+    if (!videoRef.current || !Number.isFinite(videoRef.current.duration) || videoRef.current.duration <= 0) return;
+    seekToFrame(stateRef.current.currentFrame);
+  }, [
+    appMode,
+    currentPlaylistItem?.inferenceVideoMeta?.frame_count,
+    videoUrl,
+    videoPlaybackKind,
+    seekToFrame,
+  ]);
+
+  const ballBoxesForDisplay = useMemo((): Record<number, PlayerBox[]> => {
+    if (appMode !== 'ball') return state.playerBoxes;
+    if (ballEditMode) return state.playerBoxes;
+    const item = currentPlaylistItem;
+    // Use the saved working copy (includes draws/moves/deletes), not raw inference.
+    return item?.playerBoxes ?? state.playerBoxes;
+  }, [appMode, ballEditMode, state.playerBoxes, currentPlaylistItem?.playerBoxes]);
+
+  const rejectedBallBoxesForDisplay = useMemo((): Record<number, PlayerBox[]> => {
+    if (appMode !== 'ball' || ballEditMode || !showRejectedBallBoxes) return {};
+    return currentPlaylistItem?.rejectedBallBoxes ?? {};
+  }, [appMode, ballEditMode, showRejectedBallBoxes, currentPlaylistItem?.rejectedBallBoxes]);
+
+  const ballOverlayFrame = useMemo(() => {
+    if (appMode === 'ball' && presentedBallFrame !== null) {
+      return presentedBallFrame;
+    }
+    return state.currentFrame;
+  }, [appMode, presentedBallFrame, state.currentFrame]);
+
+  const toggleBallEditMode = () => {
+    if (appMode !== 'ball') return;
+    setBallEditMode((prev) => {
+      const next = !prev;
+      if (next) {
+        setState((s) => {
+          const item = s.playlist[s.currentPlaylistIndex];
+          const base = mergeBallBoxes(item?.inferenceBallBoxes, item?.playerBoxes ?? s.playerBoxes);
+          const editable = cloneBallBoxes(base);
+          const newPlaylist = [...s.playlist];
+          if (newPlaylist[s.currentPlaylistIndex]) {
+            newPlaylist[s.currentPlaylistIndex] = {
+              ...newPlaylist[s.currentPlaylistIndex],
+              playerBoxes: editable,
+            };
+          }
+          return { ...s, playlist: newPlaylist, playerBoxes: editable };
+        });
+      } else {
+        setState((s) => {
+          const edited = cloneBallBoxes(s.playerBoxes);
+          const newPlaylist = [...s.playlist];
+          if (newPlaylist[s.currentPlaylistIndex]) {
+            newPlaylist[s.currentPlaylistIndex] = {
+              ...newPlaylist[s.currentPlaylistIndex],
+              playerBoxes: edited,
+            };
+          }
+          return { ...s, playlist: newPlaylist, playerBoxes: edited };
+        });
+      }
+      return next;
+    });
   };
 
-  const stopContinuousSeek = () => {
+  const stopAutoStep = useCallback(() => {
+    if (autoStepIntervalRef.current) {
+      clearInterval(autoStepIntervalRef.current);
+      autoStepIntervalRef.current = null;
+    }
+    setIsAutoStepping(false);
+    videoRef.current?.pause();
+  }, []);
+
+  const startAutoStep = useCallback((direction: 1 | -1 = 1) => {
+    if (autoStepIntervalRef.current) {
+      clearInterval(autoStepIntervalRef.current);
+      autoStepIntervalRef.current = null;
+    }
+    videoRef.current?.pause();
+    setIsAutoStepping(true);
+
+    const tick = () => {
+      if (appModeRef.current !== 'ball') {
+        stopAutoStep();
+        return;
+      }
+      // Wait until the previous seek actually painted before advancing.
+      if (isSeekingRef.current) return;
+      const s = stateRef.current;
+      const item = s.playlist[s.currentPlaylistIndex];
+      const timing = getBallPlaybackTiming(s.videoMetadata, item?.inferenceVideoMeta);
+      const maxFrame = Math.max(0, timing.frame_count - 1);
+      const base = pendingSeekFrameRef.current ?? s.currentFrame;
+      const next = base + direction;
+      if (next < 0 || next > maxFrame) {
+        stopAutoStep();
+        return;
+      }
+      seekToFrame(next);
+    };
+
+    autoStepIntervalRef.current = setInterval(tick, 1000 / ballFrameStepFpsRef.current);
+  }, [seekToFrame, stopAutoStep]);
+
+  const togglePlayPause = useCallback(() => {
+    if (appModeRef.current === 'ball') {
+      if (autoStepIntervalRef.current) {
+        stopAutoStep();
+      } else {
+        startAutoStep(1);
+      }
+      return;
+    }
+    if (videoRef.current?.paused) videoRef.current.play();
+    else videoRef.current?.pause();
+  }, [startAutoStep, stopAutoStep]);
+
+  useEffect(() => {
+    if (!isAutoStepping || appMode !== 'ball') return;
+    startAutoStep(1);
+  }, [ballFrameStepFps]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const heldFrameKeyRef = useRef<string | null>(null);
+  const holdStepFrameRef = useRef<number | null>(null);
+
+  const stopContinuousSeek = useCallback(() => {
     if (seekIntervalRef.current) {
       clearInterval(seekIntervalRef.current);
       seekIntervalRef.current = null;
     }
-  };
+    holdStepFrameRef.current = null;
+  }, []);
+
+  const startContinuousSeek = useCallback((delta: number) => {
+    stopAutoStep();
+    const s = stateRef.current;
+    const startFrame = holdStepFrameRef.current ?? s.currentFrame;
+    const first = startFrame + delta;
+    holdStepFrameRef.current = first;
+    seekToFrame(first);
+
+    const intervalMs = appModeRef.current === 'ball' ? 1000 / ballFrameStepFpsRef.current : 100;
+    if (seekIntervalRef.current) clearInterval(seekIntervalRef.current);
+    seekIntervalRef.current = setInterval(() => {
+      if (!videoRef.current) return;
+      if (isSeekingRef.current) return;
+      const cur = stateRef.current;
+      const item = cur.playlist[cur.currentPlaylistIndex];
+      const timing = getTimingForMode(
+        appModeRef.current,
+        cur.videoMetadata,
+        (appModeRef.current === 'ball' || appModeRef.current === 'vnl')
+          ? item?.inferenceVideoMeta
+          : undefined,
+      );
+      const maxFrame = Math.max(0, timing.frame_count - 1);
+      const baseFrame = holdStepFrameRef.current ?? cur.currentFrame;
+      const next = baseFrame + delta;
+      if (next < 0 || next > maxFrame) {
+        stopContinuousSeek();
+        return;
+      }
+      holdStepFrameRef.current = next;
+      seekToFrame(next);
+    }, intervalMs);
+  }, [seekToFrame, stopAutoStep, stopContinuousSeek]);
 
   const handleTimeUpdate = () => {
-    if (!videoRef.current || !state.videoMetadata) return;
-    const frame = Math.round(videoRef.current.currentTime * state.videoMetadata.fps);
-    if (frame !== state.currentFrame) {
-      setState(prev => ({ ...prev, currentFrame: frame }));
+    const video = videoRef.current;
+    if (!video || isSeekingRef.current || video.paused) return;
+    const item = state.playlist[state.currentPlaylistIndex];
+    const timing = getTimingForMode(
+      appMode,
+      state.videoMetadata,
+      (appMode === 'ball' || appMode === 'vnl') ? item?.inferenceVideoMeta : undefined,
+    );
+    const maxFrame = Math.max(0, timing.frame_count - 1);
+    const frame = appMode === 'ball'
+      ? (ballBaseTimeRef.current !== null
+          ? mediaTimeToFrame(video.currentTime, timing.fps, ballBaseTimeRef.current, maxFrame)
+          : timeToFrameByDuration(video.currentTime, video.duration, timing.frame_count))
+      : appMode === 'vnl' && item?.inferenceVideoMeta && video.duration > 0
+        ? vnlMapTimeToFrame(
+            video.currentTime,
+            item.inferenceVideoMeta.frame_count,
+            video.duration,
+            item.inferenceVideoMeta.fps,
+          )
+        : timeToFrame(video.currentTime, timing.fps, maxFrame);
+    setState(prev => {
+      if (frame === prev.currentFrame) return prev;
+      return { ...prev, currentFrame: frame };
+    });
+  };
+
+  const handleVideoSeeked = () => {
+    if (!videoRef.current) return;
+    const item = state.playlist[state.currentPlaylistIndex];
+    const timing = getTimingForMode(
+      appMode,
+      state.videoMetadata,
+      (appMode === 'ball' || appMode === 'vnl') ? item?.inferenceVideoMeta : undefined,
+    );
+    const maxFrame = Math.max(0, timing.frame_count - 1);
+    const decodedFrame = appMode === 'ball'
+      ? (ballBaseTimeRef.current !== null
+          ? mediaTimeToFrame(videoRef.current.currentTime, timing.fps, ballBaseTimeRef.current, maxFrame)
+          : timeToFrameByDuration(videoRef.current.currentTime, videoRef.current.duration, timing.frame_count))
+      : appMode === 'vnl' && item?.inferenceVideoMeta && videoRef.current.duration > 0
+        ? vnlMapTimeToFrame(
+            videoRef.current.currentTime,
+            item.inferenceVideoMeta.frame_count,
+            videoRef.current.duration,
+            item.inferenceVideoMeta.fps,
+          )
+        : timeToFrame(videoRef.current.currentTime, timing.fps, maxFrame);
+
+    pendingSeekFrameRef.current = null;
+    isSeekingRef.current = false;
+    if (seekTimeoutRef.current) {
+      clearTimeout(seekTimeoutRef.current);
+      seekTimeoutRef.current = null;
     }
+    setState(prev => (prev.currentFrame === decodedFrame ? prev : { ...prev, currentFrame: decodedFrame }));
   };
 
   const addEvent = (skillInfo: { label: SkillLabel; classId: number }) => {
@@ -1081,6 +2500,37 @@ function App() {
     });
   };
 
+  const setVnlEventContactPoint = useCallback((xy: [number, number]) => {
+    saveToHistory(stateRef.current);
+    setState(prev => {
+      const frame = prev.currentFrame;
+      if (!prev.events.some((e) => e.frame === frame)) return prev;
+      const events = prev.events.map((e) =>
+        e.frame === frame
+          ? {
+              ...e,
+              xy,
+              source: 'manual' as const,
+            }
+          : e,
+      );
+      return { ...prev, events };
+    });
+  }, []);
+
+  const handleVnlVideoClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (appModeRef.current !== 'vnl') return;
+    const video = videoRef.current;
+    if (!video) return;
+    const xy = getNormalizedVideoClick(video, e.clientX, e.clientY);
+    if (!xy) return;
+    const frame = stateRef.current.currentFrame;
+    if (!stateRef.current.events.some((ev) => ev.frame === frame)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setVnlEventContactPoint(xy);
+  }, [setVnlEventContactPoint]);
+
   const setRallyBound = (type: 'start' | 'end') => {
     setState(prev => ({
       ...prev,
@@ -1091,7 +2541,27 @@ function App() {
     }));
   };
 
+  const clearBallBoxesAtFrame = (frame: number) => {
+    saveToHistory(state);
+    setState(prev => {
+      const newBoxes = { ...prev.playerBoxes, [frame]: [] };
+      const newPlaylist = [...prev.playlist];
+      if (newPlaylist[prev.currentPlaylistIndex]) {
+        newPlaylist[prev.currentPlaylistIndex] = {
+          ...newPlaylist[prev.currentPlaylistIndex],
+          playerBoxes: newBoxes,
+        };
+      }
+      return { ...prev, playlist: newPlaylist, playerBoxes: newBoxes };
+    });
+  };
+
   const deleteCurrentFrameData = () => {
+    if (appMode === 'ball') {
+      clearBallBoxesAtFrame(state.currentFrame);
+      return;
+    }
+
     saveToHistory(state);
     setState(prev => {
       const isStart = prev.rally.start_frame === prev.currentFrame;
@@ -1213,6 +2683,10 @@ function App() {
       // Remove it from playerBoxes
       const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
       const newBoxes = currentBoxes.filter(b => b.track_id !== trackIdToDelete);
+      const updatedPlayerBoxes = {
+        ...prev.playerBoxes,
+        [prev.currentFrame]: newBoxes,
+      };
       
       // Also remove it from manualActions just in case it was assigned!
       const currentActions = prev.manualActions || [];
@@ -1226,12 +2700,18 @@ function App() {
         return ev;
       });
 
+      const newPlaylist = [...prev.playlist];
+      if (appMode === 'ball' && newPlaylist[prev.currentPlaylistIndex]) {
+        newPlaylist[prev.currentPlaylistIndex] = {
+          ...newPlaylist[prev.currentPlaylistIndex],
+          playerBoxes: updatedPlayerBoxes,
+        };
+      }
+
       return {
         ...prev,
-        playerBoxes: {
-          ...prev.playerBoxes,
-          [prev.currentFrame]: newBoxes
-        },
+        playlist: newPlaylist,
+        playerBoxes: updatedPlayerBoxes,
         manualActions: newActions,
         events: newEvents
       };
@@ -1244,62 +2724,120 @@ function App() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      
+
       const key = e.key.toLowerCase();
-      
-      if (['1', '2', '3', '4', '5', '6'].includes(key)) {
+
+      if (appMode === 'vnl' && ['1', '2', '3', '4', '5', '6', '7', '8'].includes(key)) {
+        const def = VNL_LABEL_DEFS.find((d) => d.hotkey === key);
+        if (def) addEvent({ label: def.label as SkillLabel, classId: def.classId });
+        e.preventDefault();
+        return;
+      }
+
+      if (appMode !== 'vnl' && ['1', '2', '3', '4', '5', '6', '7'].includes(key)) {
         const skillMap: Record<string, { label: SkillLabel; classId: number }> = {
-          '1': { label: 'toss', classId: 0 },
-          '2': { label: 'serve', classId: 1 },
-          '3': { label: 'reception', classId: 2 },
-          '4': { label: 'set', classId: 3 },
-          '5': { label: 'dig', classId: 4 },
-          '6': { label: 'attack', classId: 5 } // Using attack for both attack/block in UI
+          '1': { label: 'toss', classId: SKILL_CLASS_IDS.toss },
+          '2': { label: 'serve', classId: SKILL_CLASS_IDS.serve },
+          '3': { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+          '4': { label: 'set', classId: SKILL_CLASS_IDS.set },
+          '5': { label: 'dig', classId: SKILL_CLASS_IDS.dig },
+          '6': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+          '7': { label: 'block', classId: SKILL_CLASS_IDS.block },
         };
         addEvent(skillMap[key]);
         e.preventDefault();
-      } else if (key === 's') {
+        return;
+      }
+
+      if (key === 's' && appMode !== 'vnl') {
         setRallyBound('start');
         e.preventDefault();
-      } else if (key === 'e') {
+      } else if (key === 'e' && appMode !== 'vnl') {
         setRallyBound('end');
         e.preventDefault();
       } else if (key === 'delete' || key === 'backspace') {
         deleteCurrentFrameData();
         e.preventDefault();
       } else if (key === 'a') {
+        if (appMode === 'vnl') {
+          e.preventDefault();
+          return;
+        }
         if (selectedTrackId !== null) {
           handleAssignPlayer(state.currentFrame, selectedTrackId);
         } else {
           window.alert("Please click on a player's bounding box first to select them, then press 'A'.");
         }
         e.preventDefault();
-      } else if (key === 'arrowleft') {
-        seekToFrame(state.currentFrame - 1);
-        e.preventDefault();
-      } else if (key === 'arrowright') {
-        seekToFrame(state.currentFrame + 1);
-        e.preventDefault();
-      } else if (key === ' ') {
-        if (videoRef.current) {
-          if (videoRef.current.paused) videoRef.current.play();
-          else videoRef.current.pause();
+      } else if (key === 'arrowleft' || key === ',' || key === '<') {
+        stopAutoStep();
+        if (!e.repeat) {
+          const step = e.shiftKey ? -5 : -1;
+          startContinuousSeek(step);
+          heldFrameKeyRef.current = key;
         }
         e.preventDefault();
-      } else if (key === '<' || key === ',') {
-        seekToFrame(state.currentFrame - 1);
+      } else if (key === 'arrowright' || key === '.' || key === '>') {
+        stopAutoStep();
+        if (!e.repeat) {
+          const step = e.shiftKey ? 5 : 1;
+          startContinuousSeek(step);
+          heldFrameKeyRef.current = key;
+        }
         e.preventDefault();
-      } else if (key === '>' || key === '.') {
-        seekToFrame(state.currentFrame + 1);
+      } else if (key === ' ') {
+        togglePlayPause();
+        e.preventDefault();
+      } else if (key === 'z') {
+        setInteractionMode(prev => prev === 'draw' ? 'zoom' : 'draw');
+        e.preventDefault();
+      } else if (key === 'escape') {
+        setViewTransform({ zoom: 1, tx: 0, ty: 0 });
         e.preventDefault();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [state.currentFrame, seekToFrame, selectedTrackId]);
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const key = e.key.toLowerCase();
+      if (['arrowleft', 'arrowright', ',', '.', '<', '>'].includes(key) && heldFrameKeyRef.current === key) {
+        stopContinuousSeek();
+        heldFrameKeyRef.current = null;
+      }
+    };
 
-  const getMousePos = (e: React.MouseEvent<SVGSVGElement>) => {
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      stopContinuousSeek();
+    };
+  }, [seekToFrame, selectedTrackId, appMode, togglePlayPause, stopAutoStep, startContinuousSeek, stopContinuousSeek]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      fullscreenRef.current?.requestFullscreen().catch(err => {
+        console.error(`Error attempting to enable fullscreen: ${err.message}`);
+      });
+    } else {
+      document.exitFullscreen();
+    }
+  };
+
+  const resetZoom = () => {
+    setViewTransform({ zoom: 1, tx: 0, ty: 0 });
+  };
+
+  const getMousePos = (e: React.MouseEvent<SVGElement>) => {
     const svg = svgRef.current;
     if (!svg) return null;
     let pt = svg.createSVGPoint();
@@ -1312,6 +2850,7 @@ function App() {
   };
 
   const handleSvgMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (appMode === 'ball' && !ballEditMode) return;
     if (!state.videoMetadata) return;
     const pos = getMousePos(e);
     if (!pos) return;
@@ -1323,15 +2862,97 @@ function App() {
   };
 
   const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!drawingBox || !state.videoMetadata) return;
     const pos = getMousePos(e);
-    if (!pos) return;
+    if (!pos || !state.videoMetadata) return;
     
+    if (draggingBox) {
+      const dx = pos.x - draggingBox.startX;
+      const dy = pos.y - draggingBox.startY;
+      
+      setState(prev => {
+        const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
+        const newBoxes = currentBoxes.map(b => {
+          if (b.track_id === draggingBox.trackId) {
+            return {
+              ...b,
+              x_min: draggingBox.initialBox.x_min + dx,
+              x_max: draggingBox.initialBox.x_max + dx,
+              y_min: draggingBox.initialBox.y_min + dy,
+              y_max: draggingBox.initialBox.y_max + dy,
+              source: 'manual' as const,
+            };
+          }
+          return b;
+        });
+        return {
+          ...prev,
+          playerBoxes: { ...prev.playerBoxes, [prev.currentFrame]: newBoxes }
+        };
+      });
+      return;
+    }
+
+    if (resizingBox) {
+      const dx = pos.x - resizingBox.startX;
+      const dy = pos.y - resizingBox.startY;
+      
+      setState(prev => {
+        const currentBoxes = prev.playerBoxes[prev.currentFrame] || [];
+        const newBoxes = currentBoxes.map(b => {
+          if (b.track_id === resizingBox.trackId) {
+            let { x_min, y_min, x_max, y_max } = resizingBox.initialBox;
+            const { corner } = resizingBox;
+            
+            if (corner === 'tl') {
+              x_min = Math.min(x_min + dx, x_max - 5);
+              y_min = Math.min(y_min + dy, y_max - 5);
+            } else if (corner === 'tr') {
+              x_max = Math.max(x_max + dx, x_min + 5);
+              y_min = Math.min(y_min + dy, y_max - 5);
+            } else if (corner === 'bl') {
+              x_min = Math.min(x_min + dx, x_max - 5);
+              y_max = Math.max(y_max + dy, y_min + 5);
+            } else if (corner === 'br') {
+              x_max = Math.max(x_max + dx, x_min + 5);
+              y_max = Math.max(y_max + dy, y_min + 5);
+            }
+            
+            return { ...b, x_min, y_min, x_max, y_max, source: 'manual' as const };
+          }
+          return b;
+        });
+        return {
+          ...prev,
+          playerBoxes: { ...prev.playerBoxes, [prev.currentFrame]: newBoxes }
+        };
+      });
+      return;
+    }
+
+    if (!drawingBox) return;
     setDrawingBox(prev => prev ? { ...prev, currentX: pos.x, currentY: pos.y } : null);
   };
 
   const handleSvgMouseUp = () => {
-    if (!drawingBox) return;
+    if (draggingBox || resizingBox) {
+      if (appMode === 'ball' && ballEditMode) {
+        setState((prev) => {
+          const newPlaylist = [...prev.playlist];
+          if (newPlaylist[prev.currentPlaylistIndex]) {
+            newPlaylist[prev.currentPlaylistIndex] = {
+              ...newPlaylist[prev.currentPlaylistIndex],
+              playerBoxes: prev.playerBoxes,
+            };
+          }
+          return { ...prev, playlist: newPlaylist };
+        });
+      }
+      setDraggingBox(null);
+      setResizingBox(null);
+      return;
+    }
+
+    if (!drawingBox || !state.videoMetadata) return;
     
     const x_min = Math.min(drawingBox.startX, drawingBox.currentX);
     const x_max = Math.max(drawingBox.startX, drawingBox.currentX);
@@ -1339,36 +2960,82 @@ function App() {
     const y_max = Math.max(drawingBox.startY, drawingBox.currentY);
     
     if (x_max - x_min > 10 && y_max - y_min > 10) {
-      const highestTrackId = Math.max(0, ...Object.values(state.playerBoxes).flatMap(frameBoxes => frameBoxes.map(b => b.track_id)));
-      
-      const newBox: PlayerBox = {
-        x_min, y_min, x_max, y_max,
-        track_id: highestTrackId + 1,
-        is_active: false
-      };
-      
-      saveToHistory(state);
-      setState(prev => {
-        const newBoxesState = { ...prev.playerBoxes };
-        for (let f = prev.currentFrame - 2; f <= prev.currentFrame + 2; f++) {
-          if (f >= 0) {
-            newBoxesState[f] = [...(newBoxesState[f] || []), { ...newBox }];
-          }
+      if (interactionMode === 'zoom') {
+        const wrapper = wrapperRef.current;
+        if (wrapper) {
+          const W = wrapper.clientWidth;
+          const H = wrapper.clientHeight;
+          const vW = state.videoMetadata.width || 1280;
+          const vH = state.videoMetadata.height || 720;
+          
+          const s = Math.min(W / vW, H / vH);
+          const Ox = (W - vW * s) / 2;
+          const Oy = (H - vH * s) / 2;
+          
+          const cx = x_min + (x_max - x_min) / 2;
+          const cy = y_min + (y_max - y_min) / 2;
+          
+          const px = Ox + cx * s;
+          const py = Oy + cy * s;
+          
+          const boxW = (x_max - x_min) * s;
+          const boxH = (y_max - y_min) * s;
+          
+          let targetZ = Math.min(W / boxW, H / boxH);
+          targetZ = Math.min(Math.max(targetZ, 1), 6); // Cap at 6x zoom
+          
+          setViewTransform({ zoom: targetZ, tx: 0, ty: 0 });
+          
+          setTimeout(() => {
+            if (wrapperRef.current) {
+              wrapperRef.current.scrollLeft = (px * targetZ) - (W / 2);
+              wrapperRef.current.scrollTop = (py * targetZ) - (H / 2);
+            }
+          }, 50);
         }
+      } else {
+        const highestTrackId = Math.max(0, ...Object.values(state.playerBoxes).flatMap(frameBoxes => frameBoxes.map(b => b.track_id)));
         
-        return {
-          ...prev,
-          playerBoxes: newBoxesState,
-          manualActions: [...(prev.manualActions || []), { 
-            frame: prev.currentFrame, 
-            track_id: newBox.track_id, 
-            action: 'draw_box', 
-            box: newBox 
-          }]
+        const newBox: PlayerBox = {
+          x_min, y_min, x_max, y_max,
+          track_id: highestTrackId + 1,
+          is_active: false,
+          conf: 1.0,
+          source: 'manual',
         };
-      });
-      
-      setSelectedTrackId(newBox.track_id);
+        
+        saveToHistory(state);
+        setState(prev => {
+          const newBoxesState = { ...prev.playerBoxes };
+          if (appMode === 'ball') {
+            newBoxesState[prev.currentFrame] = [{ ...newBox }];
+          } else {
+            newBoxesState[prev.currentFrame] = [...(newBoxesState[prev.currentFrame] || []), { ...newBox }];
+          }
+
+          const newPlaylist = [...prev.playlist];
+          if (appMode === 'ball' && newPlaylist[prev.currentPlaylistIndex]) {
+            newPlaylist[prev.currentPlaylistIndex] = {
+              ...newPlaylist[prev.currentPlaylistIndex],
+              playerBoxes: newBoxesState,
+            };
+          }
+          
+          return {
+            ...prev,
+            playlist: newPlaylist,
+            playerBoxes: newBoxesState,
+            manualActions: [...(prev.manualActions || []), { 
+              frame: prev.currentFrame, 
+              track_id: newBox.track_id, 
+              action: 'draw_box', 
+              box: newBox 
+            }]
+          };
+        });
+        
+        setSelectedTrackId(newBox.track_id);
+      }
     }
     
     setDrawingBox(null);
@@ -1385,6 +3052,7 @@ function App() {
     }
     
     state.events.forEach(ev => {
+      if (appMode === 'vnl') return;
       const boxes = state.playerBoxes[ev.frame] || [];
       
       const visibleBoxes = boxes.filter(b => {
@@ -1402,11 +3070,50 @@ function App() {
     return warnings;
   };
 
+  const currentVnlEvent = useMemo(
+    () => (appMode === 'vnl' ? state.events.find((e) => e.frame === state.currentFrame) : undefined),
+    [appMode, state.events, state.currentFrame],
+  );
+
+  const currentVnlDotPosition = useMemo(() => {
+    const video = videoRef.current;
+    const container = video?.parentElement;
+    if (!currentVnlEvent?.xy || !video || !container) return null;
+    return normalizedVideoPointToContainerPercent(currentVnlEvent.xy, video, container);
+  }, [currentVnlEvent, state.currentFrame, videoUrl]);
+
+  const vnlSyncWarning = useMemo(() => {
+    if (appMode !== 'vnl') return null;
+    const inferMeta = currentPlaylistItem?.inferenceVideoMeta;
+    const duration =
+      videoRef.current && Number.isFinite(videoRef.current.duration) && videoRef.current.duration > 0
+        ? videoRef.current.duration
+        : state.videoMetadata?.duration ?? 0;
+    if (!inferMeta?.frame_count || duration <= 0) return null;
+
+    const browserFrames = estimateBrowserFrameCount(duration, inferMeta.fps);
+    const parts: string[] = [];
+    if (videoPlaybackKind === 'h264') {
+      parts.push('Using GPU-transcoded H.264 (same file for playback and inference).');
+    }
+    if (browserFrames + 1 < inferMeta.frame_count) {
+      parts.push(
+        `Preview ~${browserFrames} frames vs inference ${inferMeta.frame_count}. Skills after frame ${browserFrames - 1} may not match video.`,
+      );
+    }
+    return parts.length > 0 ? parts.join(' ') : null;
+  }, [
+    appMode,
+    currentPlaylistItem?.inferenceVideoMeta,
+    state.videoMetadata?.duration,
+    videoPlaybackKind,
+  ]);
+
   const warnings = getValidationWarnings();
 
   // Calculate active frame ranges from the JSON data
   const activeRanges = useMemo(() => {
-    if (!state.playerBoxes) return [];
+    if (!state.playerBoxes || appMode === 'ball') return [];
     
     // Group active frames by track_id
     const trackActiveFrames: Record<number, number[]> = {};
@@ -1555,12 +3262,20 @@ function App() {
       </div>
     );
   }
+
+  if (appMode === 'block_clip') {
+    return <BlockClipAnnotator onBack={returnToHome} />;
+  }
+
   if (!videoUrl) {
-    if (batchProgress.total > 0 && batchProgress.isRunning) {
+    // Full-screen wait only when inference is running but playback is not ready yet (rare).
+    if (batchProgress.total > 0 && batchProgress.isRunning && state.playlist.length === 0) {
+      const pipelineLabel =
+        appMode === 'ball' ? 'Ball tracking' : appMode === 'vnl' ? 'VNL event spotting' : 'Touch & skill';
       return (
         <div className="landing-container">
           <div className="landing-card" style={{ maxWidth: '600px', width: '100%' }}>
-            <h1 className="landing-title">Applying Skill Algorithm...</h1>
+            <h1 className="landing-title">Running {pipelineLabel}…</h1>
             <p className="landing-subtitle">
               Processing video {Math.min(batchProgress.completed + 1, batchProgress.total)} of {batchProgress.total}
               {batchProgress.avgTimeSec > 0 ? (
@@ -1574,7 +3289,14 @@ function App() {
               )}
             </p>
             <div style={{ width: '100%', height: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '6px', overflow: 'hidden', marginTop: '2rem' }}>
-              <div style={{ width: `${(batchProgress.completed / batchProgress.total) * 100}%`, height: '100%', background: 'var(--primary)', transition: 'width 0.3s ease' }} />
+              <div
+                style={{
+                  width: `${(batchProgress.completed / batchProgress.total) * 100}%`,
+                  height: '100%',
+                  background: appMode === 'vnl' ? '#8b5cf6' : 'var(--primary)',
+                  transition: 'width 0.3s ease',
+                }}
+              />
             </div>
             <p style={{ textAlign: 'center', marginTop: '1rem', color: 'rgba(255,255,255,0.7)' }}>
               {Math.round((batchProgress.completed / batchProgress.total) * 100)}% Complete
@@ -1590,28 +3312,54 @@ function App() {
     }
 
     const downloadDocumentation = () => {
-      const docText = `VERITAS PRO - USER GUIDE
+      const docText = `VERITAS PRO - DETAILED USER GUIDE
 
-1. Getting Started
-   - Drag and drop your MP4 files, ZIP files, or JSON annotation files directly into the "Local Files" area.
-   - The app will load them into the playlist sidebar on the left.
+=========================================
+1. INITIAL SETUP & UPLOADING FILES
+=========================================
+- The platform requires both MP4 video files and their corresponding JSON tracking data.
+- You can drag and drop individual MP4 and JSON files directly into the "Upload Local Files" dropzone.
+- Alternatively, you can drop a ZIP file containing paired MP4/JSON files to load an entire match at once.
+- Once loaded, files appear in the left Playlist sidebar.
 
-2. Navigation & Hotkeys
-   - [S] : Mark the start of a rally.
-   - [E] : Mark the end of a rally.
-   - [A] : Select the currently active player bounding box.
-   - [Del] : Delete all annotations on the current frame.
-   - [1-6] : Assign a skill to the current frame (Toss, Serve, Reception, Set, Dig, Attack/Block).
+=========================================
+2. AUTOMATED BATCH PROCESSING
+=========================================
+- When you upload files, the system will automatically check if skill annotations already exist.
+- If missing, the platform will automatically send your video through our AI backend pipeline.
+- You can choose which AI Engine to use (SlowFast or YOLO27) by toggling the switch on the homepage BEFORE uploading.
+- The backend assigns active players to all touch events (Serve, Toss, Reception, Dig, Set, Attack) automatically.
+- Wait for the progress bar to complete. Your annotated videos will then be ready for review.
 
-3. Bounding Boxes
-   - Double-click an existing bounding box to assign the player to the current skill event.
-   - Click and drag anywhere on the video to manually draw a new bounding box.
-   - Right-click any bounding box to instantly delete it.
+=========================================
+3. VIDEO PLAYER & ANNOTATION REVIEW
+=========================================
+- Click a video in the sidebar to open the player.
+- Player bounding boxes are shown in red (passive) or green (active).
+- The timeline shows all detected skill events as colored ticks.
+- Use the [-5f], [-1f], [+1f], [+5f] buttons to navigate frame by frame, or click directly on the timeline.
 
-4. Action Buttons Explained
-   - Undo: Click this to instantly undo your last action (like drawing a box or assigning a player). It remembers your last 50 actions!
-   - Reset Rally: Completely wipes all manual annotations, drawn boxes, and player assignments for the current video. 
-   - Batch ZIP (Bottom Left): When you are completely finished annotating all videos in the playlist, click this to export your work. It will download a single ZIP file containing all your updated JSON and XML files.
+=========================================
+4. MANUAL ADJUSTMENTS & HOTKEYS
+=========================================
+If the AI made a mistake, you can easily fix it:
+- [1-7] : Assign a specific skill to the exact current frame.
+  (1=Toss, 2=Serve, 3=Reception, 4=Set, 5=Dig, 6=Attack, 7=Block)
+- [Del] : Delete all skill annotations on the current frame.
+- [S] / [E] : Mark the Start and End frame of a rally.
+- [A] : Auto-select the currently active player box.
+
+Modifying Bounding Boxes:
+- Double-Click Box : Instantly assign that player to the active skill event on the current frame.
+- Right-Click Box : Delete the bounding box entirely.
+- Click & Drag on Video : Manually draw a brand new tracking box for a player the AI missed.
+
+=========================================
+5. EXPORTING TRAINING DATA
+=========================================
+- Once you have reviewed all videos in the playlist, click the "Batch ZIP" button in the bottom left corner of the sidebar.
+- This will compile all your verified annotations into perfectly formatted JSON and CVAT-compatible XML datasets.
+- Ensure you select "Include MP4s in ZIP" if you also want the original video clips packaged alongside the data.
 
 Enjoy using Veritas Pro!
 `;
@@ -1629,15 +3377,16 @@ Enjoy using Veritas Pro!
     return (
       <div className="landing-container" style={{ 
         display: 'flex', flexDirection: 'column',
-        minHeight: '100vh', overflowY: 'auto',
+        height: '100vh', overflowY: 'auto',
         background: 'radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.15) 0%, rgba(5, 5, 5, 1) 50%, rgba(5, 5, 5, 1) 100%)'
       }}>
         
         {/* RESPONSIVE CENTERING WRAPPER */}
         <div style={{
           display: 'flex', flexDirection: 'column', alignItems: 'center',
-          margin: 'auto', padding: '4rem 2rem', width: '100%'
+          minHeight: '100%', padding: '2rem', width: '100%'
         }}>
+          <div style={{ flexGrow: 1 }} />
         
         {/* HEADER SECTION */}
         <div style={{ textAlign: 'center', marginBottom: '2rem', animation: 'fadeInDown 0.8s ease-out' }}>
@@ -1652,10 +3401,248 @@ Enjoy using Veritas Pro!
             POWERED BY THELIOS.AI
           </p>
           <p style={{ fontSize: '1.1rem', color: 'var(--text-muted)', maxWidth: '500px', margin: '1.5rem auto 0 auto', lineHeight: 1.5 }}>
-            Advanced skill tracking and batch processing pipeline.<br/>
-            Load individual rallies or entire match datasets to begin.
+            {OFFLINE_REVIEW_ONLY
+              ? 'Review and correct precomputed annotations entirely in your browser.'
+              : appMode === 'ball'
+                ? 'Advanced ball tracking and batch processing pipeline.'
+                : appMode === 'vnl'
+                  ? 'VNL-STES event spotting on full rally videos.'
+                  : 'Advanced skill tracking and batch processing pipeline.'}<br/>
+            {OFFLINE_REVIEW_ONLY
+              ? 'Upload a ZIP containing matching video and XML/JSON files. No video or annotation data leaves your computer.'
+              : 'Load individual rallies or entire match datasets to begin.'}
           </p>
         </div>
+
+        {appMode === 'home' ? (
+          <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap', justifyContent: 'center', marginBottom: '3rem', animation: 'fadeInUp 0.8s ease-out' }}>
+            <div 
+              onClick={() => switchWorkflowMode('touch')}
+              style={{
+                width: '320px', padding: '2rem', borderRadius: '16px', cursor: 'pointer',
+                background: 'rgba(59, 130, 246, 0.05)', border: '1px solid rgba(59, 130, 246, 0.3)',
+                boxShadow: '0 10px 30px -10px rgba(59, 130, 246, 0.2)', transition: 'all 0.3s ease',
+                textAlign: 'center'
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(59, 130, 246, 0.1)'; e.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.6)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.background = 'rgba(59, 130, 246, 0.05)'; e.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.3)'; }}
+            >
+              <MousePointer2 size={40} color="#3b82f6" style={{ margin: '0 auto 1rem auto' }} />
+              <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Touch & Skill Annotation</h3>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                Identify active player touches and automatically classify volleyball skills.
+              </p>
+            </div>
+            
+            <div 
+              onClick={() => switchWorkflowMode('ball')}
+              style={{
+                width: '320px', padding: '2rem', borderRadius: '16px', cursor: 'pointer',
+                background: 'rgba(251, 191, 36, 0.05)', border: '1px solid rgba(251, 191, 36, 0.3)',
+                boxShadow: '0 10px 30px -10px rgba(251, 191, 36, 0.2)', transition: 'all 0.3s ease',
+                textAlign: 'center'
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(251, 191, 36, 0.1)'; e.currentTarget.style.borderColor = 'rgba(251, 191, 36, 0.6)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.background = 'rgba(251, 191, 36, 0.05)'; e.currentTarget.style.borderColor = 'rgba(251, 191, 36, 0.3)'; }}
+            >
+              <div style={{ width: '40px', height: '40px', borderRadius: '50%', background: '#fbbf24', margin: '0 auto 1rem auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ width: '32px', height: '32px', borderRadius: '50%', border: '2px solid rgba(0,0,0,0.5)', position: 'relative' }}>
+                  <div style={{ position: 'absolute', top: '50%', left: '0', right: '0', height: '2px', background: 'rgba(0,0,0,0.5)', transform: 'translateY(-50%)' }} />
+                  <div style={{ position: 'absolute', left: '50%', top: '0', bottom: '0', width: '2px', background: 'rgba(0,0,0,0.5)', transform: 'translateX(-50%)' }} />
+                </div>
+              </div>
+              <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Ball Tracking Annotation</h3>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                Track ball trajectories and verify bounding box detections automatically.
+              </p>
+            </div>
+
+            <div
+              onClick={() => {
+                setAppMode('block_clip');
+                localStorage.setItem(APP_MODE_STORAGE_KEY, 'block_clip');
+              }}
+              style={{
+                width: '320px', padding: '2rem', borderRadius: '16px', cursor: 'pointer',
+                background: 'rgba(16, 185, 129, 0.05)', border: '1px solid rgba(16, 185, 129, 0.3)',
+                boxShadow: '0 10px 30px -10px rgba(16, 185, 129, 0.2)', transition: 'all 0.3s ease',
+                textAlign: 'center'
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(16, 185, 129, 0.1)'; e.currentTarget.style.borderColor = 'rgba(16, 185, 129, 0.6)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.background = 'rgba(16, 185, 129, 0.05)'; e.currentTarget.style.borderColor = 'rgba(16, 185, 129, 0.3)'; }}
+            >
+              <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: 'linear-gradient(135deg, #10b981, #059669)', margin: '0 auto 1rem auto', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: '0.75rem', color: 'white' }}>
+                A/B
+              </div>
+              <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Attack / Block Clips</h3>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                Annotate 25-frame attack/block clips with four key frames: pre-attack, attack, block, and end block.
+              </p>
+            </div>
+
+            <div
+              onClick={() => switchWorkflowMode('vnl')}
+              style={{
+                width: '320px', padding: '2rem', borderRadius: '16px', cursor: 'pointer',
+                background: 'rgba(139, 92, 246, 0.05)', border: '1px solid rgba(139, 92, 246, 0.3)',
+                boxShadow: '0 10px 30px -10px rgba(139, 92, 246, 0.2)', transition: 'all 0.3s ease',
+                textAlign: 'center'
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(139, 92, 246, 0.1)'; e.currentTarget.style.borderColor = 'rgba(139, 92, 246, 0.6)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.background = 'rgba(139, 92, 246, 0.05)'; e.currentTarget.style.borderColor = 'rgba(139, 92, 246, 0.3)'; }}
+            >
+              <Zap size={40} color="#8b5cf6" style={{ margin: '0 auto 1rem auto' }} />
+              <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>VNL</h3>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                STES event spotting — toss, serve, receive, set, dig, attack, block, score on full rally videos.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div style={{ width: '100%', maxWidth: '700px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+            <button 
+              onClick={returnToHome}
+              className="btn outline"
+              style={{ position: 'absolute', top: '1.5rem', left: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem', zIndex: 50 }}
+            >
+              <ArrowLeft size={16} /> Back to Selection
+            </button>
+            
+            <h2 style={{ color: appMode === 'ball' ? '#fbbf24' : appMode === 'vnl' ? '#8b5cf6' : '#3b82f6', marginBottom: '1.5rem', fontSize: '1.5rem' }}>
+              {appMode === 'ball' ? 'Ball Tracking Mode' : appMode === 'vnl' ? 'VNL Event Spotting Mode' : 'Player Touch & Skill Mode'}
+            </h2>
+
+            {OFFLINE_REVIEW_ONLY && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  maxWidth: '620px',
+                  padding: '0.85rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(16, 185, 129, 0.1)',
+                  border: '1px solid rgba(16, 185, 129, 0.35)',
+                  color: '#a7f3d0',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                Review-only website: inference is disabled. Upload predictions made on the local tool, correct them, then download the updated ZIP/XML.
+              </div>
+            )}
+
+            {appMode === 'touch' && !OFFLINE_REVIEW_ONLY && (
+              <div style={{ marginBottom: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', animation: 'fadeInDown 0.8s ease-out' }}>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                  Select Touch Player Engine
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-card)', padding: '0.35rem', borderRadius: '12px', border: '1px solid var(--border)', width: '320px', boxShadow: '0 4px 20px -5px rgba(0,0,0,0.5)' }}>
+                  <button
+                    onClick={() => setInferenceEngine('slowfast')}
+                    style={{
+                      flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                      background: inferenceEngine === 'slowfast' ? 'var(--primary)' : 'transparent',
+                      color: inferenceEngine === 'slowfast' ? 'white' : 'var(--text-muted)',
+                      border: 'none', transition: 'all 0.2s',
+                      boxShadow: inferenceEngine === 'slowfast' ? '0 2px 10px rgba(59, 130, 246, 0.4)' : 'none'
+                    }}
+                  >
+                    SlowFast
+                  </button>
+                  <button
+                    onClick={() => setInferenceEngine('yolo')}
+                    style={{
+                      flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                      background: inferenceEngine === 'yolo' ? '#10b981' : 'transparent',
+                      color: inferenceEngine === 'yolo' ? 'white' : 'var(--text-muted)',
+                      border: 'none', transition: 'all 0.2s',
+                      boxShadow: inferenceEngine === 'yolo' ? '0 2px 10px rgba(16, 185, 129, 0.4)' : 'none'
+                    }}
+                  >
+                    YOLO27
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {appMode === 'ball' && !OFFLINE_REVIEW_ONLY && (
+              <div style={{ marginBottom: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', animation: 'fadeInDown 0.8s ease-out' }}>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                  Select Ball Tracking Engine
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-card)', padding: '0.35rem', borderRadius: '12px', border: '1px solid var(--border)', width: '480px', maxWidth: '95vw', boxShadow: '0 4px 20px -5px rgba(0,0,0,0.5)' }}>
+                  <button
+                    onClick={() => setBallEngine('yolo26')}
+                    style={{
+                      flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                      background: ballEngine === 'yolo26' ? '#fbbf24' : 'transparent',
+                      color: ballEngine === 'yolo26' ? '#000' : 'var(--text-muted)',
+                      border: 'none', transition: 'all 0.2s',
+                      boxShadow: ballEngine === 'yolo26' ? '0 2px 10px rgba(251, 191, 36, 0.4)' : 'none'
+                    }}
+                  >
+                    YOLO26
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (backendHealth?.ball_sideview_configured !== 'true') {
+                        window.alert('Side View Ball is not configured on the backend. Using YOLO26 instead.');
+                        setBallEngine('yolo26');
+                        return;
+                      }
+                      setBallEngine('side_view');
+                    }}
+                    disabled={backendHealth?.ball_sideview_configured !== 'true'}
+                    title={backendHealth?.ball_sideview_configured === 'true' ? 'Use Side View Ball YOLO26 tracker' : 'Side View Ball weights not installed on backend'}
+                    style={{
+                      flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px',
+                      cursor: backendHealth?.ball_sideview_configured === 'true' ? 'pointer' : 'not-allowed',
+                      background: ballEngine === 'side_view' ? '#38bdf8' : 'transparent',
+                      color: ballEngine === 'side_view' ? '#000' : 'var(--text-muted)',
+                      opacity: backendHealth?.ball_sideview_configured === 'true' ? 1 : 0.45,
+                      border: 'none', transition: 'all 0.2s',
+                      boxShadow: ballEngine === 'side_view' ? '0 2px 10px rgba(56, 189, 248, 0.4)' : 'none'
+                    }}
+                  >
+                    Side View Ball
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (backendHealth?.ball_triplet_configured !== 'true') {
+                        window.alert('Triplet U-Net is not configured on the backend. Using YOLO26 instead.');
+                        setBallEngine('yolo26');
+                        return;
+                      }
+                      setBallEngine('triplet');
+                    }}
+                    disabled={backendHealth?.ball_triplet_configured !== 'true'}
+                    title={backendHealth?.ball_triplet_configured === 'true' ? 'Use Triplet U-Net ball tracker' : 'Triplet weights not installed on backend'}
+                    style={{
+                      flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px',
+                      cursor: backendHealth?.ball_triplet_configured === 'true' ? 'pointer' : 'not-allowed',
+                      background: ballEngine === 'triplet' ? '#fbbf24' : 'transparent',
+                      color: ballEngine === 'triplet' ? '#000' : 'var(--text-muted)',
+                      opacity: backendHealth?.ball_triplet_configured === 'true' ? 1 : 0.45,
+                      border: 'none', transition: 'all 0.2s',
+                      boxShadow: ballEngine === 'triplet' ? '0 2px 10px rgba(251, 191, 36, 0.4)' : 'none'
+                    }}
+                  >
+                    Triplet U-Net
+                  </button>
+                </div>
+                {backendHealth && backendHealth.ball_configured !== 'true' && (
+                  <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.75rem', textAlign: 'center' }}>
+                    YOLO26 ball tracking is not fully configured on the backend.
+                  </p>
+                )}
+                {backendHealth && backendHealth.ball_sideview_configured !== 'true' && (
+                  <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.5rem', textAlign: 'center' }}>
+                    Side View Ball is not fully configured on the backend.
+                  </p>
+                )}
+              </div>
+            )}
+
 
         {/* DROPZONE */}
         <label 
@@ -1663,30 +3650,42 @@ Enjoy using Veritas Pro!
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => { e.preventDefault(); void handlePlaylistFiles(e.dataTransfer.files); }}
           style={{ 
-            width: '100%', maxWidth: '700px', padding: '2.5rem 2rem', 
+            width: '100%', maxWidth: '700px', padding: '0.75rem 1.5rem', 
             background: 'rgba(255,255,255,0.02)', border: '1px dashed rgba(255,255,255,0.15)', 
-            borderRadius: '16px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.3s ease',
-            boxShadow: '0 10px 40px -10px rgba(0,0,0,0.5)', marginBottom: '2rem', position: 'relative', overflow: 'hidden'
+            borderRadius: '12px', textAlign: 'center', cursor: 'pointer', transition: 'all 0.3s ease',
+            boxShadow: '0 5px 20px -10px rgba(0,0,0,0.5)', marginBottom: '1rem', position: 'relative', overflow: 'hidden'
           }}
           onMouseEnter={(e) => {
             e.currentTarget.style.background = 'rgba(59, 130, 246, 0.05)';
             e.currentTarget.style.borderColor = 'var(--primary)';
             e.currentTarget.style.transform = 'translateY(-2px)';
-            e.currentTarget.style.boxShadow = '0 15px 40px -10px rgba(59, 130, 246, 0.3)';
+            e.currentTarget.style.boxShadow = '0 10px 30px -10px rgba(59, 130, 246, 0.3)';
           }}
           onMouseLeave={(e) => {
             e.currentTarget.style.background = 'rgba(255,255,255,0.02)';
             e.currentTarget.style.borderColor = 'rgba(255,255,255,0.15)';
             e.currentTarget.style.transform = 'translateY(0)';
-            e.currentTarget.style.boxShadow = '0 10px 40px -10px rgba(0,0,0,0.5)';
+            e.currentTarget.style.boxShadow = '0 5px 20px -10px rgba(0,0,0,0.5)';
           }}
         >
-          <div style={{ background: 'rgba(59, 130, 246, 0.1)', width: '64px', height: '64px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1.5rem auto', color: 'var(--primary)' }}>
-            <Upload size={32} />
+          <div style={{ background: 'rgba(59, 130, 246, 0.1)', width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 0.5rem auto', color: 'var(--primary)' }}>
+            <Upload size={18} />
           </div>
-          <h2 style={{ fontSize: '1.5rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Upload Local Files</h2>
-          <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.95rem' }}>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, or <strong>JSON</strong> files here to start annotating.</p>
-          <input type="file" accept="video/mp4,application/zip,.zip,application/json,.json" multiple onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }} style={{ display: 'none' }} />
+          <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.25rem 0', color: 'white' }}>
+            {OFFLINE_REVIEW_ONLY ? 'Upload Prediction ZIP' : 'Upload Local Files'}
+          </h2>
+          <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.8rem' }}>
+            {OFFLINE_REVIEW_ONLY
+              ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
+              : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
+          </p>
+          <input
+            type="file"
+            accept={OFFLINE_REVIEW_ONLY ? "application/zip,.zip" : "video/mp4,application/zip,.zip,application/xml,text/xml,.xml,application/json,.json"}
+            multiple={!OFFLINE_REVIEW_ONLY}
+            onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
+            style={{ display: 'none' }}
+          />
         </label>
 
         {/* FEATURE CARDS (Replaces old Documentation list) */}
@@ -1695,13 +3694,21 @@ Enjoy using Veritas Pro!
           <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
             <div style={{ color: '#fbbf24', marginBottom: '0.8rem' }}><Settings size={24} /></div>
             <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Hotkeys</h3>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>Use keys <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>1-6</code> for assigning skills. Use <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>S</code> & <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>E</code> to mark rally boundaries.</p>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>
+              {appMode === 'ball' 
+                ? <>Use <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>←</code> & <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>→</code> to navigate frames. Use <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>Ctrl+Z</code> to undo.</>
+                : <>Use keys <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>1-6</code> for assigning skills. Use <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>S</code> & <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>E</code> to mark rally boundaries.</>}
+            </p>
           </div>
 
           <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
             <div style={{ color: '#4ade80', marginBottom: '0.8rem' }}><FileVideo size={24} /></div>
             <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.5rem 0', color: 'white' }}>Bounding Boxes</h3>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>Click & drag over players to track. Double-click any box to instantly assign them to the active frame's skill.</p>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', margin: 0, lineHeight: 1.5 }}>
+              {appMode === 'ball'
+                ? "Default view shows raw YOLO inference only (same as the Python script). Click Edit to correct boxes — then → carries the box to the next frame."
+                : "Click & drag over players to track. Double-click any box to instantly assign them to the active frame's skill."}
+            </p>
           </div>
 
           <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
@@ -1714,9 +3721,13 @@ Enjoy using Veritas Pro!
 
         <div style={{ marginTop: '3rem' }}>
           <button onClick={downloadDocumentation} className="btn outline" style={{ fontSize: '0.85rem', padding: '0.6rem 1.2rem', borderRadius: '20px', color: 'var(--text-muted)', borderColor: 'rgba(255,255,255,0.2)' }}>
-            Download Full Guide (.txt)
+            Download Detailed Guide (.txt)
           </button>
         </div>
+        </div>
+        )}
+        
+          <div style={{ flexGrow: 1 }} />
         </div>
       </div>
     );
@@ -1745,9 +3756,7 @@ Enjoy using Veritas Pro!
             <button 
               className="btn outline icon-only" 
               onClick={() => {
-                setState({ playlist: [], currentPlaylistIndex: 0, videoMetadata: null, rally: { start_frame: null, end_frame: null }, events: [], currentFrame: 0, playerBoxes: {}, manualActions: [] });
-                setVideoUrl('');
-                setBatchProgress({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
+                returnToHome();
               }}
               title="Return to Home"
               style={{ padding: '0.3rem 0.6rem', fontSize: '0.75rem', borderRadius: '6px' }}
@@ -1758,6 +3767,9 @@ Enjoy using Veritas Pro!
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.25rem', marginTop: '0.2rem' }}>
             {state.playlist.map((item, index) => {
               const isActive = index === state.currentPlaylistIndex;
+              const workflowMode: WorkflowMode =
+                appMode === 'ball' ? 'ball' : appMode === 'vnl' ? 'vnl' : 'touch';
+              const algorithmApplied = isItemAlgorithmApplied(item, workflowMode);
               return (
                 <div 
                   key={item.id} 
@@ -1783,14 +3795,60 @@ Enjoy using Veritas Pro!
                     if (!isActive) e.currentTarget.style.background = 'transparent';
                   }}
                 >
-                <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {item.name}
+                  <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <div style={{ 
+                      width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+                      backgroundColor: algorithmApplied ? '#10b981' : '#ef4444',
+                      boxShadow: algorithmApplied ? '0 0 5px rgba(16,185,129,0.5)' : '0 0 5px rgba(239,68,68,0.5)'
+                    }} title={algorithmApplied ? 'Algorithm Completed' : 'Algorithm Pending'} />
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</span>
+                  </div>
+                  {item.isCompleted && <CheckCircle size={14} color="var(--color-serve)" />}
                 </div>
-                {item.isCompleted && <CheckCircle size={14} color="var(--color-serve)" />}
-              </div>
-            );
-          })}
+              );
+            })}
           </div>
+
+          {gpuPrepProgress.active && (
+            <div style={{ marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', flexShrink: 0 }}>
+              <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.8)', marginBottom: '4px', display: 'flex', justifyContent: 'space-between' }}>
+                <span>GPU H.264 prep ({gpuPrepProgress.done}/{gpuPrepProgress.total})</span>
+                <span>{gpuPrepProgress.total > 0 ? Math.round((gpuPrepProgress.done / gpuPrepProgress.total) * 100) : 0}%</span>
+              </div>
+              <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', overflow: 'hidden' }}>
+                <div
+                  style={{
+                    width: `${gpuPrepProgress.total > 0 ? (gpuPrepProgress.done / gpuPrepProgress.total) * 100 : 0}%`,
+                    height: '100%',
+                    background: appMode === 'vnl' ? '#8b5cf6' : 'var(--primary)',
+                    transition: 'width 0.3s ease',
+                  }}
+                />
+              </div>
+              <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.5)', marginTop: '4px' }}>
+                You can annotate while remaining files convert in the background.
+              </div>
+            </div>
+          )}
+
+          {batchProgress.isRunning && (
+            <div style={{ marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', flexShrink: 0 }}>
+              <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.8)', marginBottom: '4px', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Processing... ({batchProgress.completed}/{batchProgress.total})</span>
+                <span>{Math.round((batchProgress.completed / batchProgress.total) * 100)}%</span>
+              </div>
+              <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', overflow: 'hidden', marginBottom: '4px' }}>
+                <div style={{ width: `${(batchProgress.completed / batchProgress.total) * 100}%`, height: '100%', background: 'var(--primary)', transition: 'width 0.3s ease' }} />
+              </div>
+              <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.5)' }}>
+                {batchProgress.avgTimeSec > 0 ? (
+                  <>ETA: {Math.floor((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) / 60)}m {Math.round((batchProgress.avgTimeSec * (batchProgress.total - batchProgress.completed)) % 60)}s</>
+                ) : (
+                  <>Calculating ETA...</>
+                )}
+              </div>
+            </div>
+          )}
 
           {warnings.length > 0 && (
             <div style={{ maxHeight: '150px', overflowY: 'auto', marginTop: '1rem', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '0.5rem', flexShrink: 0 }}>
@@ -1833,7 +3891,7 @@ Enjoy using Veritas Pro!
                   };
                 }
                 
-                exportAllToZip(updatedPlaylist, true, includeMp4InZip);
+                exportAllToZip(updatedPlaylist, true, includeMp4InZip, appMode === 'ball' ? 'ball' : appMode === 'vnl' ? 'vnl' : 'touch');
               }}
             >
               <Download size={16} /> Batch ZIP
@@ -1845,140 +3903,330 @@ Enjoy using Veritas Pro!
       </div>
 
       {/* MAIN CONTENT */}
-      <div className="main-content">
-        <div className="glass-panel video-wrapper" style={{ position: 'relative' }}>
-          <video 
-            ref={videoRef} 
-            src={videoUrl} 
-            onLoadedMetadata={handleVideoLoaded}
-            onTimeUpdate={handleTimeUpdate}
-            controls={false}
-            crossOrigin="anonymous" // Needed for Drive URLs if they support it
-            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-          />
-          {showBoundingBoxes && state.videoMetadata && (
-            <svg 
-              ref={svgRef}
-              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'auto', zIndex: 5, cursor: 'crosshair' }}
-              viewBox={`0 0 ${state.videoMetadata.width || 1280} ${state.videoMetadata.height || 720}`}
-              preserveAspectRatio="xMidYMid meet"
-              onMouseDown={handleSvgMouseDown}
-              onMouseMove={handleSvgMouseMove}
-              onMouseUp={handleSvgMouseUp}
-              onMouseLeave={handleSvgMouseUp}
-            >
-              {[...(state.playerBoxes[state.currentFrame] || [])]
-                .sort((a, b) => {
-                  const areaA = (a.x_max - a.x_min) * (a.y_max - a.y_min);
-                  const areaB = (b.x_max - b.x_min) * (b.y_max - b.y_min);
-                  return areaB - areaA; // Sort descending: biggest first, smallest last (on top)
-                })
-                .map((box, idx) => {
-                if (showOnlyActiveBoxes && !box.is_active) return null;
-                const isSelected = selectedTrackId === box.track_id;
-                const color = box.is_active ? '#4ade80' : '#ef4444';
-                return (
-                  <g 
-                    key={idx} 
-                    style={{ pointerEvents: 'auto', cursor: 'pointer' }}
-                    onClick={() => setSelectedTrackId(box.track_id)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      if (window.confirm("Delete this bounding box?")) {
-                        handleDeleteBox(box.track_id);
-                      }
-                    }}
-                    onDoubleClick={(e) => {
-                      e.stopPropagation();
-                      const hasEvent = state.events.some(ev => ev.frame === state.currentFrame);
-                      if (hasEvent) {
-                        handleAssignPlayer(state.currentFrame, box.track_id);
-                      } else {
-                        window.alert("No skill event found on this exact frame. Please create a skill first before assigning a player.");
-                      }
-                    }}
-                  >
-                    {/* Invisible larger rect to make clicking easier */}
-                    <rect 
-                      x={box.x_min - 10} 
-                      y={box.y_min - 10} 
-                      width={(box.x_max - box.x_min) + 20} 
-                      height={(box.y_max - box.y_min) + 20} 
-                      fill="transparent" 
-                    />
-                    <rect 
-                      x={box.x_min} 
-                      y={box.y_min} 
-                      width={box.x_max - box.x_min} 
-                      height={box.y_max - box.y_min} 
-                      fill={isSelected ? 'rgba(255,255,255,0.2)' : 'none'} 
-                      stroke={isSelected ? '#fff' : color} 
-                      strokeWidth={isSelected ? "6" : "4"} 
-                    />
-                    <rect 
-                      x={box.x_min - 2} 
-                      y={box.y_min - 22} 
-                      width="50" 
-                      height="22" 
-                      fill={isSelected ? '#fff' : color} 
-                    />
-                    <text 
-                      x={box.x_min + 4} 
-                      y={box.y_min - 6} 
-                      fill={isSelected ? '#000' : '#fff'} 
-                      fontSize="14" 
-                      fontWeight="bold"
-                    >
-                      ID: {box.track_id}
-                    </text>
-                  </g>
+      <div className="main-content" ref={fullscreenRef}>
+        <div className="glass-panel video-wrapper" style={{ 
+          flex: 1,
+          minHeight: 0,
+          position: 'relative', 
+          overflow: viewTransform.zoom > 1 ? 'auto' : 'hidden',
+        }} ref={wrapperRef}>
+          <div style={{
+            position: 'absolute',
+            inset: 0,
+            width: viewTransform.zoom > 1 ? `${viewTransform.zoom * 100}%` : '100%',
+            height: viewTransform.zoom > 1 ? `${viewTransform.zoom * 100}%` : '100%',
+            maxWidth: viewTransform.zoom > 1 ? 'none' : '100%',
+            background: '#000',
+            transformOrigin: 'top left',
+          }}>
+            <video 
+              ref={videoRef} 
+              src={videoUrl} 
+              onLoadedMetadata={handleVideoLoaded}
+              onLoadedData={() => {
+                const v = videoRef.current;
+                if (!v) return;
+                const frame = stateRef.current.currentFrame;
+                if (frame > 0) {
+                  const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
+                  const mode = appModeRef.current;
+                  const timing = getTimingForMode(
+                    mode,
+                    stateRef.current.videoMetadata,
+                    (mode === 'ball' || mode === 'vnl')
+                      ? item?.inferenceVideoMeta
+                      : undefined,
+                  );
+                  if (mode === 'vnl' && item?.inferenceVideoMeta && v.duration > 0) {
+                    v.currentTime = vnlMapFrameToTime(
+                      frame,
+                      item.inferenceVideoMeta.frame_count,
+                      v.duration,
+                      item.inferenceVideoMeta.fps,
+                    );
+                  } else {
+                    v.currentTime = frameToTime(frame, timing.fps, false);
+                  }
+                } else {
+                  v.currentTime = 0;
+                }
+                setVideoPlaybackError(null);
+              }}
+              onTimeUpdate={handleTimeUpdate}
+              onSeeked={handleVideoSeeked}
+              onError={() => {
+                const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
+                if (item?.file && !videoFileKeyRef.current.endsWith(':h264')) {
+                  prepareVideoPlayback(item.file);
+                  return;
+                }
+                const v = videoRef.current;
+                const code = v?.error?.code;
+                const reason =
+                  code === 3 ? 'decode error (codec not supported in browser)'
+                    : code === 4 ? 'format not supported'
+                      : code === 2 ? 'network error'
+                        : 'load error';
+                setVideoPlaybackError(
+                  `Video failed to load (${reason}). Run ./connect_gpu.sh if inference is stuck.`,
                 );
-              })}
-              
-              {drawingBox && (
-                <rect 
-                  x={Math.min(drawingBox.startX, drawingBox.currentX)}
-                  y={Math.min(drawingBox.startY, drawingBox.currentY)}
-                  width={Math.abs(drawingBox.currentX - drawingBox.startX)}
-                  height={Math.abs(drawingBox.currentY - drawingBox.startY)}
-                  fill="rgba(255,255,255,0.2)"
-                  stroke="#fff"
-                  strokeWidth="4"
-                  strokeDasharray="5,5"
-                  style={{ pointerEvents: 'none' }}
-                />
-              )}
-            </svg>
-          )}
-          {(() => {
-            const activeEvent = state.events.find(e => e.frame === state.currentFrame);
-            if (activeEvent) {
-              return (
-                <div style={{
+              }}
+              controls={false}
+              preload="auto"
+              playsInline
+              crossOrigin={videoUrl.startsWith('blob:') ? undefined : 'anonymous'}
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+            />
+            {(videoTranscoding || videoPlaybackError || (!currentPlaylistItem?.file && !currentPlaylistItem?.driveUrl) ||
+              (gpuPrepProgress.active && currentPlaylistItem && !gpuFileReadyRef.current.has(currentPlaylistItem.id))) && (
+              <div
+                style={{
                   position: 'absolute',
-                  top: '20px',
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  padding: '8px 24px',
-                  borderRadius: '8px',
-                  fontSize: '2rem',
-                  fontWeight: 'bold',
-                  textTransform: 'uppercase',
-                  backgroundColor: `var(--color-${activeEvent.skill})`,
-                  color: '#fff',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
-                  zIndex: 10,
+                  inset: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: 'rgba(0,0,0,0.82)',
+                  zIndex: 20,
+                  padding: '1.5rem',
+                  textAlign: 'center',
+                  color: 'white',
+                  fontSize: '0.95rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                {videoTranscoding || (gpuPrepProgress.active && currentPlaylistItem && !gpuFileReadyRef.current.has(currentPlaylistItem.id))
+                  ? `Converting this rally on GPU to H.264… Other rallies in the playlist can be reviewed while the batch runs.`
+                  : (videoPlaybackError ?? 'Video file not in memory. Re-upload the MP4 in VNL mode to view playback.')}
+              </div>
+            )}
+            {appMode === 'vnl' && (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: 5,
+                  cursor: currentVnlEvent ? 'crosshair' : 'default',
+                }}
+                onClick={handleVnlVideoClick}
+                title={
+                  currentVnlEvent
+                    ? 'Click to set or move the contact dot for this skill'
+                    : 'Add a skill with 1–8, then click to place the contact dot'
+                }
+              />
+            )}
+            {appMode === 'vnl' && currentVnlEvent?.xy && currentVnlDotPosition && (
+              <div
+                style={{
+                  position: 'absolute',
+                  left: `${currentVnlDotPosition.left}%`,
+                  top: `${currentVnlDotPosition.top}%`,
+                  width: 16,
+                  height: 16,
+                  borderRadius: '50%',
+                  border: '2px solid white',
+                  background: `var(--color-${currentVnlEvent.skill})`,
+                  transform: 'translate(-50%, -50%)',
+                  boxShadow: '0 0 10px rgba(255,255,255,0.8)',
                   pointerEvents: 'none',
-                  letterSpacing: '2px',
-                  textShadow: '0 2px 4px rgba(0,0,0,0.3)'
-                }}>
-                  {activeEvent.skill}
-                </div>
-              );
-            }
-            return null;
-          })()}
+                  zIndex: 6,
+                }}
+              />
+            )}
+            {showBoundingBoxes && state.videoMetadata && appMode !== 'vnl' && (
+              <svg 
+                ref={svgRef}
+                style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'auto', zIndex: 5, cursor: interactionMode === 'zoom' ? 'zoom-in' : 'crosshair' }}
+                viewBox={`0 0 ${playbackTiming.width} ${playbackTiming.height}`}
+                preserveAspectRatio="xMidYMid meet"
+                onMouseDown={handleSvgMouseDown}
+                onMouseMove={handleSvgMouseMove}
+                onMouseUp={handleSvgMouseUp}
+                onMouseLeave={handleSvgMouseUp}
+              >
+                {(rejectedBallBoxesForDisplay[ballOverlayFrame] || []).map((box, idx) => {
+                  const color = '#f472b6';
+                  return (
+                    <g key={`rejected-${idx}`} style={{ pointerEvents: 'none' }}>
+                      <rect
+                        x={box.x_min}
+                        y={box.y_min}
+                        width={box.x_max - box.x_min}
+                        height={box.y_max - box.y_min}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth="4"
+                      />
+                      <rect
+                        x={box.x_min - 2}
+                        y={box.y_min - 22}
+                        width="95"
+                        height="22"
+                        fill={color}
+                      />
+                      <text
+                        x={box.x_min + 4}
+                        y={box.y_min - 6}
+                        fill="#000"
+                        fontSize="14"
+                        fontWeight="bold"
+                      >
+                        {`Ball ${(box.conf || 0).toFixed(2)}`}
+                      </text>
+                    </g>
+                  );
+                })}
+                {[...(ballBoxesForDisplay[ballOverlayFrame] || [])]
+                  .sort((a, b) => {
+                    const areaA = (a.x_max - a.x_min) * (a.y_max - a.y_min);
+                    const areaB = (b.x_max - b.x_min) * (b.y_max - b.y_min);
+                    return areaB - areaA; // Sort descending: biggest first, smallest last (on top)
+                  })
+                  .map((box, idx) => {
+                  if (showOnlyActiveBoxes && !box.is_active) return null;
+                  const isSelected = selectedTrackId === box.track_id;
+                  const isBall = appMode === 'ball';
+                  const color = isBall ? '#fbbf24' : (box.is_active ? '#4ade80' : '#ef4444');
+                  return (
+                    <g 
+                      key={idx} 
+                      style={{ pointerEvents: 'auto', cursor: 'pointer' }}
+                      onMouseDown={(e) => {
+                        if (appMode === 'ball' && !ballEditMode) return;
+                        e.stopPropagation();
+                        const pos = getMousePos(e);
+                        if (!pos) return;
+                        saveToHistory(state);
+                        setDraggingBox({ trackId: box.track_id, startX: pos.x, startY: pos.y, initialBox: { ...box } });
+                      }}
+                      onClick={() => !isBall && setSelectedTrackId(box.track_id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (window.confirm("Delete this bounding box?")) {
+                          handleDeleteBox(box.track_id);
+                        }
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        if (isBall) return; // No player assignment in ball mode
+                        const hasEvent = state.events.some(ev => ev.frame === state.currentFrame);
+                        if (hasEvent) {
+                          handleAssignPlayer(state.currentFrame, box.track_id);
+                        } else {
+                          window.alert("No skill event found on this exact frame. Please create a skill first before assigning a player.");
+                        }
+                      }}
+                    >
+                      {/* Invisible larger rect to make clicking easier */}
+                      <rect 
+                        x={box.x_min - 10} 
+                        y={box.y_min - 10} 
+                        width={(box.x_max - box.x_min) + 20} 
+                        height={(box.y_max - box.y_min) + 20} 
+                        fill="transparent" 
+                      />
+                      <rect 
+                        x={box.x_min} 
+                        y={box.y_min} 
+                        width={box.x_max - box.x_min} 
+                        height={box.y_max - box.y_min} 
+                        fill={isSelected ? 'rgba(255,255,255,0.2)' : 'none'} 
+                        stroke={isSelected ? '#fff' : color} 
+                        strokeWidth={isSelected ? "6" : "4"} 
+                      />
+                      <rect 
+                        x={box.x_min - 2} 
+                        y={box.y_min - 22} 
+                        width={isBall ? "95" : "50"} 
+                        height="22" 
+                        fill={isSelected ? '#fff' : color} 
+                      />
+                      <text 
+                        x={box.x_min + 4} 
+                        y={box.y_min - 6} 
+                        fill={isSelected ? '#000' : (isBall ? '#000' : '#fff')} 
+                        fontSize="14" 
+                        fontWeight="bold"
+                      >
+                        {isBall ? `Ball ${(box.conf || 0).toFixed(2)}` : `ID: ${box.track_id}`}
+                      </text>
+
+                      {/* Resize Handles */}
+                      {[
+                        { corner: 'tl', x: box.x_min, y: box.y_min, cursor: 'nwse-resize' },
+                        { corner: 'tr', x: box.x_max, y: box.y_min, cursor: 'nesw-resize' },
+                        { corner: 'bl', x: box.x_min, y: box.y_max, cursor: 'nesw-resize' },
+                        { corner: 'br', x: box.x_max, y: box.y_max, cursor: 'nwse-resize' }
+                      ].map((h, i) => (
+                        <rect
+                          key={i}
+                          x={h.x - (8 / viewTransform.zoom) / 2}
+                          y={h.y - (8 / viewTransform.zoom) / 2}
+                          width={8 / viewTransform.zoom}
+                          height={8 / viewTransform.zoom}
+                          fill="white"
+                          stroke={color}
+                          strokeWidth={2 / viewTransform.zoom}
+                          cursor={h.cursor}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            const pos = getMousePos(e);
+                            if (!pos) return;
+                            saveToHistory(state);
+                            setResizingBox({ trackId: box.track_id, startX: pos.x, startY: pos.y, initialBox: { ...box }, corner: h.corner as 'tl'|'tr'|'bl'|'br' });
+                          }}
+                        />
+                      ))}
+                    </g>
+                  );
+                })}
+                
+                {drawingBox && (
+                  <rect 
+                    x={Math.min(drawingBox.startX, drawingBox.currentX)}
+                    y={Math.min(drawingBox.startY, drawingBox.currentY)}
+                    width={Math.abs(drawingBox.currentX - drawingBox.startX)}
+                    height={Math.abs(drawingBox.currentY - drawingBox.startY)}
+                    fill={interactionMode === 'zoom' ? "rgba(59, 130, 246, 0.2)" : "rgba(255,255,255,0.2)"}
+                    stroke={interactionMode === 'zoom' ? "#3b82f6" : "#fff"}
+                    strokeWidth="4"
+                    strokeDasharray="5,5"
+                    style={{ pointerEvents: 'none' }}
+                  />
+                )}
+              </svg>
+            )}
+            {(() => {
+              const activeEvent = state.events.find(e => e.frame === state.currentFrame);
+              if (activeEvent) {
+                return (
+                  <div style={{
+                    position: 'absolute',
+                    top: '20px',
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    padding: '8px 24px',
+                    borderRadius: '8px',
+                    fontSize: '2rem',
+                    fontWeight: 'bold',
+                    textTransform: 'uppercase',
+                    backgroundColor: `var(--color-${activeEvent.skill})`,
+                    color: '#fff',
+                    boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+                    zIndex: 10,
+                    pointerEvents: 'none',
+                    letterSpacing: '2px',
+                    textShadow: '0 2px 4px rgba(0,0,0,0.3)'
+                  }}>
+                    {activeEvent.skill}
+                  </div>
+                );
+              }
+              return null;
+            })()}
+          </div>
         </div>
 
         <div className="glass-panel video-controls">
@@ -1999,11 +4247,8 @@ Enjoy using Veritas Pro!
               onTouchStart={() => startContinuousSeek(-1)}
               onTouchEnd={stopContinuousSeek}
             >-1f</button>
-            <button className="btn" onClick={() => {
-              if (videoRef.current?.paused) videoRef.current.play();
-              else videoRef.current?.pause();
-            }}>
-              Play / Pause
+            <button className={`btn ${appMode === 'ball' && isAutoStepping ? 'active' : ''}`} onClick={togglePlayPause}>
+              {appMode === 'ball' ? (isAutoStepping ? 'Pause Step' : 'Step Play') : 'Play / Pause'}
             </button>
             <button 
               className="btn outline icon-only" 
@@ -2023,72 +4268,161 @@ Enjoy using Veritas Pro!
             >+5f</button>
             
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '1rem' }}>
-              <button 
-                className={`btn outline ${!showBoundingBoxes ? 'active' : ''}`}
-                onClick={() => setShowBoundingBoxes(prev => !prev)}
-                title={showBoundingBoxes ? "Hide Bounding Boxes" : "Show Bounding Boxes"}
-                style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
-              >
-                {showBoundingBoxes ? <EyeOff size={16} /> : <Eye size={16} />}
-                {showBoundingBoxes ? 'Hide All' : 'Show All'}
-              </button>
-              <button 
-                className={`btn outline ${showOnlyActiveBoxes ? 'active' : ''}`}
-                onClick={() => setShowOnlyActiveBoxes(prev => !prev)}
-                title={showOnlyActiveBoxes ? "Show All Boxes" : "Show Only Active Boxes"}
-                style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
-                disabled={!showBoundingBoxes}
-              >
-                <Eye size={16} />
-                {showOnlyActiveBoxes ? 'All Players' : 'Active Only'}
-              </button>
-              <button 
-                className="btn outline"
-                onClick={cyclePlaybackRate}
-                title="Change Playback Speed"
-                style={{ padding: '0.5rem', fontFamily: 'monospace', width: '60px' }}
-              >
-                {playbackRate}x
-              </button>
-              <div style={{ fontFamily: 'monospace', fontSize: '1.2rem' }}>
-                Frame: {state.currentFrame} / {state.videoMetadata?.frame_count || 0}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                {appMode === 'ball' && (
+                  <button
+                    className={`btn outline ${ballEditMode ? 'active' : ''}`}
+                    onClick={toggleBallEditMode}
+                    title={ballEditMode ? 'Exit edit mode (saves your changes)' : 'Edit mode: draw, drag, or carry box forward when stepping frames'}
+                    style={{
+                      padding: '0.5rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      borderColor: ballEditMode ? '#fbbf24' : undefined,
+                      color: ballEditMode ? '#fbbf24' : undefined,
+                    }}
+                  >
+                    <Pencil size={16} />
+                    {ballEditMode ? 'Editing' : 'Edit'}
+                  </button>
+                )}
+                <button 
+                  className={`btn outline ${!showBoundingBoxes ? 'active' : ''}`}
+                  onClick={() => setShowBoundingBoxes(prev => !prev)}
+                  title={showBoundingBoxes ? "Hide Bounding Boxes" : "Show Bounding Boxes"}
+                  style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+                >
+                  {showBoundingBoxes ? <EyeOff size={16} /> : <Eye size={16} />}
+                  {showBoundingBoxes ? 'Hide All' : 'Show All'}
+                </button>
+                <button 
+                  className={`btn outline ${showOnlyActiveBoxes ? 'active' : ''}`}
+                  onClick={() => setShowOnlyActiveBoxes(prev => !prev)}
+                  title={showOnlyActiveBoxes ? "Show All Boxes" : "Show Only Active Boxes"}
+                  style={{ padding: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+                  disabled={!showBoundingBoxes}
+                >
+                  <Eye size={16} />
+                  {showOnlyActiveBoxes ? 'All Players' : 'Active Only'}
+                </button>
+                {appMode === 'ball' ? (
+                  <label
+                    title="Frames per second when holding > or arrow keys"
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontFamily: 'monospace' }}
+                  >
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      step={1}
+                      value={ballFrameStepFps}
+                      onChange={(e) => handleBallFrameStepFpsChange(e.target.value)}
+                      style={{
+                        width: '52px',
+                        padding: '0.35rem',
+                        borderRadius: '6px',
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        background: 'rgba(0,0,0,0.3)',
+                        color: 'inherit',
+                        textAlign: 'center',
+                      }}
+                    />
+                    f/s
+                  </label>
+                ) : (
+                  <button 
+                    className="btn outline"
+                    onClick={cyclePlaybackRate}
+                    title="Change Playback Speed"
+                    style={{ padding: '0.5rem', fontFamily: 'monospace', width: '60px' }}
+                  >
+                    {playbackRate}x
+                  </button>
+                )}
+                <div style={{ fontFamily: 'monospace', fontSize: '1.2rem' }}>
+                  Frame: {(appMode === 'ball' ? ballOverlayFrame : state.currentFrame)} / {playbackTiming.frame_count || 0}
+                  {appMode === 'ball' && (
+                    <span style={{ fontSize: '0.8rem', color: presentedBallFrame === state.currentFrame ? '#4ade80' : '#fbbf24', marginLeft: '0.5rem' }}>
+                      (shown: {presentedBallFrame ?? 'n/a'})
+                    </span>
+                  )}
+                </div>
+                <button 
+                  className="btn outline icon-only" 
+                  onClick={() => changeVideo(state.currentPlaylistIndex - 1)}
+                  disabled={state.currentPlaylistIndex === 0}
+                  title="Previous Video"
+                >
+                  <ArrowLeft size={16} />
+                </button>
+                <button 
+                  className="btn outline icon-only" 
+                  onClick={() => changeVideo(state.currentPlaylistIndex + 1)}
+                  disabled={state.currentPlaylistIndex >= state.playlist.length - 1}
+                  title="Next Video"
+                >
+                  <ArrowRight size={16} />
+                </button>
+                
+                <div style={{ width: '1px', height: '24px', background: 'rgba(255,255,255,0.2)', margin: '0 0.5rem' }} />
+                
+                <button 
+                  className={`btn outline ${interactionMode === 'draw' ? 'active' : ''}`}
+                  onClick={() => setInteractionMode('draw')}
+                  title="Draw Bounding Box Mode"
+                  style={{ padding: '0.5rem' }}
+                  disabled={appMode === 'ball' && !ballEditMode}
+                >
+                  <MousePointer2 size={16} />
+                </button>
+                <button 
+                  className={`btn outline ${interactionMode === 'zoom' ? 'active' : ''}`}
+                  onClick={() => setInteractionMode('zoom')}
+                  title="Marquee Zoom Mode"
+                  style={{ padding: '0.5rem' }}
+                >
+                  <Search size={16} />
+                </button>
+                <button 
+                  className="btn outline"
+                  onClick={resetZoom}
+                  title="Reset Zoom"
+                  disabled={viewTransform.zoom === 1}
+                  style={{ padding: '0.5rem', fontFamily: 'monospace' }}
+                >
+                  {Math.round(viewTransform.zoom * 100)}%
+                </button>
+                
+                <button 
+                  className="btn outline icon-only"
+                  onClick={toggleFullscreen}
+                  title={isFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
+                  style={{ marginLeft: '0.5rem' }}
+                >
+                  {isFullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
+                </button>
               </div>
-              <button 
-                className="btn outline icon-only" 
-                onClick={() => changeVideo(state.currentPlaylistIndex - 1)}
-                disabled={state.currentPlaylistIndex === 0}
-                title="Previous Video"
-              >
-                <ArrowLeft size={16} />
-              </button>
-              <button 
-                className="btn outline icon-only" 
-                onClick={() => changeVideo(state.currentPlaylistIndex + 1)}
-                disabled={state.currentPlaylistIndex === state.playlist.length - 1}
-                title="Next Video"
-              >
-                <ArrowRight size={16} />
-              </button>
             </div>
           </div>
           
           <div className="scrub-bar-container" onClick={(e) => {
-            if (!state.videoMetadata) return;
+            if (!playbackTiming.frame_count) return;
             const rect = e.currentTarget.getBoundingClientRect();
             const percent = (e.clientX - rect.left) / rect.width;
-            seekToFrame(Math.round(percent * state.videoMetadata.frame_count));
+            seekToFrame(Math.round(percent * playbackTiming.frame_count));
           }}>
             <div className="scrub-bar-track">
-              {state.videoMetadata && (
+              {playbackTiming.frame_count > 0 && (
                 <div 
                   className="scrub-bar-fill" 
-                  style={{ width: `${(state.currentFrame / state.videoMetadata.frame_count) * 100}%` }}
+                  style={{ width: `${(state.currentFrame / playbackTiming.frame_count) * 100}%` }}
                 />
               )}
-              {state.videoMetadata && (
+              {playbackTiming.frame_count > 0 && (
                 <div 
                   className="scrub-bar-thumb" 
-                  style={{ left: `${(state.currentFrame / state.videoMetadata.frame_count) * 100}%` }}
+                  style={{ left: `${(state.currentFrame / playbackTiming.frame_count) * 100}%` }}
                 />
               )}
             </div>
@@ -2096,111 +4430,120 @@ Enjoy using Veritas Pro!
         </div>
 
         {/* TIMELINE */}
-        <div className="glass-panel timeline" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', padding: '0.8rem' }}>
-          <div className="timeline-track" style={{ position: 'relative', width: '100%', height: '30px' }}>
-            {state.rally.start_frame !== null && state.videoMetadata && (
-              <div 
-                className="timeline-marker" 
-                style={{ left: `${(state.rally.start_frame / state.videoMetadata.frame_count) * 100}%`, backgroundColor: 'var(--color-rally)', height: '100%', top: 0 }}
-                title="Start Rally"
-                onClick={() => seekToFrame(state.rally.start_frame!)}
-              />
-            )}
-            {state.rally.end_frame !== null && state.videoMetadata && (
-              <div 
-                className="timeline-marker" 
-                style={{ left: `${(state.rally.end_frame / state.videoMetadata.frame_count) * 100}%`, backgroundColor: 'var(--color-rally)', height: '100%', top: 0 }}
-                title="End Rally"
-                onClick={() => seekToFrame(state.rally.end_frame!)}
-              />
-            )}
-            
-            {/* Active window blocks on the timeline */}
-            {state.videoMetadata && activeRanges.map((range, idx) => {
-              const startPct = (range.start / state.videoMetadata!.frame_count) * 100;
-              const widthPct = ((range.end - range.start) / state.videoMetadata!.frame_count) * 100;
-              const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
-              return (
-                <div
-                  key={`active-win-${idx}`}
-                  style={{
-                    position: 'absolute',
-                    left: `${startPct}%`,
-                    width: `${Math.max(widthPct, 0.2)}%`,
-                    height: '100%',
-                    backgroundColor: skillColor,
-                    opacity: 0.3,
-                    borderLeft: `1px solid ${skillColor}`,
-                    borderRight: `1px solid ${skillColor}`,
-                    top: 0,
-                    cursor: 'pointer',
-                    zIndex: 1
-                  }}
-                  title={`Player ${range.trackId} active: ${range.start} to ${range.end}`}
-                  onClick={() => seekToFrame(range.start)}
-                />
-              )
-            })}
-
-            {state.videoMetadata && state.events.map(event => {
-              const skillName = (event.skill || (event as any).label || '').toString();
-              const abbreviation = {
-                'toss': 'T',
-                'serve': 'Sr',
-                'reception': 'R',
-                'set': 'St',
-                'dig': 'D',
-                'attack': 'A',
-                'block': 'B'
-              }[skillName] || (skillName ? skillName.charAt(0).toUpperCase() : '?');
-
-              return (
+        {appMode !== 'ball' && (
+          <div className="glass-panel timeline" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', padding: '0.8rem' }}>
+            <div className="timeline-track" style={{ position: 'relative', width: '100%', height: '30px' }}>
+              {state.rally.start_frame !== null && playbackTiming.frame_count > 0 && (
                 <div 
-                  key={event.frame}
-                  className="timeline-skill-marker" 
-                  style={{ 
-                    left: `${state.videoMetadata!.frame_count > 0 ? (event.frame / state.videoMetadata!.frame_count) * 100 : 0}%`, 
-                    backgroundColor: `var(--color-${skillName})`, 
-                    zIndex: 2 
-                  }}
-                  title={`${skillName} at frame ${event.frame}`}
-                  onClick={() => seekToFrame(event.frame)}
-                >
-                  {abbreviation}
-                </div>
-              );
-            })}
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem', maxHeight: '150px', overflowY: 'auto', paddingRight: '4px' }}>
-            {activeRanges.length === 0 && <span style={{ color: '#64748b' }}>No active players...</span>}
-            {activeRanges.map((range, idx) => {
-              const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
-              const bgNormal = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 15%, transparent)` : 'rgba(74, 222, 128, 0.15)';
-              const bgHover = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 30%, transparent)` : 'rgba(74, 222, 128, 0.3)';
-              const borderCol = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 40%, transparent)` : 'rgba(74, 222, 128, 0.4)';
+                  className="timeline-marker" 
+                  style={{ left: `${(state.rally.start_frame / playbackTiming.frame_count) * 100}%`, backgroundColor: 'var(--color-rally)', height: '100%', top: 0 }}
+                  title="Start Rally"
+                  onClick={() => seekToFrame(state.rally.start_frame!)}
+                />
+              )}
+              {state.rally.end_frame !== null && playbackTiming.frame_count > 0 && (
+                <div 
+                  className="timeline-marker" 
+                  style={{ left: `${(state.rally.end_frame / playbackTiming.frame_count) * 100}%`, backgroundColor: 'var(--color-rally)', height: '100%', top: 0 }}
+                  title="End Rally"
+                  onClick={() => seekToFrame(state.rally.end_frame!)}
+                />
+              )}
               
-              return (
-              <div 
-                key={idx} 
-                style={{ 
-                  background: bgNormal, 
-                  border: `1px solid ${borderCol}`, 
-                  padding: '4px 10px', 
-                  borderRadius: '6px', 
-                  cursor: 'pointer',
-                  transition: 'background 0.2s',
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.background = bgHover}
-                onMouseLeave={(e) => e.currentTarget.style.background = bgNormal}
-                onClick={() => seekToFrame(range.start)}
-                title="Click to jump to this action"
-              >
-                <strong style={{ color: skillColor }}>Player {range.trackId}:</strong> {range.start} - {range.end}
-              </div>
-            )})}
+              {/* Active window blocks on the timeline */}
+              {playbackTiming.frame_count > 0 && activeRanges.map((range, idx) => {
+                const startPct = (range.start / playbackTiming.frame_count) * 100;
+                const widthPct = ((range.end - range.start) / playbackTiming.frame_count) * 100;
+                const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
+                return (
+                  <div
+                    key={`active-win-${idx}`}
+                    style={{
+                      position: 'absolute',
+                      left: `${startPct}%`,
+                      width: `${Math.max(widthPct, 0.2)}%`,
+                      height: '100%',
+                      backgroundColor: skillColor,
+                      opacity: 0.3,
+                      borderLeft: `1px solid ${skillColor}`,
+                      borderRight: `1px solid ${skillColor}`,
+                      top: 0,
+                      cursor: 'pointer',
+                      zIndex: 1
+                    }}
+                    title={`Player ${range.trackId} active: ${range.start} to ${range.end}`}
+                    onClick={() => seekToFrame(range.start)}
+                  />
+                )
+              })}
+
+              {playbackTiming.frame_count > 0 && state.events
+                .filter((event) => {
+                  const skillName = (event.skill || '').toString().toLowerCase();
+                  return skillName !== 'start_rally' && skillName !== 'end_rally';
+                })
+                .map(event => {
+                const skillName = (event.skill || (event as any).label || '').toString();
+                const abbreviation = {
+                  'toss': 'T',
+                  'serve': 'Sr',
+                  'reception': 'R',
+                  'receive': 'Rc',
+                  'set': 'St',
+                  'dig': 'D',
+                  'attack': 'A',
+                  'block': 'B',
+                  'score': 'Sc',
+                  'spike': 'A',
+                }[skillName] || (skillName ? skillName.charAt(0).toUpperCase() : '?');
+
+                return (
+                  <div 
+                    key={event.frame}
+                    className="timeline-skill-marker" 
+                    style={{ 
+                      left: `${(event.frame / playbackTiming.frame_count) * 100}%`, 
+                      backgroundColor: `var(--color-${skillName}, #94a3b8)`, 
+                      zIndex: 2 
+                    }}
+                    title={`${skillName} at frame ${event.frame}`}
+                    onClick={() => seekToFrame(event.frame)}
+                  >
+                    {abbreviation}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.85rem', maxHeight: '150px', overflowY: 'auto', paddingRight: '4px' }}>
+              {activeRanges.length === 0 && <span style={{ color: '#64748b' }}>No active players...</span>}
+              {activeRanges.map((range, idx) => {
+                const skillColor = range.skillName !== 'default' ? `var(--color-${range.skillName})` : '#4ade80';
+                const bgNormal = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 15%, transparent)` : 'rgba(74, 222, 128, 0.15)';
+                const bgHover = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 30%, transparent)` : 'rgba(74, 222, 128, 0.3)';
+                const borderCol = range.skillName !== 'default' ? `color-mix(in srgb, ${skillColor} 40%, transparent)` : 'rgba(74, 222, 128, 0.4)';
+                
+                return (
+                <div 
+                  key={idx} 
+                  style={{ 
+                    background: bgNormal, 
+                    border: `1px solid ${borderCol}`, 
+                    padding: '4px 10px', 
+                    borderRadius: '6px', 
+                    cursor: 'pointer',
+                    transition: 'background 0.2s',
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = bgHover}
+                  onMouseLeave={(e) => e.currentTarget.style.background = bgNormal}
+                  onClick={() => seekToFrame(range.start)}
+                  title="Click to jump to this action"
+                >
+                  <strong style={{ color: skillColor }}>Player {range.trackId}:</strong> {range.start} - {range.end}
+                </div>
+              )})}
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* RIGHT SIDEBAR */}
@@ -2213,22 +4556,137 @@ Enjoy using Veritas Pro!
             <div>
               <strong>FPS:</strong> <span style={{ marginLeft: '0.5rem', color: '#4ade80' }}>{state.videoMetadata?.fps || 'Detecting...'}</span>
             </div>
+            {appMode === 'vnl' && currentPlaylistItem?.inferenceVideoMeta && (
+              <div>
+                <strong>Frames:</strong>{' '}
+                inference {currentPlaylistItem.inferenceVideoMeta.frame_count}
+                {((videoRef.current?.duration ?? 0) > 0 || (state.videoMetadata?.duration ?? 0) > 0) ? (
+                  <span style={{ color: 'rgba(255,255,255,0.7)' }}>
+                    {' '}
+                    · playback ~{estimateBrowserFrameCount(
+                      (videoRef.current?.duration ?? 0) > 0
+                        ? videoRef.current?.duration ?? 0
+                        : state.videoMetadata?.duration ?? 0,
+                      currentPlaylistItem.inferenceVideoMeta.fps,
+                    )}
+                  </span>
+                ) : null}
+                {videoPlaybackKind === 'h264' && (
+                  <span style={{ color: '#4ade80' }}> · GPU H.264</span>
+                )}
+              </div>
+            )}
+            {vnlSyncWarning && (
+              <div
+                style={{
+                  marginTop: '0.5rem',
+                  padding: '0.5rem',
+                  borderRadius: '6px',
+                  background: 'rgba(251, 191, 36, 0.12)',
+                  border: '1px solid rgba(251, 191, 36, 0.35)',
+                  color: '#fcd34d',
+                  fontSize: '0.8rem',
+                  lineHeight: 1.4,
+                }}
+              >
+                <AlertTriangle size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+                {vnlSyncWarning}
+              </div>
+            )}
+            {appMode === 'ball' && ballEngine === 'yolo26' && (
+              <>
+                <div>
+                  <strong>YOLO post-process:</strong>{' '}
+                  <span style={{ color: ballPostprocessEnabled ? '#4ade80' : '#fbbf24' }}>
+                    {ballPostprocessEnabled ? 'ON (filters legs / static / outliers)' : 'OFF'}
+                  </span>
+                </div>
+                {ballPostprocessEnabled && (
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                      <span
+                        style={{
+                          display: 'inline-block',
+                          width: 14,
+                          height: 14,
+                          border: '3px solid #fbbf24',
+                          borderRadius: 2,
+                        }}
+                      />
+                      <span>Kept (amber) — same YOLO box</span>
+                      <span
+                        style={{
+                          display: 'inline-block',
+                          width: 14,
+                          height: 14,
+                          border: '3px solid #f472b6',
+                          borderRadius: 2,
+                          marginLeft: '0.75rem',
+                        }}
+                      />
+                      <span>Removed (pink) — same box, different colour</span>
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={showRejectedBallBoxes}
+                        onChange={(e) => setShowRejectedBallBoxes(e.target.checked)}
+                      />
+                      Show removed boxes in pink (same position as YOLO detected)
+                    </label>
+                  </>
+                )}
+              </>
+            )}
+            {appMode === 'ball' && ballEngine === 'side_view' && (
+              <div style={{ fontSize: '0.85rem', color: '#94a3b8' }}>
+                Side View Ball: all raw detections kept (no post-process / pink removals).
+              </div>
+            )}
           </div>
         </div>
 
         <div className="glass-panel sidebar-section">
           <h2><Settings size={20} /> Hotkeys</h2>
           <div className="hotkey-legend">
-            <div><span className="hotkey">1</span> Toss</div>
-            <div><span className="hotkey">2</span> Serve</div>
-            <div><span className="hotkey">3</span> Reception</div>
-            <div><span className="hotkey">4</span> Set</div>
-            <div><span className="hotkey">5</span> Dig</div>
-            <div><span className="hotkey">6</span> Attack/Block</div>
-            <div><span className="hotkey">S</span> Start Rally</div>
-            <div><span className="hotkey">E</span> End Rally</div>
-            <div><span className="hotkey">A</span> Active Player</div>
-            <div><span className="hotkey">Del</span> Clear Frame</div>
+            {appMode === 'ball' ? (
+              <>
+                <div><span className="hotkey">&gt;</span> Hold to step forward ({ballFrameStepFps} f/s)</div>
+                <div><span className="hotkey">&lt;</span> Hold to step backward ({ballFrameStepFps} f/s)</div>
+                <div><span className="hotkey">Space</span> Step play / pause</div>
+                <div><span className="hotkey">Del</span> Clear Frame</div>
+              </>
+            ) : appMode === 'vnl' ? (
+              <>
+                <div><span className="hotkey">, / &lt;</span> Step back 1 frame (hold to scrub)</div>
+                <div><span className="hotkey">. / &gt;</span> Step forward 1 frame (hold to scrub)</div>
+                <div><span className="hotkey">Shift+, / Shift+.</span> Step ±5 frames</div>
+                <div><span className="hotkey">Space</span> Play / pause</div>
+                <div><span className="hotkey">Click</span> Place contact dot (after skill hotkey)</div>
+                {VNL_LABEL_DEFS.map((def) => (
+                  <div key={def.label}><span className="hotkey">{def.hotkey}</span> {def.label}</div>
+                ))}
+                <div><span className="hotkey">Del</span> Clear Frame</div>
+              </>
+            ) : (
+              <>
+                <div><span className="hotkey">, / &lt;</span> Step back 1 frame (hold to scrub)</div>
+                <div><span className="hotkey">. / &gt;</span> Step forward 1 frame (hold to scrub)</div>
+                <div><span className="hotkey">Shift+, / Shift+.</span> Step ±5 frames</div>
+                <div><span className="hotkey">Space</span> Play / pause</div>
+                <div><span className="hotkey">1</span> Toss</div>
+                <div><span className="hotkey">2</span> Serve</div>
+                <div><span className="hotkey">3</span> Reception</div>
+                <div><span className="hotkey">4</span> Set</div>
+                <div><span className="hotkey">5</span> Dig</div>
+                <div><span className="hotkey">6</span> Attack</div>
+                <div><span className="hotkey">7</span> Block</div>
+                <div><span className="hotkey">S</span> Start Rally</div>
+                <div><span className="hotkey">E</span> End Rally</div>
+                <div><span className="hotkey">A</span> Active Player</div>
+                <div><span className="hotkey">Del</span> Clear Frame</div>
+              </>
+            )}
           </div>
         </div>
 
@@ -2239,8 +4697,8 @@ Enjoy using Veritas Pro!
             <button className="btn outline" style={{ flex: 1, fontSize: '0.85rem' }} onClick={handleUndo} title="Undo last action">
               Undo
             </button>
-            <button className="btn outline" style={{ flex: 1, fontSize: '0.85rem', borderColor: 'var(--color-attack)', color: 'var(--color-attack)' }} onClick={handleResetRally} title="Reset all manual annotations for this video">
-              Reset Rally
+            <button className="btn outline" style={{ flex: 1, fontSize: '0.85rem', borderColor: 'var(--color-attack)', color: 'var(--color-attack)' }} onClick={handleResetRally} title={appMode === 'ball' ? "Clear all tracked balls" : "Reset all manual annotations for this video"}>
+              {appMode === 'ball' ? "Clear Tracking" : "Reset Rally"}
             </button>
           </div>
 
@@ -2254,7 +4712,7 @@ Enjoy using Veritas Pro!
                 </tr>
               </thead>
               <tbody>
-                {state.rally.start_frame !== null && (
+                {state.rally.start_frame !== null && appMode !== 'ball' && appMode !== 'vnl' && (
                   <tr className={state.currentFrame === state.rally.start_frame ? 'active-row' : ''} onClick={() => seekToFrame(state.rally.start_frame!)} style={{ cursor: 'pointer' }}>
                     <td>{state.rally.start_frame}</td>
                     <td><span className="badge" style={{ background: 'var(--color-rally)' }}>start_rally</span></td>
@@ -2264,78 +4722,115 @@ Enjoy using Veritas Pro!
                   </tr>
                 )}
                 
-                {[...state.events].sort((a, b) => a.frame - b.frame).map(event => {
-                  const skillName = (event.skill || (event as any).label || '').toString();
-                  return (
-                    <tr key={event.frame} className={state.currentFrame === event.frame ? 'active-row' : ''} onClick={() => seekToFrame(event.frame)} style={{ cursor: 'pointer' }}>
-                      <td>{event.frame}</td>
-                      <td>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}>
-                          <span className={`badge ${skillName}`} style={{ flexShrink: 0 }}>{skillName}</span>
-                          {event.player_id !== undefined && (
-                             <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)', flexShrink: 0 }}>ID: {event.player_id}</span>
-                          )}
-                        </div>
-                      </td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '0.25rem' }}>
-                          {assigningEventFrame === event.frame ? (
-                            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: '140px', alignItems: 'center' }}>
-                              <span style={{ fontSize: '9px', color: '#999', width: '100%' }}>Select ID:</span>
-                              {Array.from(new Set((state.playerBoxes[event.frame] || []).map(b => b.track_id))).sort((a,b) => a-b).map(id => (
-                                <button 
-                                  key={id}
-                                  className="btn outline"
-                                  style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto' }}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleAssignPlayer(event.frame, id);
-                                    setAssigningEventFrame(null);
-                                  }}
-                                >
-                                  {id}
-                                </button>
-                              ))}
-                              {(!state.playerBoxes[event.frame] || state.playerBoxes[event.frame].length === 0) && (
-                                <span style={{ fontSize: '10px', color: '#ef4444' }}>No players detected</span>
-                              )}
-                              <button 
-                                className="btn outline" 
-                                style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto', borderColor: 'transparent', color: '#999' }}
-                                onClick={(e) => { e.stopPropagation(); setAssigningEventFrame(null); }}
-                              >
-                                ×
-                              </button>
-                            </div>
-                          ) : (
-                            <button 
-                              className="btn icon-only outline" 
-                              title="Assign a player from this frame to this skill"
-                              onClick={(e) => { 
-                                e.stopPropagation(); 
-                                seekToFrame(event.frame);
-                                setAssigningEventFrame(event.frame);
-                              }}>
-                              <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
-                            </button>
-                          )}
+                {appMode === 'ball' ? (
+                  Object.entries(ballBoxesForDisplay)
+                    .map(([f, boxes]) => ({ frame: parseInt(f, 10), hasBall: boxes.length > 0 }))
+                    .filter(x => x.hasBall)
+                    .sort((a, b) => a.frame - b.frame)
+                    .map(({ frame }) => {
+                      const frameBoxes = ballBoxesForDisplay[frame] || [];
+                      const isEdited = frameBoxes.some((b) => b.source === 'manual');
+                      return (
+                      <tr key={`ball-${frame}`} className={state.currentFrame === frame ? 'active-row' : ''} onClick={() => seekToFrame(frame)} style={{ cursor: 'pointer' }}>
+                        <td>{frame}</td>
+                        <td><span className="badge" style={{ background: '#eab308', color: '#000' }}>
+                          {isEdited ? 'ball_edited' : 'ball_detected'}
+                        </span></td>
+                        <td>
                           <button 
                             className="btn icon-only outline" 
-                            title="Delete this skill"
+                            title="Delete ball from this frame"
+                            disabled={!ballEditMode}
                             onClick={(e) => { 
                               e.stopPropagation(); 
-                              handleDeleteEvent(event.frame);
+                              clearBallBoxesAtFrame(frame);
                             }}
                           >
                             <Trash2 size={14} />
                           </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
+                        </td>
+                      </tr>
+                    );
+                    })
+                ) : (
+                  [...state.events]
+                    .filter((event) => {
+                      const skillName = (event.skill || '').toString().toLowerCase();
+                      return skillName !== 'start_rally' && skillName !== 'end_rally';
+                    })
+                    .sort((a, b) => a.frame - b.frame).map(event => {
+                    const skillName = (event.skill || (event as any).label || '').toString();
+                    return (
+                      <tr key={event.frame} className={state.currentFrame === event.frame ? 'active-row' : ''} onClick={() => seekToFrame(event.frame)} style={{ cursor: 'pointer' }}>
+                        <td>{event.frame}</td>
+                        <td>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}>
+                            <span className={`badge ${skillName}`} style={{ flexShrink: 0 }}>{skillName}</span>
+                            {event.player_id !== undefined && (
+                               <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)', flexShrink: 0 }}>ID: {event.player_id}</span>
+                            )}
+                          </div>
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '0.25rem' }}>
+                            {assigningEventFrame === event.frame ? (
+                              <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: '140px', alignItems: 'center' }}>
+                                <span style={{ fontSize: '9px', color: '#999', width: '100%' }}>Select ID:</span>
+                                {Array.from(new Set((state.playerBoxes[event.frame] || []).map(b => b.track_id))).sort((a,b) => a-b).map(id => (
+                                  <button 
+                                    key={id}
+                                    className="btn outline"
+                                    style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto' }}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleAssignPlayer(event.frame, id);
+                                      setAssigningEventFrame(null);
+                                    }}
+                                  >
+                                    {id}
+                                  </button>
+                                ))}
+                                {(!state.playerBoxes[event.frame] || state.playerBoxes[event.frame].length === 0) && (
+                                  <span style={{ fontSize: '10px', color: '#ef4444' }}>No players detected</span>
+                                )}
+                                <button 
+                                  className="btn outline" 
+                                  style={{ padding: '2px 6px', fontSize: '10px', minWidth: 'auto', minHeight: 'auto', borderColor: 'transparent', color: '#999' }}
+                                  onClick={(e) => { e.stopPropagation(); setAssigningEventFrame(null); }}
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            ) : (
+                              <button 
+                                className="btn icon-only outline" 
+                                title="Assign a player from this frame to this skill"
+                                onClick={(e) => { 
+                                  e.stopPropagation(); 
+                                  seekToFrame(event.frame);
+                                  setAssigningEventFrame(event.frame);
+                                }}>
+                                <span style={{ fontSize: '10px', fontWeight: 'bold' }}>Assign</span>
+                              </button>
+                            )}
+                            <button 
+                              className="btn icon-only outline" 
+                              title="Delete this skill"
+                              onClick={(e) => { 
+                                e.stopPropagation(); 
+                                handleDeleteEvent(event.frame);
+                              }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
 
-                {state.rally.end_frame !== null && (
+                {state.rally.end_frame !== null && appMode !== 'ball' && appMode !== 'vnl' && (
                   <tr className={state.currentFrame === state.rally.end_frame ? 'active-row' : ''} onClick={() => seekToFrame(state.rally.end_frame!)} style={{ cursor: 'pointer' }}>
                     <td>{state.rally.end_frame}</td>
                     <td><span className="badge" style={{ background: 'var(--color-rally)' }}>end_rally</span></td>

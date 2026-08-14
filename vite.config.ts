@@ -1,8 +1,13 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vite.dev/config/
-export default defineConfig({
+// GitHub Pages hosts this project under /annotation_volly/.
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: '/annotation_volly/',
-})
+  base: command === 'build' ? '/annotation_volly/' : '/',
+  server: {
+    watch: {
+      ignored: ['**/backend/**', '**/node_modules/**'],
+    },
+  },
+}))
