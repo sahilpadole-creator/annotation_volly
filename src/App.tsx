@@ -1788,9 +1788,17 @@ function App() {
     if (item.file) {
       const cached = gpuFileReadyRef.current.get(item.id);
       if (OFFLINE_REVIEW_ONLY) {
-        // Prefer cached in-browser H.264; otherwise try the ZIP MP4 directly.
-        assignVideoUrlFromFile(cached ?? item.file);
-        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
+        // GitHub Pages: play *_h264 / cached immediately; otherwise probe+convert (mp4v).
+        if (cached) {
+          assignVideoUrlFromFile(cached);
+          setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
+        } else if (looksLikeH264Filename(item.file.name)) {
+          assignVideoUrlFromFile(item.file);
+          setVideoPlaybackKind('direct');
+          gpuFileReadyRef.current.set(item.id, item.file);
+        } else {
+          void prepareVideoPlayback(item.file);
+        }
       } else if (appMode === 'ball' || appMode === 'touch') {
         assignVideoUrlFromFile(cached ?? item.file);
         setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
@@ -2065,7 +2073,15 @@ function App() {
     setState(syncedState);
 
     if (syncItem?.file) {
-      if (workflowMode === 'vnl') {
+      if (OFFLINE_REVIEW_ONLY) {
+        // GitHub: convert non-H.264 (mp4v) up front so review is not stuck on a black screen.
+        if (looksLikeH264Filename(syncItem.file.name)) {
+          assignVideoUrlFromFile(syncItem.file);
+          gpuFileReadyRef.current.set(syncItem.id, syncItem.file);
+        } else {
+          void prepareVideoPlayback(syncItem.file);
+        }
+      } else if (workflowMode === 'vnl') {
         void prepareVideoPlayback(syncItem.file);
       } else {
         assignVideoUrlFromFile(syncItem.file);
@@ -4087,6 +4103,9 @@ Enjoy using Veritas Pro!
               onTimeUpdate={handleTimeUpdate}
               onSeeked={handleVideoSeeked}
               onError={() => {
+                // Do not overwrite the "converting…" overlay with a failure while convert is in flight.
+                if (videoTranscodingRef.current) return;
+
                 const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
                 const fileKey = item?.file
                   ? `${item.file.name}:${item.file.size}:${item.file.lastModified}`
@@ -4094,8 +4113,9 @@ Enjoy using Veritas Pro!
                 // Local: GPU H.264. GitHub Pages: in-browser ffmpeg.wasm for mp4v/etc.
                 if (
                   item?.file &&
-                  !videoTranscodingRef.current &&
-                  !convertFailedRef.current.has(fileKey)
+                  !looksLikeH264Filename(item.file.name) &&
+                  !convertFailedRef.current.has(fileKey) &&
+                  !gpuFileReadyRef.current.has(item.id)
                 ) {
                   void prepareVideoPlayback(item.file);
                   return;
@@ -4109,7 +4129,7 @@ Enjoy using Veritas Pro!
                         : 'load error';
                 setVideoPlaybackError(
                   OFFLINE_REVIEW_ONLY
-                    ? `Video failed to load (${reason}). Chrome cannot play MPEG-4/mp4v — use *_h264.mp4 from the ZIP or wait for in-browser convert.`
+                    ? `Video failed to load (${reason}). This clip is MPEG-4/mp4v (Chrome cannot play it). Click another *_h264.mp4 in the playlist, or wait for in-browser convert on this file.`
                     : `Video failed to load (${reason}). If this is HEVC, wait for H.264 conversion or use an H.264 MP4.`,
                 );
               }}
