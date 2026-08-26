@@ -687,6 +687,13 @@ function App() {
   }, []);
 
   const prepareVideoPlayback = useCallback(async (file: File) => {
+    // GitHub Pages review tool: play the uploaded MP4 as-is (no GPU/ffmpeg convert).
+    if (OFFLINE_REVIEW_ONLY) {
+      assignVideoUrlFromFile(file);
+      setVideoPlaybackKind('direct');
+      setVideoPlaybackError(null);
+      return file;
+    }
     if (videoTranscodingRef.current) return file;
     videoTranscodingRef.current = true;
     setVideoTranscoding(true);
@@ -1350,13 +1357,9 @@ function App() {
             fileToInfer = new File([blob], item.name, { type: 'video/mp4' });
           }
 
-          if (fileToInfer && workflowMode !== 'touch') {
-            // Ball needs unified H.264 for frame-index alignment.
-            // Touch/skill models read any codec on the GPU — skip tunnel upload for H.264 prep.
-            fileToInfer = await ensureItemGpuFile({ ...item, file: fileToInfer });
-          }
-          
-          let payload: any = null;
+          // Ball + touch: send original MP4 to the GPU (YOLO/SlowFast decode any common codec).
+          // Skip H.264 prep — it only slows review/upload and was not needed for classic ball tracking.
+          // VNL still converts on playback when the browser cannot decode HEVC.
           let heuristicallyCorrected: any[] = [];
           let startFrame = item.rally?.start_frame ?? null;
           let endFrame = item.rally?.end_frame ?? null;
@@ -1801,12 +1804,23 @@ function App() {
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
     if (item.file) {
-      const cached = gpuFileReadyRef.current.get(item.id);
-      if (cached) {
-        assignVideoUrlFromFile(cached);
-        setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
+      // GitHub Pages: always play ZIP MP4 directly — no convert overlay.
+      if (OFFLINE_REVIEW_ONLY) {
+        assignVideoUrlFromFile(item.file);
+        setVideoPlaybackKind('direct');
+      } else if (appMode === 'ball' || appMode === 'touch') {
+        // Local ball/touch: play uploaded MP4 as-is (classic ball tracking).
+        const cached = gpuFileReadyRef.current.get(item.id);
+        assignVideoUrlFromFile(cached ?? item.file);
+        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
       } else {
-        void prepareVideoPlayback(item.file);
+        const cached = gpuFileReadyRef.current.get(item.id);
+        if (cached) {
+          assignVideoUrlFromFile(cached);
+          setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
+        } else {
+          void prepareVideoPlayback(item.file);
+        }
       }
     } else if (item.driveUrl) {
       if (googleTokenRef.current) {
@@ -4099,7 +4113,9 @@ Enjoy using Veritas Pro!
                 const fileKey = item?.file
                   ? `${item.file.name}:${item.file.size}:${item.file.lastModified}`
                   : '';
+                // Local tool only: try GPU H.264 convert. GitHub Pages never converts.
                 if (
+                  !OFFLINE_REVIEW_ONLY &&
                   item?.file &&
                   !videoTranscodingRef.current &&
                   !convertFailedRef.current.has(fileKey)
@@ -4115,7 +4131,9 @@ Enjoy using Veritas Pro!
                       : code === 2 ? 'network error'
                         : 'load error';
                 setVideoPlaybackError(
-                  `Video failed to load (${reason}). If this is HEVC, wait for H.264 conversion or use an H.264 MP4.`,
+                  OFFLINE_REVIEW_ONLY
+                    ? `Video failed to load (${reason}). Use a browser-playable MP4 (H.264) from the prediction ZIP.`
+                    : `Video failed to load (${reason}). If this is HEVC, wait for H.264 conversion or use an H.264 MP4.`,
                 );
               }}
               controls={false}
