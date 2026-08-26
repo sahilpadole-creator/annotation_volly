@@ -720,38 +720,6 @@ function App() {
     }
   }, [assignVideoUrlFromFile]);
 
-  /** Ensure playlist file is GPU H.264 (cached). Convert once before inference; reuse for playback. */
-  const ensureItemGpuFile = useCallback(async (item: PlaylistItem): Promise<File> => {
-    if (!item.file) {
-      throw new Error(`No file loaded for ${item.name}`);
-    }
-    if (OFFLINE_REVIEW_ONLY) return item.file;
-    const cached = gpuFileReadyRef.current.get(item.id);
-    if (cached) return cached;
-
-    const ready = await ensureGpuH264File(item.file, INFERENCE_API_BASE);
-    gpuFileReadyRef.current.set(item.id, ready);
-    if (ready !== item.file) {
-      setState((prev) => {
-        const playlist = [...prev.playlist];
-        const idx = playlist.findIndex((p) => p.id === item.id);
-        if (idx >= 0) {
-          playlist[idx] = { ...playlist[idx], file: ready };
-        }
-        const next = { ...prev, playlist };
-        stateRef.current = next;
-        return next;
-      });
-      if (
-        stateRef.current.currentPlaylistIndex === stateRef.current.playlist.findIndex((p) => p.id === item.id)
-      ) {
-        assignVideoUrlFromFile(ready);
-        setVideoPlaybackKind('h264');
-      }
-    }
-    return ready;
-  }, [assignVideoUrlFromFile]);
-
   // Frame the <video> is ACTUALLY presenting (tracked via requestVideoFrameCallback).
   // The ball overlay is drawn against this so the box always sits on the visible ball,
   // even on fast-motion frames where an HTML5 seek can land a frame away from the target.
@@ -1360,6 +1328,7 @@ function App() {
           // Ball + touch: send original MP4 to the GPU (YOLO/SlowFast decode any common codec).
           // Skip H.264 prep — it only slows review/upload and was not needed for classic ball tracking.
           // VNL still converts on playback when the browser cannot decode HEVC.
+          let payload: any = null;
           let heuristicallyCorrected: any[] = [];
           let startFrame = item.rally?.start_frame ?? null;
           let endFrame = item.rally?.end_frame ?? null;
@@ -2092,9 +2061,7 @@ function App() {
       }
     }
 
-    // Do NOT playlist-wide convert on upload. H.264 happens once at inference
-    // (ensureItemGpuFile) and is cached; review ZIPs already include *_h264.mp4.
-    // Playback converts on-demand only if the browser cannot decode the file.
+    // GitHub/local review: trust *_h264 exports from inference; never playlist-wide re-convert.
     newPlaylistItems.forEach((item) => {
       if (item.file && looksLikeH264Filename(item.file.name)) {
         gpuFileReadyRef.current.set(item.id, item.file);
