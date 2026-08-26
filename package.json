@@ -13,6 +13,8 @@
     "deploy": "gh-pages -d dist"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@react-oauth/google": "^0.13.5",
     "gapi-script": "^1.2.0",
     "jszip": "^3.10.1",

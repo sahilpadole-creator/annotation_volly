@@ -17,7 +17,7 @@ import {
 } from './utils/workflowMode';
 import { VNL_LABEL_DEFS } from './utils/vnlAnnotation';
 import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
-import { ensureGpuH264File, looksLikeH264Filename } from './utils/videoPreview';
+import { ensureGpuH264File, ensureBrowserPlayableViaWasm, looksLikeH264Filename } from './utils/videoPreview';
 import VolleyballParticles from './components/VolleyballParticles';
 import BlockClipAnnotator from './components/BlockClipAnnotator';
 import './index.css';
@@ -687,31 +687,44 @@ function App() {
   }, []);
 
   const prepareVideoPlayback = useCallback(async (file: File) => {
-    // GitHub Pages review tool: play the uploaded MP4 as-is (no GPU/ffmpeg convert).
-    if (OFFLINE_REVIEW_ONLY) {
-      assignVideoUrlFromFile(file);
-      setVideoPlaybackKind('direct');
-      setVideoPlaybackError(null);
-      return file;
-    }
     if (videoTranscodingRef.current) return file;
     videoTranscodingRef.current = true;
     setVideoTranscoding(true);
     setVideoPlaybackError(null);
     try {
-      const ready = await ensureGpuH264File(file, INFERENCE_API_BASE);
+      // GitHub Pages: convert unsupported codecs (e.g. mp4v) in-browser via ffmpeg.wasm.
+      // Local: use GPU ffmpeg when needed.
+      const ready = OFFLINE_REVIEW_ONLY
+        ? await ensureBrowserPlayableViaWasm(file)
+        : await ensureGpuH264File(file, INFERENCE_API_BASE);
       assignVideoUrlFromFile(ready);
       setVideoPlaybackKind(ready === file ? 'direct' : 'h264');
       const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
-      if (item?.id) gpuFileReadyRef.current.set(item.id, ready);
+      if (item?.id) {
+        gpuFileReadyRef.current.set(item.id, ready);
+        if (ready !== item.file) {
+          setState((prev) => {
+            const playlist = [...prev.playlist];
+            const idx = playlist.findIndex((p) => p.id === item.id);
+            if (idx >= 0) playlist[idx] = { ...playlist[idx], file: ready };
+            const next = { ...prev, playlist };
+            stateRef.current = next;
+            return next;
+          });
+        }
+      }
       return ready;
     } catch (err) {
       console.error('Video preparation failed:', err);
       convertFailedRef.current.add(`${file.name}:${file.size}:${file.lastModified}`);
       setVideoPlaybackError(
-        `This video is not playable in the browser (often HEVC). Convert it to H.264 first. ` +
-        `Local ffmpeg server should be on ${INFERENCE_API_BASE}. ` +
-        `${err instanceof Error ? err.message : String(err)}`,
+        OFFLINE_REVIEW_ONLY
+          ? `This MP4 uses a codec Chrome cannot play (often MPEG-4/mp4v). In-browser convert failed: ${
+              err instanceof Error ? err.message : String(err)
+            }. Prefer *_h264.mp4 clips in the prediction ZIP.`
+          : `This video is not playable in the browser (often HEVC). Convert it to H.264 first. ` +
+            `Local ffmpeg server should be on ${INFERENCE_API_BASE}. ` +
+            `${err instanceof Error ? err.message : String(err)}`,
       );
       return file;
     } finally {
@@ -1773,17 +1786,15 @@ function App() {
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
     if (item.file) {
-      // GitHub Pages: always play ZIP MP4 directly — no convert overlay.
+      const cached = gpuFileReadyRef.current.get(item.id);
       if (OFFLINE_REVIEW_ONLY) {
-        assignVideoUrlFromFile(item.file);
-        setVideoPlaybackKind('direct');
+        // Prefer cached in-browser H.264; otherwise try the ZIP MP4 directly.
+        assignVideoUrlFromFile(cached ?? item.file);
+        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
       } else if (appMode === 'ball' || appMode === 'touch') {
-        // Local ball/touch: play uploaded MP4 as-is (classic ball tracking).
-        const cached = gpuFileReadyRef.current.get(item.id);
         assignVideoUrlFromFile(cached ?? item.file);
         setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
       } else {
-        const cached = gpuFileReadyRef.current.get(item.id);
         if (cached) {
           assignVideoUrlFromFile(cached);
           setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
@@ -4080,9 +4091,8 @@ Enjoy using Veritas Pro!
                 const fileKey = item?.file
                   ? `${item.file.name}:${item.file.size}:${item.file.lastModified}`
                   : '';
-                // Local tool only: try GPU H.264 convert. GitHub Pages never converts.
+                // Local: GPU H.264. GitHub Pages: in-browser ffmpeg.wasm for mp4v/etc.
                 if (
-                  !OFFLINE_REVIEW_ONLY &&
                   item?.file &&
                   !videoTranscodingRef.current &&
                   !convertFailedRef.current.has(fileKey)
@@ -4099,7 +4109,7 @@ Enjoy using Veritas Pro!
                         : 'load error';
                 setVideoPlaybackError(
                   OFFLINE_REVIEW_ONLY
-                    ? `Video failed to load (${reason}). Use a browser-playable MP4 (H.264) from the prediction ZIP.`
+                    ? `Video failed to load (${reason}). Chrome cannot play MPEG-4/mp4v — use *_h264.mp4 from the ZIP or wait for in-browser convert.`
                     : `Video failed to load (${reason}). If this is HEVC, wait for H.264 conversion or use an H.264 MP4.`,
                 );
               }}
@@ -4127,7 +4137,9 @@ Enjoy using Veritas Pro!
                 }}
               >
                 {videoTranscoding
-                  ? 'Converting this rally to H.264 for browser playback (once). Other rallies stay usable.'
+                  ? (OFFLINE_REVIEW_ONLY
+                      ? 'Converting this rally to H.264 in your browser (MPEG-4/mp4v → H.264). First time downloads ffmpeg (~25MB); large clips can take a few minutes.'
+                      : 'Converting this rally to H.264 for browser playback (once). Other rallies stay usable.')
                   : (videoPlaybackError ?? 'Video file not in memory. Re-upload the MP4 to view playback.')}
               </div>
             )}
