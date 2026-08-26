@@ -52,11 +52,19 @@ export async function fetchGpuH264Video(file: File, apiBase: string): Promise<{ 
   }
 }
 
+/** True when the file was already exported/converted as H.264 (e.g. after inference). */
+export function looksLikeH264Filename(name: string): boolean {
+  return /_h264\.(mp4|mov|m4v)$/i.test(name);
+}
+
 /**
  * Return a browser-playable H.264 File. Uses original when Chrome can decode it;
  * otherwise transcodes on the GPU server (fast ffmpeg). Same file for inference + UI.
+ * Skips re-encode when the name already ends with `_h264.mp4` (inference export).
  */
 export async function ensureGpuH264File(file: File, apiBase: string): Promise<File> {
+  if (looksLikeH264Filename(file.name)) return file;
+
   const directOk = await probeVideoFilePlayability(file);
   if (directOk) return file;
 

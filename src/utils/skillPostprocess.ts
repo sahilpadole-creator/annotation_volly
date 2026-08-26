@@ -9,13 +9,14 @@ export const SKILL_CLASS_IDS: Record<SkillLabel, number> = {
   toss: 0,
   serve: 1,
   reception: 2,
+  receive: 2,
   set: 3,
   dig: 4,
   attack: 5,
   block: 6,
-  receive: 2,
-  score: 7,
   spike: 5,
+  score: 7,
+  touch: 8,
 };
 
 function isAttackBlock(skill: string): boolean {

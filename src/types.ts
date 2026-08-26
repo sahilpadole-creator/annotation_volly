@@ -1,6 +1,6 @@
 export type SkillLabel =
   | 'toss' | 'serve' | 'reception' | 'set' | 'dig' | 'attack' | 'block'
-  | 'receive' | 'score' | 'spike';
+  | 'receive' | 'score' | 'spike' | 'touch';
 
 export interface SkillEvent {
   frame: number;

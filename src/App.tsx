@@ -15,9 +15,9 @@ import {
   workflowFromAppMode,
   type WorkflowMode,
 } from './utils/workflowMode';
-import { parseVnlPredictionsToSkillEvents, VNL_LABEL_DEFS } from './utils/vnlAnnotation';
+import { VNL_LABEL_DEFS } from './utils/vnlAnnotation';
 import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
-import { ensureGpuH264File, mapWithConcurrency } from './utils/videoPreview';
+import { ensureGpuH264File, looksLikeH264Filename } from './utils/videoPreview';
 import VolleyballParticles from './components/VolleyballParticles';
 import BlockClipAnnotator from './components/BlockClipAnnotator';
 import './index.css';
@@ -45,6 +45,7 @@ const LABEL_TO_SKILL: Record<string, { label: SkillLabel; classId: number }> = {
   'attack/block': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
   score: { label: 'score', classId: 7 },
   spike: { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+  touch: { label: 'touch', classId: SKILL_CLASS_IDS.touch },
 };
 
 type PredictionLike = { frame?: number | string; label?: string; skill?: string; class_id?: number; confidence?: number };
@@ -621,6 +622,8 @@ function App() {
   const [draggingBox, setDraggingBox] = useState<{ trackId: number; startX: number; startY: number; initialBox: PlayerBox } | null>(null);
   const [resizingBox, setResizingBox] = useState<{ trackId: number; startX: number; startY: number; initialBox: PlayerBox; corner: 'tl' | 'tr' | 'bl' | 'br' } | null>(null);
   const [ballEngine, setBallEngine] = useState<'yolo26' | 'side_view' | 'triplet'>('yolo26');
+  const [touchDetector, setTouchDetector] = useState<'default' | 'side_view'>('default');
+  const touchDetectorRef = useRef<'default' | 'side_view'>('default');
   const [backendHealth, setBackendHealth] = useState<Record<string, string> | null>(null);
   const [ballPostprocessEnabled, setBallPostprocessEnabled] = useState(true);
   const [showRejectedBallBoxes, setShowRejectedBallBoxes] = useState(true);
@@ -642,7 +645,8 @@ function App() {
   const gpuFileReadyRef = useRef<Map<string, File>>(new Map());
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [videoTranscoding, setVideoTranscoding] = useState(false);
-  const [gpuPrepProgress, setGpuPrepProgress] = useState({ active: false, done: 0, total: 0 });
+  const videoTranscodingRef = useRef(false);
+  const convertFailedRef = useRef<Set<string>>(new Set());
   const [videoPlaybackKind, setVideoPlaybackKind] = useState<'direct' | 'h264' | null>(null);
 
   const clearVideoUrl = useCallback(() => {
@@ -683,26 +687,33 @@ function App() {
   }, []);
 
   const prepareVideoPlayback = useCallback(async (file: File) => {
+    if (videoTranscodingRef.current) return file;
+    videoTranscodingRef.current = true;
     setVideoTranscoding(true);
     setVideoPlaybackError(null);
     try {
       const ready = await ensureGpuH264File(file, INFERENCE_API_BASE);
       assignVideoUrlFromFile(ready);
       setVideoPlaybackKind(ready === file ? 'direct' : 'h264');
+      const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
+      if (item?.id) gpuFileReadyRef.current.set(item.id, ready);
       return ready;
     } catch (err) {
       console.error('Video preparation failed:', err);
+      convertFailedRef.current.add(`${file.name}:${file.size}:${file.lastModified}`);
       setVideoPlaybackError(
-        `Cannot prepare video on GPU. Run ./connect_gpu.sh then re-upload. ` +
+        `This video is not playable in the browser (often HEVC). Convert it to H.264 first. ` +
+        `Local ffmpeg server should be on ${INFERENCE_API_BASE}. ` +
         `${err instanceof Error ? err.message : String(err)}`,
       );
       return file;
     } finally {
+      videoTranscodingRef.current = false;
       setVideoTranscoding(false);
     }
   }, [assignVideoUrlFromFile]);
 
-  /** Ensure playlist file is GPU H.264 (cached). Used before inference and in background prep. */
+  /** Ensure playlist file is GPU H.264 (cached). Convert once before inference; reuse for playback. */
   const ensureItemGpuFile = useCallback(async (item: PlaylistItem): Promise<File> => {
     if (!item.file) {
       throw new Error(`No file loaded for ${item.name}`);
@@ -734,40 +745,6 @@ function App() {
     return ready;
   }, [assignVideoUrlFromFile]);
 
-  const runBackgroundGpuPrep = useCallback((originalFiles: File[], itemIds: string[]) => {
-    if (OFFLINE_REVIEW_ONLY) return;
-    if (originalFiles.length === 0) return;
-    setGpuPrepProgress({ active: true, done: 0, total: originalFiles.length });
-    void mapWithConcurrency(originalFiles, 2, async (file, idx) => {
-      const itemId = itemIds[idx];
-      try {
-        const ready = await ensureGpuH264File(file, INFERENCE_API_BASE);
-        gpuFileReadyRef.current.set(itemId, ready);
-        setState((prev) => {
-          const playlist = [...prev.playlist];
-          const i = playlist.findIndex((p) => p.id === itemId);
-          if (i >= 0) {
-            playlist[i] = { ...playlist[i], file: ready };
-          }
-          const next = { ...prev, playlist };
-          stateRef.current = next;
-          return next;
-        });
-        const currentIdx = stateRef.current.currentPlaylistIndex;
-        const currentItem = stateRef.current.playlist[currentIdx];
-        if (currentItem?.id === itemId) {
-          assignVideoUrlFromFile(ready);
-          setVideoPlaybackKind(ready === file ? 'direct' : 'h264');
-        }
-      } catch (err) {
-        console.error(`GPU H.264 convert failed for ${file.name}`, err);
-      } finally {
-        setGpuPrepProgress((prev) => ({ ...prev, done: prev.done + 1 }));
-      }
-    }).finally(() => {
-      setGpuPrepProgress({ active: false, done: 0, total: 0 });
-    });
-  }, [assignVideoUrlFromFile]);
   // Frame the <video> is ACTUALLY presenting (tracked via requestVideoFrameCallback).
   // The ball overlay is drawn against this so the box always sits on the visible ball,
   // even on fast-motion frames where an HTML5 seek can land a frame away from the target.
@@ -804,6 +781,10 @@ function App() {
   useEffect(() => {
     appModeRef.current = appMode;
   }, [appMode]);
+
+  useEffect(() => {
+    touchDetectorRef.current = touchDetector;
+  }, [touchDetector]);
 
   useEffect(() => {
     ballFrameStepFpsRef.current = ballFrameStepFps;
@@ -878,6 +859,9 @@ function App() {
           if (health.ball_sideview_configured !== 'true' && ballEngine === 'side_view') {
             setBallEngine('yolo26');
           }
+        }
+        if (appMode === 'touch' && health.touch_sideview_configured !== 'true' && touchDetector === 'side_view') {
+          setTouchDetector('default');
         }
       })
       .catch((err) => console.warn('Backend health check failed:', err));
@@ -1124,6 +1108,44 @@ function App() {
   };
 
 
+  const inferTouchPeaksOnly = async (file: File, model: 'default' | 'side_view' = 'side_view') => {
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('touch_model', model);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 900_000);
+    try {
+      const res = await fetch(`${INFERENCE_API_BASE}/api/infer/touch`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Touch inference failed: ${err}`);
+      }
+      return res.json() as Promise<{
+        video_name?: string;
+        touch_peaks?: number[];
+        touch_model?: string;
+        frame_count?: number;
+        video_fps?: number;
+      }>;
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error('Touch inference timed out. Check the GPU tunnel (./connect_gpu.sh).');
+      }
+      if (err instanceof TypeError) {
+        throw new Error(
+          `Cannot reach inference backend at ${INFERENCE_API_BASE}. Run ./connect_gpu.sh on your laptop.`,
+        );
+      }
+      throw err;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
   const inferSingleVideo = async (
     file: File,
     mode: 'touch' | 'ball' | 'vnl',
@@ -1142,8 +1164,15 @@ function App() {
       formData.append('ball_model', selected);
       formData.append('use_triplet', selected === 'triplet' ? 'true' : 'false');
     }
+    if (mode === 'touch') {
+      let selectedTouch = touchDetector;
+      if (selectedTouch === 'side_view' && backendHealth?.touch_sideview_configured !== 'true') {
+        selectedTouch = 'default';
+      }
+      formData.append('touch_model', selectedTouch);
+    }
     const endpoint =
-      mode === 'ball' ? '/api/infer/ball' : mode === 'vnl' ? '/api/infer/vnl' : '/api/infer/skill5';
+      mode === 'ball' ? '/api/infer/ball' : '/api/infer/skill5';
     // VNL while sharing GPU with training can take much longer than solo GPU runs.
     const timeoutMs = mode === 'vnl' ? 1_800_000 : 900_000; // 30m VNL / 15m others
     const controller = new AbortController();
@@ -1258,7 +1287,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (OFFLINE_REVIEW_ONLY) {
+    if (OFFLINE_REVIEW_ONLY || appModeRef.current === 'vnl') {
       if (batchProgress.isRunning) {
         processingRef.current = false;
         setBatchProgress((prev) => ({ ...prev, isRunning: false }));
@@ -1321,7 +1350,9 @@ function App() {
             fileToInfer = new File([blob], item.name, { type: 'video/mp4' });
           }
 
-          if (fileToInfer) {
+          if (fileToInfer && workflowMode !== 'touch') {
+            // Ball needs unified H.264 for frame-index alignment.
+            // Touch/skill models read any codec on the GPU — skip tunnel upload for H.264 prep.
             fileToInfer = await ensureItemGpuFile({ ...item, file: fileToInfer });
           }
           
@@ -1364,16 +1395,36 @@ function App() {
             console.log(`[batch] Ball tracking events parsed: ${ballTrackingData?.length || 0}`);
             setBallEditMode(false);
           } else if (workflowMode === 'vnl') {
-            if (item.isVnlAlgorithmApplied && item.events && item.events.length > 0) {
-              console.log(`[batch] Skipping VNL inference for ${item.name} — using existing events.`);
-              heuristicallyCorrected = [...item.events];
-            } else {
-              payload = await inferSingleVideo(fileToInfer!, 'vnl');
-              heuristicallyCorrected = parseVnlPredictionsToSkillEvents(payload.predictions ?? payload);
-              console.log(`[batch] VNL events parsed: ${heuristicallyCorrected.length}`);
-            }
+            console.log(`[batch] Skipping VNL inference for ${item.name} — manual annotation only.`);
+            heuristicallyCorrected = [...(item.events || [])];
           } else {
-            if (item.events && item.events.length > 0) {
+            const useSideViewTouchOnly = touchDetectorRef.current === 'side_view';
+
+            if (useSideViewTouchOnly) {
+              // Side View Touch: peaks only — no skill model, no player assignment, no tracking JSON.
+              if (item.events && item.events.length > 0) {
+                console.log(`[batch] Skipping Side View Touch for ${item.name} — using existing events.`);
+                heuristicallyCorrected = [...item.events];
+              } else {
+                const touchPayload = await inferTouchPeaksOnly(fileToInfer!, 'side_view');
+                const peaks = Array.isArray(touchPayload.touch_peaks) ? touchPayload.touch_peaks : [];
+                heuristicallyCorrected = peaks.map((frame) => ({
+                  frame: Number(frame),
+                  skill: 'touch' as SkillLabel,
+                  class_id: SKILL_CLASS_IDS.touch,
+                  confidence: 1,
+                  source: 'auto' as const,
+                }));
+                payload = touchPayload;
+                startFrame = 0;
+                endFrame =
+                  touchPayload.frame_count && touchPayload.frame_count > 0
+                    ? touchPayload.frame_count - 1
+                    : endFrame;
+                console.log(`[batch] Side View Touch peaks: ${heuristicallyCorrected.length}`);
+              }
+              touchAssignSucceeded = true;
+            } else if (item.events && item.events.length > 0) {
               console.log(
                 `[batch] Skipping skill inference for ${item.name} — using existing events for player assignment.`,
               );
@@ -1393,6 +1444,7 @@ function App() {
               );
             }
 
+            if (!useSideViewTouchOnly) {
             // Pass pre-existing player boxes as tracking JSON to bypass SparseRCNN.
             // Send the original (compact) JSON to the API; backend extends to full video length.
             const trackingBoxesForApi = (item.playerBoxes && Object.keys(item.playerBoxes).length > 0) 
@@ -1528,6 +1580,7 @@ function App() {
                 `Error: ${errText}`
               );
             }
+            } // end !useSideViewTouchOnly
           }
           
           const videoFps = payload ? (payload as any).video_fps : null;
@@ -1748,7 +1801,13 @@ function App() {
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
     if (item.file) {
-      prepareVideoPlayback(item.file);
+      const cached = gpuFileReadyRef.current.get(item.id);
+      if (cached) {
+        assignVideoUrlFromFile(cached);
+        setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
+      } else {
+        void prepareVideoPlayback(item.file);
+      }
     } else if (item.driveUrl) {
       if (googleTokenRef.current) {
         assignVideoUrlFromRemote(`${item.driveUrl}&access_token=${googleTokenRef.current}`);
@@ -1883,9 +1942,9 @@ function App() {
       const isNewUpload = !existing || existing.id !== fileId;
       let isApplied = existing && !isNewUpload ? isItemAlgorithmApplied(existing, workflowMode) : false;
       if (workflowMode === 'vnl') {
-        // Default to re-infer unless we import usable VNL events from ZIP/XML.
-        isApplied = false;
-        itemEvents = [];
+        // VNL is manual annotation: never auto-infer. Keep existing events if re-uploading.
+        isApplied = true;
+        if (isNewUpload) itemEvents = [];
       }
       let itemPlayerBoxes = workflowMode === 'ball' ? {} : (existing?.playerBoxes || {});
       let itemRawJson = workflowMode === 'ball' ? undefined : (existing?.rawJsonString || undefined);
@@ -1923,10 +1982,10 @@ function App() {
           isApplied = OFFLINE_REVIEW_ONLY;
         }
       } else if (workflowMode === 'vnl' && parsedAnnotations[xmlKey]) {
-        // For VNL imports, trust existing XML events and bypass re-inference.
+        // VNL is always manual: load XML if present, never queue inference.
         itemEvents = parsedAnnotations[xmlKey].events;
         itemRally = parsedAnnotations[xmlKey].rally;
-        isApplied = OFFLINE_REVIEW_ONLY || itemEvents.length > 0;
+        isApplied = true;
       } else if (workflowMode === 'ball') {
         if (parsedJsonAnnotations[jsonKey]?.parsed && Object.keys(parsedJsonAnnotations[jsonKey].parsed).length > 0) {
           itemPlayerBoxes = parsedJsonAnnotations[jsonKey].parsed;
@@ -2012,18 +2071,28 @@ function App() {
     setState(syncedState);
 
     if (syncItem?.file) {
-      assignVideoUrlFromFile(syncItem.file);
+      if (workflowMode === 'vnl') {
+        void prepareVideoPlayback(syncItem.file);
+      } else {
+        assignVideoUrlFromFile(syncItem.file);
+      }
     }
 
-    if (!OFFLINE_REVIEW_ONLY) {
-      runBackgroundGpuPrep(allVideoFiles, newPlaylistItems.map((p) => p.id));
-    }
+    // Do NOT playlist-wide convert on upload. H.264 happens once at inference
+    // (ensureItemGpuFile) and is cached; review ZIPs already include *_h264.mp4.
+    // Playback converts on-demand only if the browser cannot decode the file.
+    newPlaylistItems.forEach((item) => {
+      if (item.file && looksLikeH264Filename(item.file.name)) {
+        gpuFileReadyRef.current.set(item.id, item.file);
+      }
+    });
 
     if (total > 0) {
       processingRef.current = false;
+      const runBatch = workflowMode !== 'vnl' && !OFFLINE_REVIEW_ONLY && completed < total;
       setBatchProgress({
-        isRunning: completed < total,
-        completed,
+        isRunning: runBatch,
+        completed: workflowMode === 'vnl' ? total : completed,
         total,
         lastFps: 0,
         avgTimeSec: 0,
@@ -3422,7 +3491,7 @@ Enjoy using Veritas Pro!
               : appMode === 'ball'
                 ? 'Advanced ball tracking and batch processing pipeline.'
                 : appMode === 'vnl'
-                  ? 'VNL-STES event spotting on full rally videos.'
+                  ? 'Manual VNL annotation on full rally videos. No auto inference.'
                   : 'Advanced skill tracking and batch processing pipeline.'}<br/>
             {OFFLINE_REVIEW_ONLY
               ? 'Upload a ZIP containing matching video and XML/JSON files. No video or annotation data leaves your computer.'
@@ -3510,7 +3579,7 @@ Enjoy using Veritas Pro!
               <Zap size={40} color="#8b5cf6" style={{ margin: '0 auto 1rem auto' }} />
               <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>VNL</h3>
               <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
-                STES event spotting — toss, serve, receive, set, dig, attack, block, score on full rally videos.
+                Manual annotation — no auto inference. Use keys 1–8 for toss, serve, receive, set, dig, attack, block, score.
               </p>
             </div>
           </div>
@@ -3525,8 +3594,24 @@ Enjoy using Veritas Pro!
             </button>
             
             <h2 style={{ color: appMode === 'ball' ? '#fbbf24' : appMode === 'vnl' ? '#8b5cf6' : '#3b82f6', marginBottom: '1.5rem', fontSize: '1.5rem' }}>
-              {appMode === 'ball' ? 'Ball Tracking Mode' : appMode === 'vnl' ? 'VNL Event Spotting Mode' : 'Player Touch & Skill Mode'}
+              {appMode === 'ball' ? 'Ball Tracking Mode' : appMode === 'vnl' ? 'VNL Manual Annotation' : 'Player Touch & Skill Mode'}
             </h2>
+
+            {appMode === 'vnl' && !OFFLINE_REVIEW_ONLY && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  padding: '0.65rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(139, 92, 246, 0.1)',
+                  border: '1px solid rgba(139, 92, 246, 0.35)',
+                  color: '#ddd6fe',
+                  fontSize: '0.9rem',
+                }}
+              >
+                Manual annotation: no GPU inference. Upload MP4s and label skills yourself with keys 1–8.
+              </div>
+            )}
 
             {OFFLINE_REVIEW_ONLY && (
               <div
@@ -3548,36 +3633,97 @@ Enjoy using Veritas Pro!
             )}
 
             {appMode === 'touch' && !OFFLINE_REVIEW_ONLY && (
-              <div style={{ marginBottom: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', animation: 'fadeInDown 0.8s ease-out' }}>
-                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px' }}>
-                  Select Touch Player Engine
-                </p>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-card)', padding: '0.35rem', borderRadius: '12px', border: '1px solid var(--border)', width: '320px', boxShadow: '0 4px 20px -5px rgba(0,0,0,0.5)' }}>
-                  <button
-                    onClick={() => setInferenceEngine('slowfast')}
-                    style={{
-                      flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
-                      background: inferenceEngine === 'slowfast' ? 'var(--primary)' : 'transparent',
-                      color: inferenceEngine === 'slowfast' ? 'white' : 'var(--text-muted)',
-                      border: 'none', transition: 'all 0.2s',
-                      boxShadow: inferenceEngine === 'slowfast' ? '0 2px 10px rgba(59, 130, 246, 0.4)' : 'none'
-                    }}
-                  >
-                    SlowFast
-                  </button>
-                  <button
-                    onClick={() => setInferenceEngine('yolo')}
-                    style={{
-                      flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
-                      background: inferenceEngine === 'yolo' ? '#10b981' : 'transparent',
-                      color: inferenceEngine === 'yolo' ? 'white' : 'var(--text-muted)',
-                      border: 'none', transition: 'all 0.2s',
-                      boxShadow: inferenceEngine === 'yolo' ? '0 2px 10px rgba(16, 185, 129, 0.4)' : 'none'
-                    }}
-                  >
-                    YOLO27
-                  </button>
+              <div style={{ marginBottom: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', animation: 'fadeInDown 0.8s ease-out', gap: '1.25rem' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
+                  <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                    Select Touch Detector
+                  </p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-card)', padding: '0.35rem', borderRadius: '12px', border: '1px solid var(--border)', width: '420px', maxWidth: '95vw', boxShadow: '0 4px 20px -5px rgba(0,0,0,0.5)' }}>
+                    <button
+                      onClick={() => setTouchDetector('default')}
+                      style={{
+                        flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                        background: touchDetector === 'default' ? 'var(--primary)' : 'transparent',
+                        color: touchDetector === 'default' ? 'white' : 'var(--text-muted)',
+                        border: 'none', transition: 'all 0.2s',
+                        boxShadow: touchDetector === 'default' ? '0 2px 10px rgba(59, 130, 246, 0.4)' : 'none'
+                      }}
+                    >
+                      Default Touch
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (backendHealth?.touch_sideview_configured !== 'true') {
+                          window.alert('Side View Touch is not configured on the backend. Using Default Touch instead.');
+                          setTouchDetector('default');
+                          return;
+                        }
+                        setTouchDetector('side_view');
+                      }}
+                      disabled={backendHealth?.touch_sideview_configured !== 'true'}
+                      title={
+                        backendHealth?.touch_sideview_configured === 'true'
+                          ? (backendHealth.touch_sideview_model || 'Side View SlowFast touch (best epoch 10)')
+                          : 'Side View Touch weights not installed on backend'
+                      }
+                      style={{
+                        flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px',
+                        cursor: backendHealth?.touch_sideview_configured === 'true' ? 'pointer' : 'not-allowed',
+                        background: touchDetector === 'side_view' ? '#38bdf8' : 'transparent',
+                        color: touchDetector === 'side_view' ? '#000' : 'var(--text-muted)',
+                        opacity: backendHealth?.touch_sideview_configured === 'true' ? 1 : 0.45,
+                        border: 'none', transition: 'all 0.2s',
+                        boxShadow: touchDetector === 'side_view' ? '0 2px 10px rgba(56, 189, 248, 0.4)' : 'none'
+                      }}
+                    >
+                      Side View Touch
+                    </button>
+                  </div>
+                  {touchDetector === 'side_view' && (
+                    <p style={{ color: '#7dd3fc', fontSize: '0.8rem', marginTop: '0.5rem', textAlign: 'center', maxWidth: '420px' }}>
+                      Peaks only — no skill classification and no tracking JSON / player assign.
+                    </p>
+                  )}
+                  {backendHealth && backendHealth.touch_sideview_configured !== 'true' && (
+                    <p style={{ color: '#f87171', fontSize: '0.8rem', marginTop: '0.5rem', textAlign: 'center' }}>
+                      Side View Touch is not fully configured on the backend.
+                    </p>
+                  )}
                 </div>
+
+                {touchDetector !== 'side_view' && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
+                  <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '0.75rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                    Select Touch Player Engine
+                  </p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-card)', padding: '0.35rem', borderRadius: '12px', border: '1px solid var(--border)', width: '320px', boxShadow: '0 4px 20px -5px rgba(0,0,0,0.5)' }}>
+                    <button
+                      onClick={() => setInferenceEngine('slowfast')}
+                      style={{
+                        flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                        background: inferenceEngine === 'slowfast' ? 'var(--primary)' : 'transparent',
+                        color: inferenceEngine === 'slowfast' ? 'white' : 'var(--text-muted)',
+                        border: 'none', transition: 'all 0.2s',
+                        boxShadow: inferenceEngine === 'slowfast' ? '0 2px 10px rgba(59, 130, 246, 0.4)' : 'none'
+                      }}
+                    >
+                      SlowFast
+                    </button>
+                    <button
+                      onClick={() => setInferenceEngine('yolo')}
+                      style={{
+                        flex: 1, padding: '0.6rem 1rem', fontSize: '0.9rem', fontWeight: 600, borderRadius: '8px', cursor: 'pointer',
+                        background: inferenceEngine === 'yolo' ? '#10b981' : 'transparent',
+                        color: inferenceEngine === 'yolo' ? 'white' : 'var(--text-muted)',
+                        border: 'none', transition: 'all 0.2s',
+                        boxShadow: inferenceEngine === 'yolo' ? '0 2px 10px rgba(16, 185, 129, 0.4)' : 'none'
+                      }}
+                    >
+                      YOLO27
+                    </button>
+                  </div>
+                </div>
+                )}
               </div>
             )}
 
@@ -3609,7 +3755,7 @@ Enjoy using Veritas Pro!
                       setBallEngine('side_view');
                     }}
                     disabled={backendHealth?.ball_sideview_configured !== 'true'}
-                    title={backendHealth?.ball_sideview_configured === 'true' ? 'Use Side View Ball YOLO26 tracker' : 'Side View Ball weights not installed on backend'}
+                    title={backendHealth?.ball_sideview_configured === 'true' ? 'Use Side View Ball YOLO26 v2 (prev + 18 rallies + batch24 + batch5)' : 'Side View Ball weights not installed on backend'}
                     style={{
                       flex: 1, padding: '0.6rem 0.75rem', fontSize: '0.85rem', fontWeight: 600, borderRadius: '8px',
                       cursor: backendHealth?.ball_sideview_configured === 'true' ? 'pointer' : 'not-allowed',
@@ -3620,7 +3766,7 @@ Enjoy using Veritas Pro!
                       boxShadow: ballEngine === 'side_view' ? '0 2px 10px rgba(56, 189, 248, 0.4)' : 'none'
                     }}
                   >
-                    Side View Ball
+                    Side View Ball v2
                   </button>
                   <button
                     onClick={() => {
@@ -3825,28 +3971,6 @@ Enjoy using Veritas Pro!
             })}
           </div>
 
-          {gpuPrepProgress.active && (
-            <div style={{ marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', flexShrink: 0 }}>
-              <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.8)', marginBottom: '4px', display: 'flex', justifyContent: 'space-between' }}>
-                <span>GPU H.264 prep ({gpuPrepProgress.done}/{gpuPrepProgress.total})</span>
-                <span>{gpuPrepProgress.total > 0 ? Math.round((gpuPrepProgress.done / gpuPrepProgress.total) * 100) : 0}%</span>
-              </div>
-              <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', overflow: 'hidden' }}>
-                <div
-                  style={{
-                    width: `${gpuPrepProgress.total > 0 ? (gpuPrepProgress.done / gpuPrepProgress.total) * 100 : 0}%`,
-                    height: '100%',
-                    background: appMode === 'vnl' ? '#8b5cf6' : 'var(--primary)',
-                    transition: 'width 0.3s ease',
-                  }}
-                />
-              </div>
-              <div style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.5)', marginTop: '4px' }}>
-                You can annotate while remaining files convert in the background.
-              </div>
-            </div>
-          )}
-
           {batchProgress.isRunning && (
             <div style={{ marginTop: '0.5rem', paddingTop: '0.5rem', borderTop: '1px solid rgba(255,255,255,0.1)', flexShrink: 0 }}>
               <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.8)', marginBottom: '4px', display: 'flex', justifyContent: 'space-between' }}>
@@ -3972,8 +4096,15 @@ Enjoy using Veritas Pro!
               onSeeked={handleVideoSeeked}
               onError={() => {
                 const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
-                if (item?.file && !videoFileKeyRef.current.endsWith(':h264')) {
-                  prepareVideoPlayback(item.file);
+                const fileKey = item?.file
+                  ? `${item.file.name}:${item.file.size}:${item.file.lastModified}`
+                  : '';
+                if (
+                  item?.file &&
+                  !videoTranscodingRef.current &&
+                  !convertFailedRef.current.has(fileKey)
+                ) {
+                  void prepareVideoPlayback(item.file);
                   return;
                 }
                 const v = videoRef.current;
@@ -3984,7 +4115,7 @@ Enjoy using Veritas Pro!
                       : code === 2 ? 'network error'
                         : 'load error';
                 setVideoPlaybackError(
-                  `Video failed to load (${reason}). Run ./connect_gpu.sh if inference is stuck.`,
+                  `Video failed to load (${reason}). If this is HEVC, wait for H.264 conversion or use an H.264 MP4.`,
                 );
               }}
               controls={false}
@@ -3993,8 +4124,7 @@ Enjoy using Veritas Pro!
               crossOrigin={videoUrl.startsWith('blob:') ? undefined : 'anonymous'}
               style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
             />
-            {(videoTranscoding || videoPlaybackError || (!currentPlaylistItem?.file && !currentPlaylistItem?.driveUrl) ||
-              (gpuPrepProgress.active && currentPlaylistItem && !gpuFileReadyRef.current.has(currentPlaylistItem.id))) && (
+            {(videoTranscoding || videoPlaybackError || (!currentPlaylistItem?.file && !currentPlaylistItem?.driveUrl)) && (
               <div
                 style={{
                   position: 'absolute',
@@ -4011,9 +4141,9 @@ Enjoy using Veritas Pro!
                   lineHeight: 1.5,
                 }}
               >
-                {videoTranscoding || (gpuPrepProgress.active && currentPlaylistItem && !gpuFileReadyRef.current.has(currentPlaylistItem.id))
-                  ? `Converting this rally on GPU to H.264… Other rallies in the playlist can be reviewed while the batch runs.`
-                  : (videoPlaybackError ?? 'Video file not in memory. Re-upload the MP4 in VNL mode to view playback.')}
+                {videoTranscoding
+                  ? 'Converting this rally to H.264 for browser playback (once). Other rallies stay usable.'
+                  : (videoPlaybackError ?? 'Video file not in memory. Re-upload the MP4 to view playback.')}
               </div>
             )}
             {appMode === 'vnl' && (
@@ -4656,7 +4786,7 @@ Enjoy using Veritas Pro!
             )}
             {appMode === 'ball' && ballEngine === 'side_view' && (
               <div style={{ fontSize: '0.85rem', color: '#94a3b8' }}>
-                Side View Ball: all raw detections kept (no post-process / pink removals).
+                Side View Ball v2: all raw detections kept (no post-process / pink removals).
               </div>
             )}
           </div>
