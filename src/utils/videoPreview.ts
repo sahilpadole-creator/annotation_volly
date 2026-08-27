@@ -1,3 +1,5 @@
+import { getCachedH264, putCachedH264 } from './h264BrowserCache';
+
 /** Probe whether the browser can decode this file (metadata load). */
 export function probeVideoFilePlayability(file: File, timeoutMs = 12_000): Promise<boolean> {
   return new Promise((resolve) => {
@@ -90,12 +92,19 @@ async function getBrowserFfmpeg(): Promise<FFmpegInstance> {
 /**
  * GitHub Pages / offline: play as-is when the browser can decode it;
  * otherwise re-encode MPEG-4 Part 2 (mp4v) → H.264 in the browser via ffmpeg.wasm.
+ * Converted clips are stored in IndexedDB so refresh does not re-convert.
  */
 export async function ensureBrowserPlayableViaWasm(
   file: File,
   onProgress?: (ratio: number) => void,
 ): Promise<File> {
   if (looksLikeH264Filename(file.name)) return file;
+
+  const cached = await getCachedH264(file);
+  if (cached) {
+    const stillOk = await probeVideoFilePlayability(cached, 4_000);
+    if (stillOk) return cached;
+  }
 
   const directOk = await probeVideoFilePlayability(file, 6_000);
   if (directOk) return file;
@@ -131,7 +140,9 @@ export async function ensureBrowserPlayableViaWasm(
     // Copy into a plain ArrayBuffer-backed view (avoids SharedArrayBuffer typing issues).
     const copy = new Uint8Array(bytes.byteLength);
     copy.set(bytes);
-    return new File([copy], outFilename, { type: 'video/mp4' });
+    const converted = new File([copy], outFilename, { type: 'video/mp4' });
+    await putCachedH264(file, converted);
+    return converted;
   } finally {
     ffmpeg.off('progress', progressHandler);
     try { await ffmpeg.deleteFile(inputName); } catch { /* ignore */ }

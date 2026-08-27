@@ -27,6 +27,7 @@ import {
 } from './utils/vnlBrowserStorage';
 import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
 import { ensureGpuH264File, ensureBrowserPlayableViaWasm, looksLikeH264Filename } from './utils/videoPreview';
+import { getCachedH264 } from './utils/h264BrowserCache';
 import VolleyballParticles from './components/VolleyballParticles';
 import BlockClipAnnotator from './components/BlockClipAnnotator';
 import './index.css';
@@ -700,6 +701,30 @@ function App() {
 
   const prepareVideoPlayback = useCallback(async (file: File) => {
     if (videoTranscodingRef.current) return file;
+
+    // GitHub: reuse IndexedDB H.264 from a previous visit — no re-convert overlay.
+    if (OFFLINE_REVIEW_ONLY && !looksLikeH264Filename(file.name)) {
+      const cached = await getCachedH264(file);
+      if (cached) {
+        assignVideoUrlFromFile(cached);
+        setVideoPlaybackKind('h264');
+        setVideoPlaybackError(null);
+        const item = stateRef.current.playlist[stateRef.current.currentPlaylistIndex];
+        if (item?.id) {
+          gpuFileReadyRef.current.set(item.id, cached);
+          setState((prev) => {
+            const playlist = [...prev.playlist];
+            const idx = playlist.findIndex((p) => p.id === item.id);
+            if (idx >= 0) playlist[idx] = { ...playlist[idx], file: cached };
+            const next = { ...prev, playlist };
+            stateRef.current = next;
+            return next;
+          });
+        }
+        return cached;
+      }
+    }
+
     videoTranscodingRef.current = true;
     setVideoTranscoding(true);
     setVideoPlaybackError(null);
@@ -1843,12 +1868,38 @@ function App() {
     if (item.file) {
       const cached = gpuFileReadyRef.current.get(item.id);
       if (OFFLINE_REVIEW_ONLY) {
-        // GitHub Pages: always try the MP4 first (H.264 plays immediately).
-        // Unsupported codecs (mp4v/HEVC) fall through to onError → in-browser convert.
-        assignVideoUrlFromFile(cached ?? item.file);
-        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
-        if (looksLikeH264Filename(item.file.name) && !cached) {
+        // Prefer memory/IndexedDB H.264; otherwise play original (onError will convert once and cache).
+        if (cached) {
+          assignVideoUrlFromFile(cached);
+          setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
+        } else if (looksLikeH264Filename(item.file.name)) {
+          assignVideoUrlFromFile(item.file);
+          setVideoPlaybackKind('direct');
           gpuFileReadyRef.current.set(item.id, item.file);
+        } else {
+          const original = item.file;
+          void getCachedH264(original).then((fromDisk) => {
+            const stillCurrent =
+              stateRef.current.playlist[stateRef.current.currentPlaylistIndex]?.id === item.id;
+            if (!stillCurrent) return;
+            if (fromDisk) {
+              gpuFileReadyRef.current.set(item.id, fromDisk);
+              assignVideoUrlFromFile(fromDisk);
+              setVideoPlaybackKind('h264');
+              setState((prev) => {
+                const playlist = [...prev.playlist];
+                const idx = playlist.findIndex((p) => p.id === item.id);
+                if (idx < 0) return prev;
+                playlist[idx] = { ...playlist[idx], file: fromDisk };
+                const next = { ...prev, playlist };
+                stateRef.current = next;
+                return next;
+              });
+            } else {
+              assignVideoUrlFromFile(original);
+              setVideoPlaybackKind('direct');
+            }
+          });
         }
       } else if (appMode === 'ball' || appMode === 'touch') {
         assignVideoUrlFromFile(cached ?? item.file);
@@ -2153,12 +2204,25 @@ function App() {
 
     if (syncItem?.file) {
       if (OFFLINE_REVIEW_ONLY) {
-        // GitHub: play MP4 immediately. Convert only if the browser cannot decode (onError).
-        assignVideoUrlFromFile(syncItem.file);
-        setVideoPlaybackKind('direct');
-        if (looksLikeH264Filename(syncItem.file.name)) {
+        // Prefer previously converted H.264 from IndexedDB (survives refresh).
+        let playFile = syncItem.file;
+        if (!looksLikeH264Filename(syncItem.file.name)) {
+          const cached = await getCachedH264(syncItem.file);
+          if (cached) {
+            playFile = cached;
+            gpuFileReadyRef.current.set(syncItem.id, cached);
+            const playlist = [...syncedState.playlist];
+            const idx = playlist.findIndex((p) => p.id === syncItem.id);
+            if (idx >= 0) playlist[idx] = { ...playlist[idx], file: cached };
+            syncedState.playlist = playlist;
+            stateRef.current = syncedState;
+            setState(syncedState);
+          }
+        } else {
           gpuFileReadyRef.current.set(syncItem.id, syncItem.file);
         }
+        assignVideoUrlFromFile(playFile);
+        setVideoPlaybackKind(playFile === syncItem.file ? 'direct' : 'h264');
       } else if (workflowMode === 'vnl') {
         // Local VNL: try MP4 first; convert on decode error.
         assignVideoUrlFromFile(syncItem.file);
@@ -2166,6 +2230,29 @@ function App() {
       } else {
         assignVideoUrlFromFile(syncItem.file);
       }
+    }
+
+    // Warm playlist cache from IndexedDB in the background (same browser, after refresh).
+    if (OFFLINE_REVIEW_ONLY) {
+      void Promise.all(
+        newPlaylistItems.map(async (item) => {
+          if (!item.file || looksLikeH264Filename(item.file.name) || gpuFileReadyRef.current.has(item.id)) {
+            return;
+          }
+          const cached = await getCachedH264(item.file);
+          if (!cached) return;
+          gpuFileReadyRef.current.set(item.id, cached);
+          setState((prev) => {
+            const playlist = [...prev.playlist];
+            const idx = playlist.findIndex((p) => p.id === item.id);
+            if (idx < 0) return prev;
+            playlist[idx] = { ...playlist[idx], file: cached };
+            const next = { ...prev, playlist };
+            stateRef.current = next;
+            return next;
+          });
+        }),
+      );
     }
 
     // GitHub/local review: trust *_h264 exports from inference; never playlist-wide re-convert.
@@ -4356,7 +4443,7 @@ Enjoy using Veritas Pro!
               >
                 {videoTranscoding
                   ? (OFFLINE_REVIEW_ONLY
-                      ? 'Converting this rally to H.264 in your browser (MPEG-4/mp4v → H.264). First time downloads ffmpeg (~25MB); large clips can take a few minutes.'
+                      ? 'Converting this rally to H.264 in your browser (once). Saved in this browser — after refresh, re-open the same MP4 and it will load from cache (no re-convert). First time also downloads ffmpeg (~25MB).'
                       : 'Converting this rally to H.264 for browser playback (once). Other rallies stay usable.')
                   : (videoPlaybackError ?? 'Video file not in memory. Re-upload the MP4 to view playback.')}
               </div>
