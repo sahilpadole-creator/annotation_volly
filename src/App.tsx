@@ -4515,7 +4515,14 @@ Enjoy using Veritas Pro!
   return (
     <div className="app-container">
       {/* PLAYLIST SIDEBAR */}
-      <div className="sidebar" style={{ minWidth: '200px', maxWidth: '250px', overflowY: 'hidden' }}>
+      <div
+        className="sidebar"
+        style={{
+          minWidth: appMode === 'touch_block' ? '260px' : '200px',
+          maxWidth: appMode === 'touch_block' ? '300px' : '250px',
+          overflowY: 'hidden',
+        }}
+      >
         
         {/* BRANDING HEADER */}
         <div style={{ flexShrink: 0, paddingBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.75rem', paddingLeft: '0.5rem' }}>
@@ -4527,7 +4534,16 @@ Enjoy using Veritas Pro!
         </div>
 
         {/* PLAYLIST PANEL */}
-        <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div
+          className="glass-panel sidebar-section"
+          style={{
+            flex: appMode === 'touch_block' ? '0 1 38%' : 1,
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+            maxHeight: appMode === 'touch_block' ? '38%' : undefined,
+          }}
+        >
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
             <h2 style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Playlist ({state.currentPlaylistIndex + 1} / {state.playlist.length})
@@ -4662,6 +4678,111 @@ Enjoy using Veritas Pro!
 
           </div>
         </div>
+
+        {appMode === 'touch_block' && attackProgressSummary && (
+          <div
+            className="glass-panel sidebar-section"
+            style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
+          >
+            <h2 style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem', marginBottom: '0.35rem' }}>
+              <span>Attacks</span>
+              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#a8df23' }}>
+                {attackProgressSummary.done}/{attackProgressSummary.total} done
+              </span>
+            </h2>
+            <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginBottom: '0.55rem', lineHeight: 1.35 }}>
+              <span style={{ color: '#4ade80' }}>●</span> block+dot{' '}
+              <span style={{ color: '#fbbf24' }}>●</span> block only{' '}
+              <span style={{ color: '#64748b' }}>●</span> pending
+            </div>
+            <button
+              className="btn"
+              onClick={seekNextPendingAttack}
+              style={{
+                width: '100%',
+                marginBottom: '0.55rem',
+                background: '#a8df23',
+                color: '#111',
+                border: 'none',
+                fontWeight: 700,
+                fontSize: '0.8rem',
+                padding: '0.55rem 0.6rem',
+                flexShrink: 0,
+              }}
+              title="Jump to next attack still needing work"
+            >
+              Next pending attack
+              {attackProgressSummary.pending + attackProgressSummary.partial > 0
+                ? ` (${attackProgressSummary.pending + attackProgressSummary.partial} left)`
+                : ' ✓'}
+            </button>
+            <div style={{ overflowY: 'auto', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.28rem' }}>
+              {attackBlockProgress.length === 0 ? (
+                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>No attacks in XML yet.</div>
+              ) : (
+                attackBlockProgress.map((row) => {
+                  const isCurrent =
+                    state.currentFrame === row.attackFrame ||
+                    (row.blockFrame !== undefined && state.currentFrame === row.blockFrame);
+                  const statusColor =
+                    row.status === 'done' ? '#4ade80' : row.status === 'block_no_dot' ? '#fbbf24' : '#64748b';
+                  const statusLabel =
+                    row.status === 'done' ? 'done' : row.status === 'block_no_dot' ? 'no dot' : 'pending';
+                  return (
+                    <button
+                      key={`atk-${row.attackIndex}-${row.attackFrame}`}
+                      type="button"
+                      onClick={() =>
+                        seekToFrame(
+                          row.status === 'block_no_dot' && row.blockFrame != null
+                            ? row.blockFrame
+                            : row.attackFrame,
+                        )
+                      }
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.4rem',
+                        width: '100%',
+                        textAlign: 'left',
+                        padding: '0.38rem 0.5rem',
+                        borderRadius: '8px',
+                        border: isCurrent ? '1px solid #a8df23' : '1px solid rgba(148,163,184,0.25)',
+                        background: isCurrent ? 'rgba(168,223,35,0.12)' : 'rgba(15,23,42,0.45)',
+                        color: '#e2e8f0',
+                        cursor: 'pointer',
+                        fontSize: '0.75rem',
+                        flexShrink: 0,
+                      }}
+                      title={
+                        row.status === 'done'
+                          ? `Attack #${row.attackIndex} @ f${row.attackFrame} — block+dot done`
+                          : row.status === 'block_no_dot'
+                            ? `Attack #${row.attackIndex} — block at f${row.blockFrame}, click video for ball dot`
+                            : `Attack #${row.attackIndex} @ f${row.attackFrame} — press 7 then click for block+dot`
+                      }
+                    >
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          background: statusColor,
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ fontWeight: 700, minWidth: '1.5rem' }}>#{row.attackIndex}</span>
+                      <span style={{ opacity: 0.85 }}>f{row.attackFrame}</span>
+                      <span style={{ marginLeft: 'auto', color: statusColor, fontWeight: 600, fontSize: '0.68rem' }}>
+                        {statusLabel}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* MAIN CONTENT */}
@@ -5535,99 +5656,6 @@ Enjoy using Veritas Pro!
             )}
           </div>
         </div>
-
-        {appMode === 'touch_block' && attackProgressSummary && (
-          <div className="glass-panel sidebar-section" style={{ maxHeight: '280px', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-            <h2 style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
-              <span>Attacks</span>
-              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#a8df23' }}>
-                {attackProgressSummary.done}/{attackProgressSummary.total} done
-              </span>
-            </h2>
-            <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '0.6rem', lineHeight: 1.4 }}>
-              <span style={{ color: '#4ade80' }}>●</span> block+dot{' '}
-              <span style={{ color: '#fbbf24' }}>●</span> block only{' '}
-              <span style={{ color: '#64748b' }}>●</span> pending
-            </div>
-            <button
-              className="btn"
-              onClick={seekNextPendingAttack}
-              style={{
-                width: '100%',
-                marginBottom: '0.65rem',
-                background: '#a8df23',
-                color: '#111',
-                border: 'none',
-                fontWeight: 700,
-                fontSize: '0.85rem',
-              }}
-              title="Jump to next attack still needing work"
-            >
-              Next pending attack
-              {attackProgressSummary.pending + attackProgressSummary.partial > 0
-                ? ` (${attackProgressSummary.pending + attackProgressSummary.partial} left)`
-                : ' ✓'}
-            </button>
-            <div style={{ overflowY: 'auto', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
-              {attackBlockProgress.length === 0 ? (
-                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>No attacks in XML yet.</div>
-              ) : (
-                attackBlockProgress.map((row) => {
-                  const isCurrent =
-                    state.currentFrame === row.attackFrame ||
-                    (row.blockFrame !== undefined && state.currentFrame === row.blockFrame);
-                  const statusColor =
-                    row.status === 'done' ? '#4ade80' : row.status === 'block_no_dot' ? '#fbbf24' : '#64748b';
-                  const statusLabel =
-                    row.status === 'done' ? 'done' : row.status === 'block_no_dot' ? 'no dot' : 'pending';
-                  return (
-                    <button
-                      key={`atk-${row.attackIndex}-${row.attackFrame}`}
-                      type="button"
-                      onClick={() => seekToFrame(row.status === 'block_no_dot' && row.blockFrame != null ? row.blockFrame : row.attackFrame)}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '0.5rem',
-                        width: '100%',
-                        textAlign: 'left',
-                        padding: '0.4rem 0.55rem',
-                        borderRadius: '8px',
-                        border: isCurrent ? '1px solid #a8df23' : '1px solid rgba(148,163,184,0.25)',
-                        background: isCurrent ? 'rgba(168,223,35,0.12)' : 'rgba(15,23,42,0.45)',
-                        color: '#e2e8f0',
-                        cursor: 'pointer',
-                        fontSize: '0.8rem',
-                      }}
-                      title={
-                        row.status === 'done'
-                          ? `Attack #${row.attackIndex} @ f${row.attackFrame} — block+dot done`
-                          : row.status === 'block_no_dot'
-                            ? `Attack #${row.attackIndex} — block at f${row.blockFrame}, click video for ball dot`
-                            : `Attack #${row.attackIndex} @ f${row.attackFrame} — press 7 then click for block+dot`
-                      }
-                    >
-                      <span
-                        style={{
-                          width: 8,
-                          height: 8,
-                          borderRadius: '50%',
-                          background: statusColor,
-                          flexShrink: 0,
-                        }}
-                      />
-                      <span style={{ fontWeight: 700, minWidth: '1.6rem' }}>#{row.attackIndex}</span>
-                      <span style={{ opacity: 0.85 }}>f{row.attackFrame}</span>
-                      <span style={{ marginLeft: 'auto', color: statusColor, fontWeight: 600, fontSize: '0.72rem' }}>
-                        {statusLabel}
-                      </span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        )}
 
         <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <h2>Annotations</h2>
