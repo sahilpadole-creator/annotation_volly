@@ -26,6 +26,18 @@ import {
   persistVnlFolder,
   storedFolderToAppState,
 } from './utils/vnlBrowserStorage';
+import {
+  buildAttackBlockProgress,
+  computeTouchBlockFolderKey,
+  findNextPendingAttackFrame,
+  findStoredTouchBlockItem,
+  getTouchBlockFolderLabelFromFiles,
+  loadActiveTouchBlockFolder,
+  loadTouchBlockFolder,
+  mergeTouchBlockEvents,
+  persistTouchBlockFolder,
+  storedTouchBlockFolderToAppState,
+} from './utils/touchBlockBrowserStorage';
 import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
 import { ensureGpuH264File, ensureBrowserPlayableViaWasm, looksLikeH264Filename } from './utils/videoPreview';
 import { getCachedH264 } from './utils/h264BrowserCache';
@@ -657,6 +669,9 @@ function App() {
   const vnlFolderKeyRef = useRef<string | null>(null);
   const vnlFolderLabelRef = useRef<string>('VNL folder');
   const [vnlAwaitingFolder, setVnlAwaitingFolder] = useState(false);
+  const touchBlockFolderKeyRef = useRef<string | null>(null);
+  const touchBlockFolderLabelRef = useRef<string>('Touch Block folder');
+  const [touchBlockAwaitingFolder, setTouchBlockAwaitingFolder] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [videoTranscoding, setVideoTranscoding] = useState(false);
   const videoTranscodingRef = useRef(false);
@@ -808,7 +823,7 @@ function App() {
     appModeRef.current = appMode;
   }, [appMode]);
 
-  // Restore last workflow (VNL annotations live in browser storage on GitHub Pages).
+  // Restore last workflow (VNL / Touch Block annotations live in browser storage on GitHub Pages).
   useEffect(() => {
     const savedMode = localStorage.getItem(APP_MODE_STORAGE_KEY);
     if (savedMode === 'vnl' && OFFLINE_REVIEW_ONLY) {
@@ -821,6 +836,19 @@ function App() {
         setState(restored);
         setAppMode('vnl');
         setVnlAwaitingFolder(true);
+        return;
+      }
+    }
+    if (savedMode === 'touch_block' && OFFLINE_REVIEW_ONLY) {
+      const folderSnapshot = loadActiveTouchBlockFolder();
+      if (folderSnapshot && folderSnapshot.playlist.length > 0) {
+        touchBlockFolderKeyRef.current = folderSnapshot.folderKey;
+        touchBlockFolderLabelRef.current = folderSnapshot.folderLabel;
+        const restored = storedTouchBlockFolderToAppState(folderSnapshot);
+        stateRef.current = restored;
+        setState(restored);
+        setAppMode('touch_block');
+        setTouchBlockAwaitingFolder(true);
         return;
       }
     }
@@ -942,6 +970,20 @@ function App() {
         setState(fromFolder);
         stateRef.current = fromFolder;
         setVnlAwaitingFolder(true);
+        setAppMode(mode);
+        localStorage.setItem(APP_MODE_STORAGE_KEY, mode);
+        return;
+      }
+    }
+    if (mode === 'touch_block' && OFFLINE_REVIEW_ONLY) {
+      const folderSnapshot = loadActiveTouchBlockFolder();
+      if (folderSnapshot && folderSnapshot.playlist.length > 0) {
+        touchBlockFolderKeyRef.current = folderSnapshot.folderKey;
+        touchBlockFolderLabelRef.current = folderSnapshot.folderLabel;
+        const fromFolder = storedTouchBlockFolderToAppState(folderSnapshot);
+        setState(fromFolder);
+        stateRef.current = fromFolder;
+        setTouchBlockAwaitingFolder(true);
         setAppMode(mode);
         localStorage.setItem(APP_MODE_STORAGE_KEY, mode);
         return;
@@ -1867,6 +1909,12 @@ function App() {
         playlist: currentPlaylist,
       });
     }
+    if (appMode === 'touch_block' && touchBlockFolderKeyRef.current) {
+      persistTouchBlockFolder(touchBlockFolderKeyRef.current, touchBlockFolderLabelRef.current, {
+        ...state,
+        playlist: currentPlaylist,
+      });
+    }
   }, [state, appMode]);
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
@@ -2038,12 +2086,20 @@ function App() {
     gpuFileReadyRef.current.clear();
 
     let vnlFolderSnapshot = null;
+    let touchBlockFolderSnapshot = null;
     if (workflowMode === 'vnl' && allVideoFiles.length > 0) {
       const folderKey = computeVnlFolderKey(allVideoFiles.map((f) => f.name));
       vnlFolderKeyRef.current = folderKey;
       vnlFolderLabelRef.current = getVnlFolderLabelFromFiles(allVideoFiles);
       vnlFolderSnapshot = loadVnlFolder(folderKey);
       setVnlAwaitingFolder(false);
+    }
+    if (workflowMode === 'touch_block' && allVideoFiles.length > 0) {
+      const folderKey = computeTouchBlockFolderKey(allVideoFiles.map((f) => f.name));
+      touchBlockFolderKeyRef.current = folderKey;
+      touchBlockFolderLabelRef.current = getTouchBlockFolderLabelFromFiles(allVideoFiles);
+      touchBlockFolderSnapshot = loadTouchBlockFolder(folderKey);
+      setTouchBlockAwaitingFolder(false);
     }
 
     const newPlaylistItems: PlaylistItem[] = await Promise.all(allVideoFiles.map(async (file) => {
@@ -2053,12 +2109,20 @@ function App() {
       );
       const storedItem = workflowMode === 'vnl'
         ? findStoredVnlItem(vnlFolderSnapshot, displayName)
-        : undefined;
+        : workflowMode === 'touch_block'
+          ? findStoredTouchBlockItem(touchBlockFolderSnapshot, displayName)
+          : undefined;
 
       let itemEvents = workflowMode === 'ball' ? [] : (existing?.events || storedItem?.events || []);
       let itemRally = existing?.rally || storedItem?.rally || { start_frame: null, end_frame: null };
-      const itemId = workflowMode === 'vnl' ? displayName : `${displayName}${file.lastModified}`;
-      const isNewUpload = workflowMode === 'vnl' ? !existing && !storedItem : (!existing || existing.id !== itemId);
+      const itemId =
+        workflowMode === 'vnl' || workflowMode === 'touch_block'
+          ? displayName
+          : `${displayName}${file.lastModified}`;
+      const isNewUpload =
+        workflowMode === 'vnl' || workflowMode === 'touch_block'
+          ? !existing && !storedItem
+          : (!existing || existing.id !== itemId);
       let isApplied = existing && !isNewUpload ? isItemAlgorithmApplied(existing, workflowMode) : false;
       if (workflowMode === 'vnl') {
         // VNL is manual annotation: never auto-infer. Restore browser-saved labels when re-opening folder.
@@ -2067,6 +2131,10 @@ function App() {
           itemEvents = storedItem.events;
           itemRally = storedItem.rally ?? itemRally;
         }
+      }
+      if (workflowMode === 'touch_block') {
+        isApplied = true;
+        if (storedItem?.rally) itemRally = storedItem.rally;
       }
       let itemPlayerBoxes = workflowMode === 'ball' ? {} : (existing?.playerBoxes || {});
       let itemRawJson = workflowMode === 'ball' ? undefined : (existing?.rawJsonString || undefined);
@@ -2089,15 +2157,29 @@ function App() {
       const jsonKey = matchAnnotationKey(Object.keys(parsedJsonAnnotations));
 
       if (isTouchFamilyMode(workflowMode) && parsedAnnotations[xmlKey]) {
-        if (!existing || (!isItemAlgorithmApplied(existing, workflowMode) && (!existing.events || existing.events.length === 0))) {
-          itemEvents = parsedAnnotations[xmlKey].events;
-          itemRally = parsedAnnotations[xmlKey].rally;
-          // GitHub / touch_block: imported XML is the skill source (manual block labeling).
+        if (
+          workflowMode === 'touch_block' ||
+          !existing ||
+          (!isItemAlgorithmApplied(existing, workflowMode) && (!existing.events || existing.events.length === 0))
+        ) {
+          const xmlEvents = parsedAnnotations[xmlKey].events as SkillEvent[];
+          const xmlRally = parsedAnnotations[xmlKey].rally;
+          if (workflowMode === 'touch_block') {
+            // Keep XML skills; merge browser-saved blocks + ball dots so refresh does not wipe work.
+            itemEvents = mergeTouchBlockEvents(xmlEvents, storedItem?.events || existing?.events);
+            itemRally = storedItem?.rally || existing?.rally || xmlRally;
+          } else {
+            itemEvents = xmlEvents;
+            itemRally = xmlRally;
+          }
           isApplied = OFFLINE_REVIEW_ONLY || workflowMode === 'touch_block';
         }
       } else if (isTouchFamilyMode(workflowMode) && (OFFLINE_REVIEW_ONLY || workflowMode === 'touch_block')) {
         // Manual skill / block annotation — MP4 only is allowed; XML preferred for touch_block.
         isApplied = true;
+        if (workflowMode === 'touch_block' && (storedItem?.events?.length || existing?.events?.length)) {
+          itemEvents = mergeTouchBlockEvents(itemEvents, storedItem?.events || existing?.events);
+        }
       } else if (workflowMode === 'vnl' && parsedAnnotations[xmlKey]) {
         // VNL is always manual: load XML if present, never queue inference.
         itemEvents = parsedAnnotations[xmlKey].events;
@@ -2168,17 +2250,26 @@ function App() {
       ? total
       : newPlaylistItems.filter((p) => isItemAlgorithmApplied(p, workflowMode)).length;
 
-    const syncIndex = workflowMode === 'vnl' && vnlFolderSnapshot
-      ? Math.min(
-          Math.max(0, vnlFolderSnapshot.currentPlaylistIndex),
-          Math.max(0, newPlaylistItems.length - 1),
-        )
-      : 0;
+    const syncIndex =
+      workflowMode === 'vnl' && vnlFolderSnapshot
+        ? Math.min(
+            Math.max(0, vnlFolderSnapshot.currentPlaylistIndex),
+            Math.max(0, newPlaylistItems.length - 1),
+          )
+        : workflowMode === 'touch_block' && touchBlockFolderSnapshot
+          ? Math.min(
+              Math.max(0, touchBlockFolderSnapshot.currentPlaylistIndex),
+              Math.max(0, newPlaylistItems.length - 1),
+            )
+          : 0;
     const syncItem = newPlaylistItems[syncIndex] ?? newPlaylistItems[0];
     const isRestoring = stateRef.current.videoMetadata?.filename === syncItem?.name;
-    const savedFrame = workflowMode === 'vnl' && vnlFolderSnapshot
-      ? (vnlFolderSnapshot.playlist[syncIndex]?.savedFrame ?? 0)
-      : (isRestoring ? stateRef.current.currentFrame : 0);
+    const savedFrame =
+      workflowMode === 'vnl' && vnlFolderSnapshot
+        ? (vnlFolderSnapshot.playlist[syncIndex]?.savedFrame ?? 0)
+        : workflowMode === 'touch_block' && touchBlockFolderSnapshot
+          ? (touchBlockFolderSnapshot.playlist[syncIndex]?.savedFrame ?? 0)
+          : (isRestoring ? stateRef.current.currentFrame : 0);
     const syncedState: AppState = {
       ...stateRef.current,
       playlist: newPlaylistItems,
@@ -2201,6 +2292,9 @@ function App() {
 
     if (workflowMode === 'vnl' && vnlFolderKeyRef.current) {
       persistVnlFolder(vnlFolderKeyRef.current, vnlFolderLabelRef.current, syncedState);
+    }
+    if (workflowMode === 'touch_block' && touchBlockFolderKeyRef.current) {
+      persistTouchBlockFolder(touchBlockFolderKeyRef.current, touchBlockFolderLabelRef.current, syncedState);
     }
 
     if (syncItem?.file) {
@@ -2544,6 +2638,28 @@ function App() {
       seekToFrame(prev);
     }
   }, [seekToFrame]);
+
+  const seekNextPendingAttack = useCallback(() => {
+    const next = findNextPendingAttackFrame(stateRef.current.events || [], stateRef.current.currentFrame);
+    if (next === null) {
+      window.alert('All attacks already have a block + ball contact dot.');
+      return;
+    }
+    seekToFrame(next);
+  }, [seekToFrame]);
+
+  const attackBlockProgress = useMemo(
+    () => (appMode === 'touch_block' ? buildAttackBlockProgress(state.events || []) : []),
+    [appMode, state.events],
+  );
+
+  const attackProgressSummary = useMemo(() => {
+    if (appMode !== 'touch_block') return null;
+    const done = attackBlockProgress.filter((p) => p.status === 'done').length;
+    const partial = attackBlockProgress.filter((p) => p.status === 'block_no_dot').length;
+    const pending = attackBlockProgress.filter((p) => p.status === 'pending').length;
+    return { total: attackBlockProgress.length, done, partial, pending };
+  }, [appMode, attackBlockProgress]);
 
   // Re-align playback when VNL inference metadata arrives (after batch) or preview source changes.
   useEffect(() => {
@@ -3908,8 +4024,27 @@ Enjoy using Veritas Pro!
                   lineHeight: 1.5,
                 }}
               >
-                Load match <strong>MP4 + XML</strong> (e.g. video-32608.mp4 + annotations_32608.xml). All skills stay visible.
-                Use <strong>← / →</strong> to jump attack ↔ attack, <strong>&lt; / &gt;</strong> for ±1 frame, press <strong>7</strong> to add <strong>block</strong>, then <strong>click the video</strong> to place the ball contact dot where the block happens.
+                Load match <strong>MP4 + XML</strong>. Skills are saved in this browser — after refresh, open the <strong>same folder</strong> again.
+                Use <strong>← / →</strong> for attacks, <strong>&lt; / &gt;</strong> for frames, <strong>7</strong> + <strong>click</strong> for block ball-dot.
+                Green = done (block+dot), yellow = block missing dot, gray = still needs block.
+              </div>
+            )}
+
+            {appMode === 'touch_block' && touchBlockAwaitingFolder && state.playlist.length > 0 && (
+              <div
+                style={{
+                  marginBottom: '1rem',
+                  maxWidth: '760px',
+                  padding: '0.75rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(251, 191, 36, 0.15)',
+                  border: '1px solid rgba(251, 191, 36, 0.45)',
+                  color: '#fde68a',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                }}
+              >
+                Restored {state.playlist.length} video(s) + your block annotations from browser storage — pick the same folder below to play videos.
               </div>
             )}
 
@@ -4945,6 +5080,16 @@ Enjoy using Veritas Pro!
                 Attack →
               </button>
             )}
+            {appMode === 'touch_block' && (
+              <button
+                className="btn"
+                onClick={seekNextPendingAttack}
+                title="Jump to next attack that still needs a block + ball dot"
+                style={{ background: '#a8df23', color: '#111', border: 'none', fontWeight: 700 }}
+              >
+                Next pending
+              </button>
+            )}
             <button 
               className="btn outline icon-only" 
               onMouseDown={() => startContinuousSeek(5)}
@@ -5390,6 +5535,99 @@ Enjoy using Veritas Pro!
             )}
           </div>
         </div>
+
+        {appMode === 'touch_block' && attackProgressSummary && (
+          <div className="glass-panel sidebar-section" style={{ maxHeight: '280px', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+            <h2 style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
+              <span>Attacks</span>
+              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#a8df23' }}>
+                {attackProgressSummary.done}/{attackProgressSummary.total} done
+              </span>
+            </h2>
+            <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '0.6rem', lineHeight: 1.4 }}>
+              <span style={{ color: '#4ade80' }}>●</span> block+dot{' '}
+              <span style={{ color: '#fbbf24' }}>●</span> block only{' '}
+              <span style={{ color: '#64748b' }}>●</span> pending
+            </div>
+            <button
+              className="btn"
+              onClick={seekNextPendingAttack}
+              style={{
+                width: '100%',
+                marginBottom: '0.65rem',
+                background: '#a8df23',
+                color: '#111',
+                border: 'none',
+                fontWeight: 700,
+                fontSize: '0.85rem',
+              }}
+              title="Jump to next attack still needing work"
+            >
+              Next pending attack
+              {attackProgressSummary.pending + attackProgressSummary.partial > 0
+                ? ` (${attackProgressSummary.pending + attackProgressSummary.partial} left)`
+                : ' ✓'}
+            </button>
+            <div style={{ overflowY: 'auto', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+              {attackBlockProgress.length === 0 ? (
+                <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>No attacks in XML yet.</div>
+              ) : (
+                attackBlockProgress.map((row) => {
+                  const isCurrent =
+                    state.currentFrame === row.attackFrame ||
+                    (row.blockFrame !== undefined && state.currentFrame === row.blockFrame);
+                  const statusColor =
+                    row.status === 'done' ? '#4ade80' : row.status === 'block_no_dot' ? '#fbbf24' : '#64748b';
+                  const statusLabel =
+                    row.status === 'done' ? 'done' : row.status === 'block_no_dot' ? 'no dot' : 'pending';
+                  return (
+                    <button
+                      key={`atk-${row.attackIndex}-${row.attackFrame}`}
+                      type="button"
+                      onClick={() => seekToFrame(row.status === 'block_no_dot' && row.blockFrame != null ? row.blockFrame : row.attackFrame)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        width: '100%',
+                        textAlign: 'left',
+                        padding: '0.4rem 0.55rem',
+                        borderRadius: '8px',
+                        border: isCurrent ? '1px solid #a8df23' : '1px solid rgba(148,163,184,0.25)',
+                        background: isCurrent ? 'rgba(168,223,35,0.12)' : 'rgba(15,23,42,0.45)',
+                        color: '#e2e8f0',
+                        cursor: 'pointer',
+                        fontSize: '0.8rem',
+                      }}
+                      title={
+                        row.status === 'done'
+                          ? `Attack #${row.attackIndex} @ f${row.attackFrame} — block+dot done`
+                          : row.status === 'block_no_dot'
+                            ? `Attack #${row.attackIndex} — block at f${row.blockFrame}, click video for ball dot`
+                            : `Attack #${row.attackIndex} @ f${row.attackFrame} — press 7 then click for block+dot`
+                      }
+                    >
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: '50%',
+                          background: statusColor,
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span style={{ fontWeight: 700, minWidth: '1.6rem' }}>#{row.attackIndex}</span>
+                      <span style={{ opacity: 0.85 }}>f{row.attackFrame}</span>
+                      <span style={{ marginLeft: 'auto', color: statusColor, fontWeight: 600, fontSize: '0.72rem' }}>
+                        {statusLabel}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
 
         <div className="glass-panel sidebar-section" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <h2>Annotations</h2>
