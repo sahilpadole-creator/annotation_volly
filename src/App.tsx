@@ -2786,13 +2786,16 @@ function App() {
     });
   };
 
-  const setVnlEventContactPoint = useCallback((xy: [number, number]) => {
+  const setEventContactPoint = useCallback((xy: [number, number], skillFilter?: SkillLabel) => {
     saveToHistory(stateRef.current);
     setState(prev => {
       const frame = prev.currentFrame;
-      if (!prev.events.some((e) => e.frame === frame)) return prev;
+      const target = prev.events.find((e) =>
+        e.frame === frame && (!skillFilter || e.skill === skillFilter),
+      );
+      if (!target) return prev;
       const events = prev.events.map((e) =>
-        e.frame === frame
+        e.frame === frame && (!skillFilter || e.skill === skillFilter)
           ? {
               ...e,
               xy,
@@ -2803,6 +2806,10 @@ function App() {
       return { ...prev, events };
     });
   }, []);
+
+  const setVnlEventContactPoint = useCallback((xy: [number, number]) => {
+    setEventContactPoint(xy);
+  }, [setEventContactPoint]);
 
   const handleVnlVideoClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (appModeRef.current !== 'vnl') return;
@@ -2816,6 +2823,24 @@ function App() {
     e.stopPropagation();
     setVnlEventContactPoint(xy);
   }, [setVnlEventContactPoint]);
+
+  /** Touch Skill Block Only: click video to place ball contact dot on the current block. */
+  const handleTouchBlockVideoClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (appModeRef.current !== 'touch_block') return;
+    const video = videoRef.current;
+    if (!video) return;
+    const frame = stateRef.current.currentFrame;
+    const hasBlock = stateRef.current.events.some((ev) => ev.frame === frame && ev.skill === 'block');
+    if (!hasBlock) {
+      window.alert('Press 7 to add a block on this frame first, then click the ball contact position.');
+      return;
+    }
+    const xy = getNormalizedVideoClick(video, e.clientX, e.clientY);
+    if (!xy) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setEventContactPoint(xy, 'block');
+  }, [setEventContactPoint]);
 
   const setRallyBound = (type: 'start' | 'end') => {
     setState(prev => ({
@@ -3390,12 +3415,27 @@ function App() {
     [appMode, state.events, state.currentFrame],
   );
 
+  const currentBlockEvent = useMemo(
+    () =>
+      appMode === 'touch_block'
+        ? state.events.find((e) => e.frame === state.currentFrame && e.skill === 'block')
+        : undefined,
+    [appMode, state.events, state.currentFrame],
+  );
+
   const currentVnlDotPosition = useMemo(() => {
     const video = videoRef.current;
     const container = video?.parentElement;
     if (!currentVnlEvent?.xy || !video || !container) return null;
     return normalizedVideoPointToContainerPercent(currentVnlEvent.xy, video, container);
   }, [currentVnlEvent, state.currentFrame, videoUrl]);
+
+  const currentBlockDotPosition = useMemo(() => {
+    const video = videoRef.current;
+    const container = video?.parentElement;
+    if (!currentBlockEvent?.xy || !video || !container) return null;
+    return normalizedVideoPointToContainerPercent(currentBlockEvent.xy, video, container);
+  }, [currentBlockEvent, state.currentFrame, videoUrl]);
 
   const vnlSyncWarning = useMemo(() => {
     if (appMode !== 'vnl') return null;
@@ -3765,7 +3805,7 @@ Enjoy using Veritas Pro!
               </div>
               <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Touch Skill Block Only</h3>
               <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
-                Load match video + XML (all skills shown). ←/→ jump attacks; &lt;/&gt; step frames; press 7 to add missing block labels for 7-class training.
+                Load match video + XML (all skills shown). ←/→ jump attacks; &lt;/&gt; step frames; press 7 to add block, then click the video to place the ball contact dot for 7-class training.
               </p>
             </div>
             
@@ -3869,7 +3909,7 @@ Enjoy using Veritas Pro!
                 }}
               >
                 Load match <strong>MP4 + XML</strong> (e.g. video-32608.mp4 + annotations_32608.xml). All skills stay visible.
-                Use <strong>← / →</strong> to jump attack ↔ attack, <strong>&lt; / &gt;</strong> for ±1 frame, and press <strong>7</strong> to add missing <strong>block</strong> labels for 7-class training.
+                Use <strong>← / →</strong> to jump attack ↔ attack, <strong>&lt; / &gt;</strong> for ±1 frame, press <strong>7</strong> to add <strong>block</strong>, then <strong>click the video</strong> to place the ball contact dot where the block happens.
               </div>
             )}
 
@@ -4618,6 +4658,22 @@ Enjoy using Veritas Pro!
                 }
               />
             )}
+            {appMode === 'touch_block' && (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: 7,
+                  cursor: currentBlockEvent ? 'crosshair' : 'default',
+                }}
+                onClick={handleTouchBlockVideoClick}
+                title={
+                  currentBlockEvent
+                    ? 'Click to set or move the ball contact dot for this block'
+                    : 'Press 7 to add block, then click where the ball is contacted'
+                }
+              />
+            )}
             {appMode === 'vnl' && currentVnlEvent?.xy && currentVnlDotPosition && (
               <div
                 style={{
@@ -4636,7 +4692,26 @@ Enjoy using Veritas Pro!
                 }}
               />
             )}
-            {showBoundingBoxes && state.videoMetadata && appMode !== 'vnl' && (
+            {appMode === 'touch_block' && currentBlockEvent?.xy && currentBlockDotPosition && (
+              <div
+                style={{
+                  position: 'absolute',
+                  left: `${currentBlockDotPosition.left}%`,
+                  top: `${currentBlockDotPosition.top}%`,
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  border: '2px solid white',
+                  background: 'var(--color-block, #a8df23)',
+                  transform: 'translate(-50%, -50%)',
+                  boxShadow: '0 0 12px rgba(168, 223, 35, 0.9)',
+                  pointerEvents: 'none',
+                  zIndex: 8,
+                }}
+                title="Block ball contact"
+              />
+            )}
+            {showBoundingBoxes && state.videoMetadata && appMode !== 'vnl' && appMode !== 'touch_block' && (
               <svg 
                 ref={svgRef}
                 style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'auto', zIndex: 5, cursor: interactionMode === 'zoom' ? 'zoom-in' : 'crosshair' }}
@@ -5288,7 +5363,8 @@ Enjoy using Veritas Pro!
                 <div><span className="hotkey">. / &gt;</span> Step forward 1 frame</div>
                 <div><span className="hotkey">Shift+, / Shift+.</span> Step ±5 frames</div>
                 <div><span className="hotkey">Space</span> Play / pause</div>
-                <div><span className="hotkey">7</span> Add Block (primary)</div>
+                <div><span className="hotkey">7</span> Add Block</div>
+                <div><span className="hotkey">Click</span> Place ball contact dot on block</div>
                 <div><span className="hotkey">1–6</span> Toss / Serve / Reception / Set / Dig / Attack</div>
                 <div><span className="hotkey">S / E</span> Start / End Rally</div>
                 <div><span className="hotkey">Del</span> Clear Frame</div>
@@ -5391,6 +5467,20 @@ Enjoy using Veritas Pro!
                         <td>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}>
                             <span className={`badge ${skillName}`} style={{ flexShrink: 0 }}>{skillName}</span>
+                            {event.xy && (
+                              <span
+                                title={`Ball contact @ (${event.xy[0].toFixed(3)}, ${event.xy[1].toFixed(3)})`}
+                                style={{
+                                  width: 10,
+                                  height: 10,
+                                  borderRadius: '50%',
+                                  background: skillName === 'block' ? 'var(--color-block)' : 'var(--primary)',
+                                  border: '1px solid white',
+                                  flexShrink: 0,
+                                  boxShadow: '0 0 4px rgba(255,255,255,0.5)',
+                                }}
+                              />
+                            )}
                             {event.player_id !== undefined && (
                                <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-attack)', flexShrink: 0 }}>ID: {event.player_id}</span>
                             )}

@@ -341,20 +341,35 @@ export const parseXMLAnnotations = (xmlString: string): ParsedAnnotations => {
         const matchedSkill = LABEL_TO_SKILL[normalized];
         if (matchedSkill) {
           let playerId: number | undefined = undefined;
+          let xy: [number, number] | undefined = undefined;
+          let xVal: number | undefined;
+          let yVal: number | undefined;
           const attributes = tags[j].getElementsByTagName("attribute");
           for (let k = 0; k < attributes.length; k++) {
-            if (attributes[k].getAttribute("name") === "player_id") {
-              const pid = parseInt(attributes[k].textContent || "", 10);
+            const attrName = attributes[k].getAttribute("name");
+            const attrText = attributes[k].textContent || "";
+            if (attrName === "player_id") {
+              const pid = parseInt(attrText, 10);
               if (!isNaN(pid)) playerId = pid;
+            } else if (attrName === "x") {
+              const x = Number(attrText);
+              if (Number.isFinite(x)) xVal = x;
+            } else if (attrName === "y") {
+              const y = Number(attrText);
+              if (Number.isFinite(y)) yVal = y;
             }
           }
-          
+          if (xVal !== undefined && yVal !== undefined) {
+            xy = [xVal, yVal];
+          }
+
           events.push({
             frame,
             skill: matchedSkill.label,
             class_id: matchedSkill.classId,
             confidence: 1.0,
-            player_id: playerId
+            player_id: playerId,
+            ...(xy ? { xy } : {}),
           });
         }
       }
