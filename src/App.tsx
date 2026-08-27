@@ -1979,12 +1979,12 @@ function App() {
     }
     if (
       OFFLINE_REVIEW_ONLY &&
-      workflowMode !== 'vnl' &&
+      workflowMode === 'ball' &&
       Object.keys(parsedAnnotations).length === 0 &&
       Object.keys(parsedJsonAnnotations).length === 0
     ) {
       window.alert(
-        "No XML or JSON annotations were found. The videos will open without predictions; no inference runs on the hosted website.",
+        "No XML or JSON ball-tracking predictions were found in this ZIP. Upload a prediction ZIP with matching video + JSON/XML, or use Ball Tracking on the local tool first.",
       );
     }
 
@@ -3732,7 +3732,7 @@ Enjoy using Veritas Pro!
               </div>
             )}
 
-            {OFFLINE_REVIEW_ONLY && appMode !== 'vnl' && (
+            {OFFLINE_REVIEW_ONLY && appMode !== 'vnl' && appMode !== 'touch' && (
               <div
                 style={{
                   marginBottom: '1.5rem',
@@ -3748,6 +3748,25 @@ Enjoy using Veritas Pro!
                 }}
               >
                 Review-only website: inference is disabled. Upload predictions made on the local tool, correct them, then download the updated ZIP/XML.
+              </div>
+            )}
+
+            {OFFLINE_REVIEW_ONLY && appMode === 'touch' && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  maxWidth: '720px',
+                  padding: '0.85rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(59, 130, 246, 0.12)',
+                  border: '1px solid rgba(59, 130, 246, 0.35)',
+                  color: '#bfdbfe',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                Manual skill annotation on GitHub — open your rally MP4 folder. XML/JSON is optional (use it only if you already have predictions to review).
               </div>
             )}
 
@@ -3953,7 +3972,7 @@ Enjoy using Veritas Pro!
             <Upload size={18} />
           </div>
           <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.25rem 0', color: 'white' }}>
-            {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
+            {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch')
               ? 'Open Video Folder'
               : OFFLINE_REVIEW_ONLY
                 ? 'Upload Prediction ZIP'
@@ -3962,14 +3981,16 @@ Enjoy using Veritas Pro!
           <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.8rem' }}>
             {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
               ? <>Select the <strong>same folder</strong> of rally MP4s. Skills you label are kept in browser storage across refresh.</>
+              : OFFLINE_REVIEW_ONLY && appMode === 'touch'
+                ? <>Select a folder of rally <strong>MP4s</strong> to annotate skills manually. XML/JSON not required.</>
               : OFFLINE_REVIEW_ONLY
                 ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
                 : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
           </p>
-          {OFFLINE_REVIEW_ONLY && appMode === 'vnl' ? (
+          {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch') ? (
             <>
               <input
-                id="vnl-folder-input"
+                id="manual-folder-input"
                 type="file"
                 multiple
                 accept="video/mp4,.mp4"
@@ -3984,7 +4005,7 @@ Enjoy using Veritas Pro!
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  document.getElementById('vnl-folder-input')?.click();
+                  document.getElementById('manual-folder-input')?.click();
                 }}
               >
                 Choose video folder
