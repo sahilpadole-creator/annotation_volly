@@ -5204,6 +5204,23 @@ Enjoy using Veritas Pro!
             {appMode === 'touch_block' && (
               <button
                 className="btn"
+                onClick={() =>
+                  addEvent({ label: 'block', classId: SKILL_CLASS_IDS.block })
+                }
+                title="Add Block on current frame (hotkey 7), then click video for ball contact dot"
+                style={{
+                  background: 'var(--color-block, #ef4444)',
+                  color: '#fff',
+                  border: 'none',
+                  fontWeight: 700,
+                }}
+              >
+                Block
+              </button>
+            )}
+            {appMode === 'touch_block' && (
+              <button
+                className="btn"
                 onClick={seekNextPendingAttack}
                 title="Jump to next attack that still needs a block + ball dot"
                 style={{ background: '#a8df23', color: '#111', border: 'none', fontWeight: 700 }}
