@@ -16,6 +16,15 @@ import {
   type WorkflowMode,
 } from './utils/workflowMode';
 import { VNL_LABEL_DEFS } from './utils/vnlAnnotation';
+import {
+  computeVnlFolderKey,
+  findStoredVnlItem,
+  getVnlFolderLabelFromFiles,
+  loadActiveVnlFolder,
+  loadVnlFolder,
+  persistVnlFolder,
+  storedFolderToAppState,
+} from './utils/vnlBrowserStorage';
 import { applySixSkillPostprocess, SKILL_CLASS_IDS } from './utils/skillPostprocess';
 import { ensureGpuH264File, ensureBrowserPlayableViaWasm, looksLikeH264Filename } from './utils/videoPreview';
 import VolleyballParticles from './components/VolleyballParticles';
@@ -643,6 +652,9 @@ function App() {
   const videoUrlRef = useRef<string>('');
   const videoFileKeyRef = useRef<string>('');
   const gpuFileReadyRef = useRef<Map<string, File>>(new Map());
+  const vnlFolderKeyRef = useRef<string | null>(null);
+  const vnlFolderLabelRef = useRef<string>('VNL folder');
+  const [vnlAwaitingFolder, setVnlAwaitingFolder] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [videoTranscoding, setVideoTranscoding] = useState(false);
   const videoTranscodingRef = useRef(false);
@@ -770,6 +782,28 @@ function App() {
     appModeRef.current = appMode;
   }, [appMode]);
 
+  // Restore last workflow (VNL annotations live in browser storage on GitHub Pages).
+  useEffect(() => {
+    const savedMode = localStorage.getItem(APP_MODE_STORAGE_KEY);
+    if (savedMode === 'vnl' && OFFLINE_REVIEW_ONLY) {
+      const folderSnapshot = loadActiveVnlFolder();
+      if (folderSnapshot && folderSnapshot.playlist.length > 0) {
+        vnlFolderKeyRef.current = folderSnapshot.folderKey;
+        vnlFolderLabelRef.current = folderSnapshot.folderLabel;
+        const restored = storedFolderToAppState(folderSnapshot);
+        stateRef.current = restored;
+        setState(restored);
+        setAppMode('vnl');
+        setVnlAwaitingFolder(true);
+        return;
+      }
+    }
+    if (savedMode === 'touch' || savedMode === 'ball' || savedMode === 'vnl') {
+      switchWorkflowMode(savedMode);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     touchDetectorRef.current = touchDetector;
   }, [touchDetector]);
@@ -873,6 +907,20 @@ function App() {
     clearVideoUrl();
 
     const restored = loadWorkflowState(mode);
+    if (mode === 'vnl' && OFFLINE_REVIEW_ONLY) {
+      const folderSnapshot = loadActiveVnlFolder();
+      if (folderSnapshot && folderSnapshot.playlist.length > 0) {
+        vnlFolderKeyRef.current = folderSnapshot.folderKey;
+        vnlFolderLabelRef.current = folderSnapshot.folderLabel;
+        const fromFolder = storedFolderToAppState(folderSnapshot);
+        setState(fromFolder);
+        stateRef.current = fromFolder;
+        setVnlAwaitingFolder(true);
+        setAppMode(mode);
+        localStorage.setItem(APP_MODE_STORAGE_KEY, mode);
+        return;
+      }
+    }
     if (restored) {
       setState(restored);
     } else {
@@ -1782,6 +1830,13 @@ function App() {
       ...state,
       playlist: currentPlaylist,
     });
+
+    if (OFFLINE_REVIEW_ONLY && appMode === 'vnl' && vnlFolderKeyRef.current) {
+      persistVnlFolder(vnlFolderKeyRef.current, vnlFolderLabelRef.current, {
+        ...state,
+        playlist: currentPlaylist,
+      });
+    }
   }, [state, appMode]);
 
   const loadVideoIntoPlayer = (item: PlaylistItem) => {
@@ -1924,6 +1979,7 @@ function App() {
     }
     if (
       OFFLINE_REVIEW_ONLY &&
+      workflowMode !== 'vnl' &&
       Object.keys(parsedAnnotations).length === 0 &&
       Object.keys(parsedJsonAnnotations).length === 0
     ) {
@@ -1934,23 +1990,42 @@ function App() {
 
     gpuFileReadyRef.current.clear();
 
+    let vnlFolderSnapshot = null;
+    if (workflowMode === 'vnl' && allVideoFiles.length > 0) {
+      const folderKey = computeVnlFolderKey(allVideoFiles.map((f) => f.name));
+      vnlFolderKeyRef.current = folderKey;
+      vnlFolderLabelRef.current = getVnlFolderLabelFromFiles(allVideoFiles);
+      vnlFolderSnapshot = loadVnlFolder(folderKey);
+      setVnlAwaitingFolder(false);
+    }
+
     const newPlaylistItems: PlaylistItem[] = await Promise.all(allVideoFiles.map(async (file) => {
-      const displayName = file.name;
-      let existing = stateRef.current.playlist.find((p) => p.name === displayName);
-      
-      let itemEvents = workflowMode === 'ball' ? [] : (existing?.events || []);
-      let itemRally = existing?.rally || { start_frame: null, end_frame: null };
-      const fileId = file.name + file.lastModified;
-      const isNewUpload = !existing || existing.id !== fileId;
+      const displayName = file.name.replace(/^.*[/\\]/, '') || file.name;
+      let existing = stateRef.current.playlist.find(
+        (p) => p.name === displayName || p.name.replace(/^.*[/\\]/, '') === displayName,
+      );
+      const storedItem = workflowMode === 'vnl'
+        ? findStoredVnlItem(vnlFolderSnapshot, displayName)
+        : undefined;
+
+      let itemEvents = workflowMode === 'ball' ? [] : (existing?.events || storedItem?.events || []);
+      let itemRally = existing?.rally || storedItem?.rally || { start_frame: null, end_frame: null };
+      const itemId = workflowMode === 'vnl' ? displayName : `${displayName}${file.lastModified}`;
+      const isNewUpload = workflowMode === 'vnl' ? !existing && !storedItem : (!existing || existing.id !== itemId);
       let isApplied = existing && !isNewUpload ? isItemAlgorithmApplied(existing, workflowMode) : false;
       if (workflowMode === 'vnl') {
-        // VNL is manual annotation: never auto-infer. Keep existing events if re-uploading.
-        isApplied = true;
-        if (isNewUpload) itemEvents = [];
+        // VNL is manual annotation: never auto-infer. Restore browser-saved labels when re-opening folder.
+        isApplied = (itemEvents.length > 0) || !!storedItem || !!existing;
+        if (storedItem?.events?.length) {
+          itemEvents = storedItem.events;
+          itemRally = storedItem.rally ?? itemRally;
+        }
       }
       let itemPlayerBoxes = workflowMode === 'ball' ? {} : (existing?.playerBoxes || {});
       let itemRawJson = workflowMode === 'ball' ? undefined : (existing?.rawJsonString || undefined);
-      let itemManualActions = workflowMode === 'ball' ? [] : (existing?.manualActions || []);
+      let itemManualActions = workflowMode === 'ball'
+        ? []
+        : (existing?.manualActions || storedItem?.manualActions || []);
       let jsonFps: number | undefined = undefined;
 
       const nativeFps = await detectVideoFps(file);
@@ -2024,7 +2099,7 @@ function App() {
       }
 
       return {
-        id: displayName + file.lastModified,
+        id: itemId,
         name: displayName,
         file,
         events: itemEvents,
@@ -2049,13 +2124,21 @@ function App() {
       ? total
       : newPlaylistItems.filter((p) => isItemAlgorithmApplied(p, workflowMode)).length;
 
-    const syncItem = newPlaylistItems[0];
+    const syncIndex = workflowMode === 'vnl' && vnlFolderSnapshot
+      ? Math.min(
+          Math.max(0, vnlFolderSnapshot.currentPlaylistIndex),
+          Math.max(0, newPlaylistItems.length - 1),
+        )
+      : 0;
+    const syncItem = newPlaylistItems[syncIndex] ?? newPlaylistItems[0];
     const isRestoring = stateRef.current.videoMetadata?.filename === syncItem?.name;
-    const savedFrame = isRestoring ? stateRef.current.currentFrame : 0;
+    const savedFrame = workflowMode === 'vnl' && vnlFolderSnapshot
+      ? (vnlFolderSnapshot.playlist[syncIndex]?.savedFrame ?? 0)
+      : (isRestoring ? stateRef.current.currentFrame : 0);
     const syncedState: AppState = {
       ...stateRef.current,
       playlist: newPlaylistItems,
-      currentPlaylistIndex: 0,
+      currentPlaylistIndex: syncIndex,
       videoMetadata: syncItem?.videoMetadata || {
         filename: syncItem?.name ?? '',
         fps: 30,
@@ -2071,6 +2154,10 @@ function App() {
     };
     stateRef.current = syncedState;
     setState(syncedState);
+
+    if (workflowMode === 'vnl' && vnlFolderKeyRef.current) {
+      persistVnlFolder(vnlFolderKeyRef.current, vnlFolderLabelRef.current, syncedState);
+    }
 
     if (syncItem?.file) {
       if (OFFLINE_REVIEW_ONLY) {
@@ -3621,7 +3708,31 @@ Enjoy using Veritas Pro!
               </div>
             )}
 
-            {OFFLINE_REVIEW_ONLY && (
+            {OFFLINE_REVIEW_ONLY && appMode === 'vnl' && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  maxWidth: '720px',
+                  padding: '0.85rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(139, 92, 246, 0.12)',
+                  border: '1px solid rgba(139, 92, 246, 0.35)',
+                  color: '#ddd6fe',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                Labels are saved in this browser. After refresh, open the <strong>same video folder</strong> again — your skill annotations will reload automatically.
+                {vnlAwaitingFolder && state.playlist.length > 0 && (
+                  <div style={{ marginTop: '0.5rem', color: '#fbbf24' }}>
+                    Restored {state.playlist.length} video(s) from browser storage — pick the folder below to play videos.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {OFFLINE_REVIEW_ONLY && appMode !== 'vnl' && (
               <div
                 style={{
                   marginBottom: '1.5rem',
@@ -3842,13 +3953,44 @@ Enjoy using Veritas Pro!
             <Upload size={18} />
           </div>
           <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.25rem 0', color: 'white' }}>
-            {OFFLINE_REVIEW_ONLY ? 'Upload Prediction ZIP' : 'Upload Local Files'}
+            {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
+              ? 'Open Video Folder'
+              : OFFLINE_REVIEW_ONLY
+                ? 'Upload Prediction ZIP'
+                : 'Upload Local Files'}
           </h2>
           <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.8rem' }}>
-            {OFFLINE_REVIEW_ONLY
-              ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
-              : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
+            {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
+              ? <>Select the <strong>same folder</strong> of rally MP4s. Skills you label are kept in browser storage across refresh.</>
+              : OFFLINE_REVIEW_ONLY
+                ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
+                : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
           </p>
+          {OFFLINE_REVIEW_ONLY && appMode === 'vnl' ? (
+            <>
+              <input
+                id="vnl-folder-input"
+                type="file"
+                multiple
+                accept="video/mp4,.mp4"
+                onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
+                style={{ display: 'none' }}
+                {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+              />
+              <button
+                type="button"
+                className="btn"
+                style={{ marginTop: '0.75rem' }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  document.getElementById('vnl-folder-input')?.click();
+                }}
+              >
+                Choose video folder
+              </button>
+            </>
+          ) : (
           <input
             type="file"
             accept={OFFLINE_REVIEW_ONLY ? "application/zip,.zip" : "video/mp4,application/zip,.zip,application/xml,text/xml,.xml,application/json,.json"}
@@ -3856,6 +3998,7 @@ Enjoy using Veritas Pro!
             onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
             style={{ display: 'none' }}
           />
+          )}
         </label>
 
         {/* FEATURE CARDS (Replaces old Documentation list) */}
