@@ -3,8 +3,8 @@
 const DB_NAME = 'veritas_h264_cache';
 const DB_VERSION = 1;
 const STORE = 'videos';
-/** Soft cap — drop oldest entries when total size exceeds this. */
-const MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
+/** How many oldest clips to drop when the browser reports storage quota full. */
+const QUOTA_EVICT_BATCH = 8;
 
 export function h264CacheKey(file: File): string {
   const base = file.name.replace(/^.*[/\\]/, '');
@@ -72,46 +72,85 @@ export async function getCachedH264(file: File): Promise<File | null> {
   }
 }
 
-async function enforceCacheBudget(store: IDBObjectStore): Promise<void> {
+function isQuotaError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as DOMException;
+  return e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED';
+}
+
+/** Drop oldest cached clips — only used when the browser disk quota is full. */
+async function evictOldest(count: number): Promise<number> {
+  const db = await openDb();
   const all = await new Promise<CacheRecord[]>((resolve, reject) => {
-    const req = store.getAll();
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
     req.onsuccess = () => resolve((req.result as CacheRecord[]) || []);
     req.onerror = () => reject(req.error);
   });
-  let total = all.reduce((sum, r) => sum + (r.blob?.size || 0), 0);
-  if (total <= MAX_CACHE_BYTES) return;
+  if (all.length === 0) return 0;
   all.sort((a, b) => a.createdAt - b.createdAt);
-  for (const rec of all) {
-    if (total <= MAX_CACHE_BYTES) break;
-    store.delete(rec.key);
-    total -= rec.blob?.size || 0;
-  }
+  const toDelete = all.slice(0, Math.min(count, all.length));
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    for (const rec of toDelete) store.delete(rec.key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB evict failed'));
+  });
+  return toDelete.length;
 }
 
+async function putRecord(record: CacheRecord): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB put failed'));
+  });
+}
+
+/**
+ * Cache converted H.264 with no app-side size cap (supports large match folders, e.g. 6–8GB+).
+ * Only evicts oldest clips if the browser reports QuotaExceededError.
+ */
 export async function putCachedH264(source: File, converted: File): Promise<void> {
+  const key = h264CacheKey(source);
+  const record: CacheRecord = {
+    key,
+    name: source.name.replace(/^.*[/\\]/, ''),
+    size: source.size,
+    lastModified: source.lastModified,
+    outFilename: converted.name,
+    blob: converted,
+    createdAt: Date.now(),
+  };
+
   try {
-    const key = h264CacheKey(source);
-    const record: CacheRecord = {
-      key,
-      name: source.name.replace(/^.*[/\\]/, ''),
-      size: source.size,
-      lastModified: source.lastModified,
-      outFilename: converted.name,
-      blob: converted,
-      createdAt: Date.now(),
-    };
-    const db = await openDb();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      store.put(record);
-      void enforceCacheBudget(store);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error('IndexedDB put failed'));
-    });
+    await putRecord(record);
+    return;
   } catch (err) {
-    console.warn('[h264 cache] write failed', err);
+    if (!isQuotaError(err)) {
+      console.warn('[h264 cache] write failed', err);
+      return;
+    }
   }
+
+  // Browser disk full for this origin — free space by dropping oldest, then retry a few times.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const removed = await evictOldest(QUOTA_EVICT_BATCH);
+      if (removed === 0) break;
+      await putRecord(record);
+      return;
+    } catch (err) {
+      if (!isQuotaError(err)) {
+        console.warn('[h264 cache] write failed after eviction', err);
+        return;
+      }
+    }
+  }
+  console.warn('[h264 cache] browser storage quota full; could not save converted clip');
 }
 
 /** Quick check used when opening a playlist — restore cached H.264 without re-encoding. */
