@@ -1,9 +1,10 @@
 import type { AppState, PlaylistItem } from '../types';
 
-export type WorkflowMode = 'touch' | 'ball' | 'vnl';
+export type WorkflowMode = 'touch' | 'touch_block' | 'ball' | 'vnl';
 
 export const WORKFLOW_STORAGE_KEYS: Record<WorkflowMode, string> = {
   touch: 'volleyball_annotations_touch',
+  touch_block: 'volleyball_annotations_touch_block',
   ball: 'volleyball_annotations_ball',
   vnl: 'volleyball_annotations_vnl',
 };
@@ -23,10 +24,17 @@ export const EMPTY_APP_STATE: AppState = {
 };
 
 export function workflowFromAppMode(
-  appMode: 'home' | 'touch' | 'ball' | 'block_clip' | 'vnl',
+  appMode: 'home' | 'touch' | 'touch_block' | 'ball' | 'block_clip' | 'vnl',
 ): WorkflowMode | null {
-  if (appMode === 'touch' || appMode === 'ball' || appMode === 'vnl') return appMode;
+  if (appMode === 'touch' || appMode === 'touch_block' || appMode === 'ball' || appMode === 'vnl') {
+    return appMode;
+  }
   return null;
+}
+
+/** Touch-family modes share skill XML import/export (touch + touch_block). */
+export function isTouchFamilyMode(mode: WorkflowMode | string | null | undefined): boolean {
+  return mode === 'touch' || mode === 'touch_block';
 }
 
 export function isItemAlgorithmApplied(item: PlaylistItem, mode: WorkflowMode): boolean {

@@ -20,10 +20,22 @@ export const normalizeAnnotationStem = (stem: string): string => {
   const normalized = name
     .replace(/^annotations_/, '')
     .replace(/^ball_tracking_/, '')
+    .replace(/^video[-_]/i, '')
     .replace(/_updated$/, '')
     .replace(/_ball_tracking$/, '')
     .replace(/_skill_annotations$/, '');
   return `${path}${normalized}`;
+};
+
+/** Match video stems like video-32608 to annotation stems like 32608 / annotations_32608. */
+export const annotationKeysMatch = (videoStem: string, annotationStem: string): boolean => {
+  const a = normalizeAnnotationStem(videoStem).toLowerCase();
+  const b = normalizeAnnotationStem(annotationStem).toLowerCase();
+  if (a === b) return true;
+  if (a.endsWith(b) || b.endsWith(a)) return true;
+  const aId = a.match(/(\d{3,})$/)?.[1];
+  const bId = b.match(/(\d{3,})$/)?.[1];
+  return !!aId && !!bId && aId === bId;
 };
 
 const cloneBallBoxes = (boxes: Record<number, PlayerBox[]>): Record<number, PlayerBox[]> => {

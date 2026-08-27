@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Upload, Download, Settings, Trash2, AlertTriangle, AlertCircle, FileVideo, ArrowRight, ArrowLeft, CheckCircle, Eye, EyeOff, Maximize, Minimize, MousePointer2, Search, Pencil, Zap } from 'lucide-react';
 import type { AppState, SkillLabel, PlaylistItem, SkillEvent, PlayerBox, InferenceVideoMeta, Rally, VideoMetadata } from './types';
-import { exportAllToZip, generateXMLString, getXmlExportFilename, getBatchZipFilename, normalizeAnnotationStem } from './utils/exportUtils';
+import { exportAllToZip, generateXMLString, getXmlExportFilename, getBatchZipFilename, normalizeAnnotationStem, annotationKeysMatch } from './utils/exportUtils';
 import { detectVideoFps } from './utils/fpsUtils';
 import { applyBallPostprocess } from './utils/ballPostprocess';
 import { parseZIPAnnotations, parseXMLAnnotations, parseJSONAnnotations, extendPlayerBoxesToFrameCount } from './utils/importUtils';
@@ -9,6 +9,7 @@ import {
   APP_MODE_STORAGE_KEY,
   EMPTY_APP_STATE,
   isItemAlgorithmApplied,
+  isTouchFamilyMode,
   loadWorkflowState,
   persistWorkflowState,
   withAlgorithmApplied,
@@ -353,7 +354,7 @@ const getBallPlaybackTiming = (
 };
 
 const getTimingForMode = (
-  appMode: 'home' | 'touch' | 'ball' | 'block_clip' | 'vnl',
+  appMode: 'home' | 'touch' | 'touch_block' | 'ball' | 'block_clip' | 'vnl',
   meta: { fps: number; frame_count: number; width: number; height: number; duration?: number } | null | undefined,
   inferenceMeta?: InferenceVideoMeta,
 ) => {
@@ -531,7 +532,7 @@ function App() {
   const [batchProgress, setBatchProgress] = useState({ isRunning: false, completed: 0, total: 0, lastFps: 0, avgTimeSec: 0 });
   const [includeMp4InZip, setIncludeMp4InZip] = useState(false);
   const [inferenceEngine, setInferenceEngine] = useState<"slowfast" | "yolo">("slowfast");
-  const [appMode, setAppMode] = useState<'home' | 'touch' | 'ball' | 'block_clip' | 'vnl'>('home');
+  const [appMode, setAppMode] = useState<'home' | 'touch' | 'touch_block' | 'ball' | 'block_clip' | 'vnl'>('home');
   const googleTokenRef = useRef<string | null>(null);
   
   const [state, setState] = useState<AppState>({
@@ -823,7 +824,7 @@ function App() {
         return;
       }
     }
-    if (savedMode === 'touch' || savedMode === 'ball' || savedMode === 'vnl') {
+    if (savedMode === 'touch' || savedMode === 'touch_block' || savedMode === 'ball' || savedMode === 'vnl') {
       switchWorkflowMode(savedMode);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -893,7 +894,7 @@ function App() {
       setBackendHealth(null);
       return;
     }
-    if (appMode !== 'touch' && appMode !== 'ball' && appMode !== 'vnl') return;
+    if (appMode !== 'touch' && appMode !== 'touch_block' && appMode !== 'ball' && appMode !== 'vnl') return;
     fetch(`${INFERENCE_API_BASE}/api/health`)
       .then((res) => (res.ok ? res.json() : null))
       .then((health) => {
@@ -1348,7 +1349,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (OFFLINE_REVIEW_ONLY || appModeRef.current === 'vnl') {
+    if (OFFLINE_REVIEW_ONLY || appModeRef.current === 'vnl' || appModeRef.current === 'touch_block') {
       if (batchProgress.isRunning) {
         processingRef.current = false;
         setBatchProgress((prev) => ({ ...prev, isRunning: false }));
@@ -1374,7 +1375,12 @@ function App() {
           // Automatically download the batch ZIP when finished!
           const annotated = currentPlaylist.filter((p) => isItemAlgorithmApplied(p, workflowMode));
           if (annotated.length > 0) {
-            exportAllToZip(annotated, true, includeMp4InZip, workflowMode).then(blob => {
+            exportAllToZip(
+              annotated,
+              true,
+              includeMp4InZip,
+              workflowMode === 'ball' ? 'ball' : workflowMode === 'vnl' ? 'vnl' : 'touch',
+            ).then(blob => {
               if (blob && googleTokenRef.current) {
                 const metadata = { name: `${getBatchZipFilename(workflowMode).replace('.zip', '')}_${Date.now()}.zip`, mimeType: 'application/zip' };
                 const form = new FormData();
@@ -1834,8 +1840,7 @@ function App() {
 
   // Autosave per workflow mode (touch and ball stay isolated)
   useEffect(() => {
-    if (appMode !== 'touch' && appMode !== 'ball' && appMode !== 'vnl') return;
-    if (state.playlist.length === 0 && !state.videoMetadata) return;
+    if (appMode !== 'touch' && appMode !== 'touch_block' && appMode !== 'ball' && appMode !== 'vnl') return;
 
     console.log(`[DEBUG] state.events changed! Length: ${state.events.length}`);
     const currentPlaylist = [...state.playlist];
@@ -1968,7 +1973,13 @@ function App() {
     if (!files || files.length === 0) return;
 
     const workflowMode: WorkflowMode =
-      appModeRef.current === 'ball' ? 'ball' : appModeRef.current === 'vnl' ? 'vnl' : 'touch';
+      appModeRef.current === 'ball'
+        ? 'ball'
+        : appModeRef.current === 'vnl'
+          ? 'vnl'
+          : appModeRef.current === 'touch_block'
+            ? 'touch_block'
+            : 'touch';
     
     const fileArray = Array.from(files);
     const videoFiles = fileArray.filter(f => f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mp4'));
@@ -2069,33 +2080,23 @@ function App() {
       const stem = file.name.replace(/\.[^/.]+$/, '');
       const matchAnnotationKey = (keys: string[]): string => {
         if (keys.includes(stem)) return stem;
-        const stemBase = stem.split('/').pop() || stem;
-        const found = keys.find((k) => {
-          const kBase = k.split('/').pop() || k;
-          return (
-            k === stem ||
-            kBase === stem ||
-            kBase === stemBase ||
-            k.startsWith(stem + '_') ||
-            stem.startsWith(k + '_') ||
-            kBase.startsWith(stemBase + '_') ||
-            stemBase.startsWith(kBase + '_')
-          );
-        });
+        const stemNorm = normalizeAnnotationStem(stem);
+        if (keys.includes(stemNorm)) return stemNorm;
+        const found = keys.find((k) => annotationKeysMatch(stem, k));
         return found || stem;
       };
       const xmlKey = matchAnnotationKey(Object.keys(parsedAnnotations));
       const jsonKey = matchAnnotationKey(Object.keys(parsedJsonAnnotations));
 
-      if (workflowMode === 'touch' && parsedAnnotations[xmlKey]) {
+      if (isTouchFamilyMode(workflowMode) && parsedAnnotations[xmlKey]) {
         if (!existing || (!isItemAlgorithmApplied(existing, workflowMode) && (!existing.events || existing.events.length === 0))) {
           itemEvents = parsedAnnotations[xmlKey].events;
           itemRally = parsedAnnotations[xmlKey].rally;
-          // GitHub Pages is review-only: imported XML is the prediction source.
-          isApplied = OFFLINE_REVIEW_ONLY;
+          // GitHub / touch_block: imported XML is the skill source (manual block labeling).
+          isApplied = OFFLINE_REVIEW_ONLY || workflowMode === 'touch_block';
         }
-      } else if (workflowMode === 'touch' && OFFLINE_REVIEW_ONLY) {
-        // Manual skill annotation on GitHub — MP4 only, no XML required.
+      } else if (isTouchFamilyMode(workflowMode) && (OFFLINE_REVIEW_ONLY || workflowMode === 'touch_block')) {
+        // Manual skill / block annotation — MP4 only is allowed; XML preferred for touch_block.
         isApplied = true;
       } else if (workflowMode === 'vnl' && parsedAnnotations[xmlKey]) {
         // VNL is always manual: load XML if present, never queue inference.
@@ -2122,7 +2123,7 @@ function App() {
         itemManualActions = alignManualActionsToEvents(itemManualActions, itemEvents, 5);
       }
 
-      if (workflowMode === 'touch' && parsedJsonAnnotations[jsonKey]) {
+      if (isTouchFamilyMode(workflowMode) && parsedJsonAnnotations[jsonKey]) {
         const parsedResult = itemManualActions.length > 0 
           ? parseJSONAnnotations(parsedJsonAnnotations[jsonKey].rawJsonString, itemManualActions)
           : parsedJsonAnnotations[jsonKey];
@@ -2151,9 +2152,9 @@ function App() {
         inferenceBallBoxes: workflowMode === 'ball' ? cloneBallBoxes(itemPlayerBoxes) : existing?.inferenceBallBoxes,
         rawJsonString: itemRawJson,
         manualActions: itemManualActions,
-        isTouchAlgorithmApplied: workflowMode === 'touch' ? isApplied : existing?.isTouchAlgorithmApplied,
+        isTouchAlgorithmApplied: isTouchFamilyMode(workflowMode) ? isApplied : existing?.isTouchAlgorithmApplied,
         isBallAlgorithmApplied: workflowMode === 'ball' ? isApplied : existing?.isBallAlgorithmApplied,
-        isSkillAlgorithmApplied: workflowMode === 'touch' ? isApplied : existing?.isSkillAlgorithmApplied,
+        isSkillAlgorithmApplied: isTouchFamilyMode(workflowMode) ? isApplied : existing?.isSkillAlgorithmApplied,
         isVnlAlgorithmApplied: workflowMode === 'vnl' ? isApplied : existing?.isVnlAlgorithmApplied,
         videoMetadata: newVideoMetadata,
         isCompleted: existing?.isCompleted || false
@@ -2264,7 +2265,11 @@ function App() {
 
     if (total > 0) {
       processingRef.current = false;
-      const runBatch = workflowMode !== 'vnl' && !OFFLINE_REVIEW_ONLY && completed < total;
+      const runBatch =
+        workflowMode !== 'vnl' &&
+        workflowMode !== 'touch_block' &&
+        !OFFLINE_REVIEW_ONLY &&
+        completed < total;
       setBatchProgress({
         isRunning: runBatch,
         completed: workflowMode === 'vnl' ? total : completed,
@@ -2518,6 +2523,27 @@ function App() {
       return prev;
     });
   }, [state.videoMetadata, state.playlist, state.currentPlaylistIndex, appMode, ballEditMode]);
+
+  /** Touch Skill Block Only: ←/→ jump between attack frames (all other skills stay visible). */
+  const seekAdjacentAttack = useCallback((direction: -1 | 1) => {
+    const events = stateRef.current.events || [];
+    const attacks = events
+      .filter((e) => e.skill === 'attack' || e.skill === 'spike')
+      .map((e) => e.frame)
+      .sort((a, b) => a - b);
+    if (attacks.length === 0) {
+      window.alert('No attack labels found in this video. Load an XML that includes attack tags.');
+      return;
+    }
+    const current = stateRef.current.currentFrame;
+    if (direction > 0) {
+      const next = attacks.find((f) => f > current) ?? attacks[0];
+      seekToFrame(next);
+    } else {
+      const prev = [...attacks].reverse().find((f) => f < current) ?? attacks[attacks.length - 1];
+      seekToFrame(prev);
+    }
+  }, [seekToFrame]);
 
   // Re-align playback when VNL inference metadata arrives (after batch) or preview source changes.
   useEffect(() => {
@@ -2994,7 +3020,23 @@ function App() {
         return;
       }
 
-      if (appMode !== 'vnl' && ['1', '2', '3', '4', '5', '6', '7'].includes(key)) {
+      if (appMode !== 'vnl' && appMode !== 'touch_block' && ['1', '2', '3', '4', '5', '6', '7'].includes(key)) {
+        const skillMap: Record<string, { label: SkillLabel; classId: number }> = {
+          '1': { label: 'toss', classId: SKILL_CLASS_IDS.toss },
+          '2': { label: 'serve', classId: SKILL_CLASS_IDS.serve },
+          '3': { label: 'reception', classId: SKILL_CLASS_IDS.reception },
+          '4': { label: 'set', classId: SKILL_CLASS_IDS.set },
+          '5': { label: 'dig', classId: SKILL_CLASS_IDS.dig },
+          '6': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
+          '7': { label: 'block', classId: SKILL_CLASS_IDS.block },
+        };
+        addEvent(skillMap[key]);
+        e.preventDefault();
+        return;
+      }
+
+      // Touch Skill Block Only: focus on adding block (7). Other skill keys still work.
+      if (appMode === 'touch_block' && ['1', '2', '3', '4', '5', '6', '7'].includes(key)) {
         const skillMap: Record<string, { label: SkillLabel; classId: number }> = {
           '1': { label: 'toss', classId: SKILL_CLASS_IDS.toss },
           '2': { label: 'serve', classId: SKILL_CLASS_IDS.serve },
@@ -3027,6 +3069,19 @@ function App() {
           handleAssignPlayer(state.currentFrame, selectedTrackId);
         } else {
           window.alert("Please click on a player's bounding box first to select them, then press 'A'.");
+        }
+        e.preventDefault();
+      } else if (appMode === 'touch_block' && (key === 'arrowleft' || key === 'arrowright')) {
+        stopAutoStep();
+        stopContinuousSeek();
+        if (!e.repeat) seekAdjacentAttack(key === 'arrowright' ? 1 : -1);
+        e.preventDefault();
+      } else if (appMode === 'touch_block' && (key === ',' || key === '<' || key === '.' || key === '>')) {
+        stopAutoStep();
+        if (!e.repeat) {
+          const step = (key === '.' || key === '>') ? (e.shiftKey ? 5 : 1) : (e.shiftKey ? -5 : -1);
+          startContinuousSeek(step);
+          heldFrameKeyRef.current = key;
         }
         e.preventDefault();
       } else if (key === 'arrowleft' || key === ',' || key === '<') {
@@ -3073,7 +3128,7 @@ function App() {
       window.removeEventListener('keyup', handleKeyUp);
       stopContinuousSeek();
     };
-  }, [seekToFrame, selectedTrackId, appMode, togglePlayPause, stopAutoStep, startContinuousSeek, stopContinuousSeek]);
+  }, [seekToFrame, selectedTrackId, appMode, togglePlayPause, stopAutoStep, startContinuousSeek, stopContinuousSeek, seekAdjacentAttack]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -3693,6 +3748,26 @@ Enjoy using Veritas Pro!
                 Identify active player touches and automatically classify volleyball skills.
               </p>
             </div>
+
+            <div
+              onClick={() => switchWorkflowMode('touch_block')}
+              style={{
+                width: '320px', padding: '2rem', borderRadius: '16px', cursor: 'pointer',
+                background: 'rgba(168, 223, 35, 0.08)', border: '1px solid rgba(168, 223, 35, 0.4)',
+                boxShadow: '0 10px 30px -10px rgba(168, 223, 35, 0.25)', transition: 'all 0.3s ease',
+                textAlign: 'center'
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-5px)'; e.currentTarget.style.background = 'rgba(168, 223, 35, 0.15)'; e.currentTarget.style.borderColor = 'rgba(168, 223, 35, 0.7)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.background = 'rgba(168, 223, 35, 0.08)'; e.currentTarget.style.borderColor = 'rgba(168, 223, 35, 0.4)'; }}
+            >
+              <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: 'linear-gradient(135deg, #a8df23, #73882d)', margin: '0 auto 1rem auto', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: '0.7rem', color: '#111' }}>
+                BLK
+              </div>
+              <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Touch Skill Block Only</h3>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
+                Load match video + XML (all skills shown). ←/→ jump attacks; &lt;/&gt; step frames; press 7 to add missing block labels for 7-class training.
+              </p>
+            </div>
             
             <div 
               onClick={() => switchWorkflowMode('ball')}
@@ -3768,9 +3843,35 @@ Enjoy using Veritas Pro!
               <ArrowLeft size={16} /> Back to Selection
             </button>
             
-            <h2 style={{ color: appMode === 'ball' ? '#fbbf24' : appMode === 'vnl' ? '#8b5cf6' : '#3b82f6', marginBottom: '1.5rem', fontSize: '1.5rem' }}>
-              {appMode === 'ball' ? 'Ball Tracking Mode' : appMode === 'vnl' ? 'VNL Manual Annotation' : 'Player Touch & Skill Mode'}
+            <h2 style={{ color: appMode === 'ball' ? '#fbbf24' : appMode === 'vnl' ? '#8b5cf6' : appMode === 'touch_block' ? '#a8df23' : '#3b82f6', marginBottom: '1.5rem', fontSize: '1.5rem' }}>
+              {appMode === 'ball'
+                ? 'Ball Tracking Mode'
+                : appMode === 'vnl'
+                  ? 'VNL Manual Annotation'
+                  : appMode === 'touch_block'
+                    ? 'Touch Skill Block Only'
+                    : 'Player Touch & Skill Mode'}
             </h2>
+
+            {appMode === 'touch_block' && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  maxWidth: '760px',
+                  padding: '0.85rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(168, 223, 35, 0.12)',
+                  border: '1px solid rgba(168, 223, 35, 0.4)',
+                  color: '#eab308',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                Load match <strong>MP4 + XML</strong> (e.g. video-32608.mp4 + annotations_32608.xml). All skills stay visible.
+                Use <strong>← / →</strong> to jump attack ↔ attack, <strong>&lt; / &gt;</strong> for ±1 frame, and press <strong>7</strong> to add missing <strong>block</strong> labels for 7-class training.
+              </div>
+            )}
 
             {appMode === 'vnl' && !OFFLINE_REVIEW_ONLY && (
               <div
@@ -4071,14 +4172,18 @@ Enjoy using Veritas Pro!
             <Upload size={18} />
           </div>
           <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.25rem 0', color: 'white' }}>
-            {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball')
+            {appMode === 'touch_block'
+              ? 'Open Match Video + XML'
+              : OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball')
               ? 'Open MP4 Videos'
               : OFFLINE_REVIEW_ONLY
                 ? 'Upload Prediction ZIP'
                 : 'Upload Local Files'}
           </h2>
           <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.8rem' }}>
-            {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
+            {appMode === 'touch_block'
+              ? <>Drag & drop <strong>MP4 + XML</strong> together (e.g. <code>video-32608.mp4</code> + <code>annotations_32608.xml</code>), or choose files / folder.</>
+              : OFFLINE_REVIEW_ONLY && appMode === 'vnl'
               ? <>Drag & drop <strong>MP4</strong> files, or choose files / a folder. Labels stay in this browser after refresh.</>
               : OFFLINE_REVIEW_ONLY && appMode === 'touch'
                 ? <>Drag & drop <strong>MP4</strong> files, or choose files / a folder. XML/JSON not required.</>
@@ -4088,7 +4193,51 @@ Enjoy using Veritas Pro!
                 ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
                 : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
           </p>
-          {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball') ? (
+          {appMode === 'touch_block' ? (
+            <>
+              <input
+                id="touch-block-files-input"
+                type="file"
+                multiple
+                accept="video/mp4,video/*,.mp4,.mov,.m4v,application/xml,text/xml,.xml,application/zip,.zip"
+                onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
+                style={{ display: 'none' }}
+              />
+              <input
+                id="touch-block-folder-input"
+                type="file"
+                multiple
+                accept="video/mp4,video/*,.mp4,application/xml,text/xml,.xml"
+                onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
+                style={{ display: 'none' }}
+                {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+              />
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', flexWrap: 'wrap', marginTop: '0.75rem' }}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    document.getElementById('touch-block-files-input')?.click();
+                  }}
+                >
+                  Choose MP4 + XML
+                </button>
+                <button
+                  type="button"
+                  className="btn outline"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    document.getElementById('touch-block-folder-input')?.click();
+                  }}
+                >
+                  Choose folder
+                </button>
+              </div>
+            </>
+          ) : OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball') ? (
             <>
               <input
                 id="manual-mp4-input"
@@ -4324,7 +4473,12 @@ Enjoy using Veritas Pro!
                   };
                 }
                 
-                exportAllToZip(updatedPlaylist, true, includeMp4InZip, appMode === 'ball' ? 'ball' : appMode === 'vnl' ? 'vnl' : 'touch');
+                exportAllToZip(
+                  updatedPlaylist,
+                  true,
+                  includeMp4InZip,
+                  appMode === 'ball' ? 'ball' : appMode === 'vnl' ? 'vnl' : 'touch',
+                );
               }}
             >
               <Download size={16} /> Batch ZIP
@@ -4687,6 +4841,11 @@ Enjoy using Veritas Pro!
               onTouchStart={() => startContinuousSeek(-5)}
               onTouchEnd={stopContinuousSeek}
             >-5f</button>
+            {appMode === 'touch_block' && (
+              <button className="btn outline" onClick={() => seekAdjacentAttack(-1)} title="Previous attack (←)">
+                ← Attack
+              </button>
+            )}
             <button 
               className="btn outline icon-only" 
               onMouseDown={() => startContinuousSeek(-1)}
@@ -4706,6 +4865,11 @@ Enjoy using Veritas Pro!
               onTouchStart={() => startContinuousSeek(1)}
               onTouchEnd={stopContinuousSeek}
             >+1f</button>
+            {appMode === 'touch_block' && (
+              <button className="btn outline" onClick={() => seekAdjacentAttack(1)} title="Next attack (→)">
+                Attack →
+              </button>
+            )}
             <button 
               className="btn outline icon-only" 
               onMouseDown={() => startContinuousSeek(5)}
@@ -5114,6 +5278,19 @@ Enjoy using Veritas Pro!
                 {VNL_LABEL_DEFS.map((def) => (
                   <div key={def.label}><span className="hotkey">{def.hotkey}</span> {def.label}</div>
                 ))}
+                <div><span className="hotkey">Del</span> Clear Frame</div>
+              </>
+            ) : appMode === 'touch_block' ? (
+              <>
+                <div><span className="hotkey">←</span> Previous attack</div>
+                <div><span className="hotkey">→</span> Next attack</div>
+                <div><span className="hotkey">, / &lt;</span> Step back 1 frame</div>
+                <div><span className="hotkey">. / &gt;</span> Step forward 1 frame</div>
+                <div><span className="hotkey">Shift+, / Shift+.</span> Step ±5 frames</div>
+                <div><span className="hotkey">Space</span> Play / pause</div>
+                <div><span className="hotkey">7</span> Add Block (primary)</div>
+                <div><span className="hotkey">1–6</span> Toss / Serve / Reception / Set / Dig / Attack</div>
+                <div><span className="hotkey">S / E</span> Start / End Rally</div>
                 <div><span className="hotkey">Del</span> Clear Frame</div>
               </>
             ) : (
