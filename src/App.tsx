@@ -2948,7 +2948,7 @@ function App() {
     const frame = stateRef.current.currentFrame;
     const hasBlock = stateRef.current.events.some((ev) => ev.frame === frame && ev.skill === 'block');
     if (!hasBlock) {
-      window.alert('Press 7 to add a block on this frame first, then click the ball contact position.');
+      window.alert('Press 7 or M to add a block on this frame first, then click the ball contact position.');
       return;
     }
     const xy = getNormalizedVideoClick(video, e.clientX, e.clientY);
@@ -3176,8 +3176,8 @@ function App() {
         return;
       }
 
-      // Touch Skill Block Only: focus on adding block (7). Other skill keys still work.
-      if (appMode === 'touch_block' && ['1', '2', '3', '4', '5', '6', '7'].includes(key)) {
+      // Touch Skill Block Only: focus on adding block (7 / M). Other skill keys still work.
+      if (appMode === 'touch_block' && (['1', '2', '3', '4', '5', '6', '7'].includes(key) || key === 'm')) {
         const skillMap: Record<string, { label: SkillLabel; classId: number }> = {
           '1': { label: 'toss', classId: SKILL_CLASS_IDS.toss },
           '2': { label: 'serve', classId: SKILL_CLASS_IDS.serve },
@@ -3186,6 +3186,7 @@ function App() {
           '5': { label: 'dig', classId: SKILL_CLASS_IDS.dig },
           '6': { label: 'attack', classId: SKILL_CLASS_IDS.attack },
           '7': { label: 'block', classId: SKILL_CLASS_IDS.block },
+          'm': { label: 'block', classId: SKILL_CLASS_IDS.block },
         };
         addEvent(skillMap[key]);
         e.preventDefault();
@@ -3921,7 +3922,7 @@ Enjoy using Veritas Pro!
               </div>
               <h3 style={{ margin: '0 0 0.5rem 0', color: 'white', fontSize: '1.25rem' }}>Touch Skill Block Only</h3>
               <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5 }}>
-                Load match video + XML (all skills shown). ←/→ jump attacks; &lt;/&gt; step frames; press 7 to add block, then click the video to place the ball contact dot for 7-class training.
+                Load match video + XML (all skills shown). ←/→ jump attacks; &lt;/&gt; step frames; press 7 or M to add block, then click the video to place the ball contact dot for 7-class training.
               </p>
             </div>
             
@@ -4025,7 +4026,7 @@ Enjoy using Veritas Pro!
                 }}
               >
                 Load match <strong>MP4 + XML</strong>. Skills are saved in this browser — after refresh, open the <strong>same folder</strong> again.
-                Use <strong>← / →</strong> for attacks, <strong>&lt; / &gt;</strong> for frames, <strong>7</strong> + <strong>click</strong> for block ball-dot.
+                Use <strong>← / →</strong> for attacks, <strong>&lt; / &gt;</strong> for frames, <strong>7 / M</strong> + <strong>click</strong> for block ball-dot.
                 Green = done (block+dot), yellow = block missing dot, gray = still needs block.
               </div>
             )}
@@ -4759,7 +4760,7 @@ Enjoy using Veritas Pro!
                           ? `Attack #${row.attackIndex} @ f${row.attackFrame} — block+dot done`
                           : row.status === 'block_no_dot'
                             ? `Attack #${row.attackIndex} — block at f${row.blockFrame}, click video for ball dot`
-                            : `Attack #${row.attackIndex} @ f${row.attackFrame} — press 7 then click for block+dot`
+                            : `Attack #${row.attackIndex} @ f${row.attackFrame} — press 7/M then click for block+dot`
                       }
                     >
                       <span
@@ -4926,7 +4927,7 @@ Enjoy using Veritas Pro!
                 title={
                   currentBlockEvent
                     ? 'Click to set or move the ball contact dot for this block'
-                    : 'Press 7 to add block, then click where the ball is contacted'
+                    : 'Press 7 or M to add block, then click where the ball is contacted'
                 }
               />
             )}
@@ -5207,7 +5208,7 @@ Enjoy using Veritas Pro!
                 onClick={() =>
                   addEvent({ label: 'block', classId: SKILL_CLASS_IDS.block })
                 }
-                title="Add Block on current frame (hotkey 7), then click video for ball contact dot"
+                title="Add Block on current frame (hotkey 7 or M), then click video for ball contact dot"
                 style={{
                   background: 'var(--color-block, #ef4444)',
                   color: '#fff',
@@ -5646,7 +5647,7 @@ Enjoy using Veritas Pro!
                 <div><span className="hotkey">. / &gt;</span> Step forward 1 frame</div>
                 <div><span className="hotkey">Shift+, / Shift+.</span> Step ±5 frames</div>
                 <div><span className="hotkey">Space</span> Play / pause</div>
-                <div><span className="hotkey">7</span> Add Block</div>
+                <div><span className="hotkey">7 / M</span> Add Block</div>
                 <div><span className="hotkey">Click</span> Place ball contact dot on block</div>
                 <div><span className="hotkey">1–6</span> Toss / Serve / Reception / Set / Dig / Attack</div>
                 <div><span className="hotkey">S / E</span> Start / End Rally</div>
