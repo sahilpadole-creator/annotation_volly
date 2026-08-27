@@ -1843,27 +1843,20 @@ function App() {
     if (item.file) {
       const cached = gpuFileReadyRef.current.get(item.id);
       if (OFFLINE_REVIEW_ONLY) {
-        // GitHub Pages: play *_h264 / cached immediately; otherwise probe+convert (mp4v).
-        if (cached) {
-          assignVideoUrlFromFile(cached);
-          setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
-        } else if (looksLikeH264Filename(item.file.name)) {
-          assignVideoUrlFromFile(item.file);
-          setVideoPlaybackKind('direct');
+        // GitHub Pages: always try the MP4 first (H.264 plays immediately).
+        // Unsupported codecs (mp4v/HEVC) fall through to onError → in-browser convert.
+        assignVideoUrlFromFile(cached ?? item.file);
+        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
+        if (looksLikeH264Filename(item.file.name) && !cached) {
           gpuFileReadyRef.current.set(item.id, item.file);
-        } else {
-          void prepareVideoPlayback(item.file);
         }
       } else if (appMode === 'ball' || appMode === 'touch') {
         assignVideoUrlFromFile(cached ?? item.file);
         setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
       } else {
-        if (cached) {
-          assignVideoUrlFromFile(cached);
-          setVideoPlaybackKind(cached === item.file ? 'direct' : 'h264');
-        } else {
-          void prepareVideoPlayback(item.file);
-        }
+        // Local VNL: play MP4 directly; convert only on decode error.
+        assignVideoUrlFromFile(cached ?? item.file);
+        setVideoPlaybackKind(cached && cached !== item.file ? 'h264' : 'direct');
       }
     } else if (item.driveUrl) {
       if (googleTokenRef.current) {
@@ -1977,16 +1970,8 @@ function App() {
       window.alert("No video files found! Please upload MP4 videos along with your ZIP file, or ensure your ZIP contains MP4s.");
       return;
     }
-    if (
-      OFFLINE_REVIEW_ONLY &&
-      workflowMode === 'ball' &&
-      Object.keys(parsedAnnotations).length === 0 &&
-      Object.keys(parsedJsonAnnotations).length === 0
-    ) {
-      window.alert(
-        "No XML or JSON ball-tracking predictions were found in this ZIP. Upload a prediction ZIP with matching video + JSON/XML, or use Ball Tracking on the local tool first.",
-      );
-    }
+    // GitHub Pages: MP4-only uploads are fine for manual VNL / touch / ball annotation.
+    // XML/JSON is optional (only needed when reviewing existing predictions).
 
     gpuFileReadyRef.current.clear();
 
@@ -2058,6 +2043,9 @@ function App() {
           // GitHub Pages is review-only: imported XML is the prediction source.
           isApplied = OFFLINE_REVIEW_ONLY;
         }
+      } else if (workflowMode === 'touch' && OFFLINE_REVIEW_ONLY) {
+        // Manual skill annotation on GitHub — MP4 only, no XML required.
+        isApplied = true;
       } else if (workflowMode === 'vnl' && parsedAnnotations[xmlKey]) {
         // VNL is always manual: load XML if present, never queue inference.
         itemEvents = parsedAnnotations[xmlKey].events;
@@ -2072,6 +2060,10 @@ function App() {
         } else if (parsedAnnotations[xmlKey]?.playerBoxes && Object.keys(parsedAnnotations[xmlKey].playerBoxes).length > 0) {
           itemPlayerBoxes = parsedAnnotations[xmlKey].playerBoxes;
           isApplied = true;
+        } else if (OFFLINE_REVIEW_ONLY) {
+          // Manual ball annotation on GitHub — open MP4 with empty boxes; no prediction ZIP required.
+          isApplied = true;
+          itemPlayerBoxes = existing?.playerBoxes || {};
         }
       }
 
@@ -2161,15 +2153,16 @@ function App() {
 
     if (syncItem?.file) {
       if (OFFLINE_REVIEW_ONLY) {
-        // GitHub: convert non-H.264 (mp4v) up front so review is not stuck on a black screen.
+        // GitHub: play MP4 immediately. Convert only if the browser cannot decode (onError).
+        assignVideoUrlFromFile(syncItem.file);
+        setVideoPlaybackKind('direct');
         if (looksLikeH264Filename(syncItem.file.name)) {
-          assignVideoUrlFromFile(syncItem.file);
           gpuFileReadyRef.current.set(syncItem.id, syncItem.file);
-        } else {
-          void prepareVideoPlayback(syncItem.file);
         }
       } else if (workflowMode === 'vnl') {
-        void prepareVideoPlayback(syncItem.file);
+        // Local VNL: try MP4 first; convert on decode error.
+        assignVideoUrlFromFile(syncItem.file);
+        setVideoPlaybackKind('direct');
       } else {
         assignVideoUrlFromFile(syncItem.file);
       }
@@ -3723,7 +3716,7 @@ Enjoy using Veritas Pro!
                   lineHeight: 1.5,
                 }}
               >
-                Labels are saved in this browser. After refresh, open the <strong>same video folder</strong> again — your skill annotations will reload automatically.
+                Labels are saved in this browser. Open <strong>MP4</strong> files (or the same folder) after refresh — your skill annotations will reload automatically.
                 {vnlAwaitingFolder && state.playlist.length > 0 && (
                   <div style={{ marginTop: '0.5rem', color: '#fbbf24' }}>
                     Restored {state.playlist.length} video(s) from browser storage — pick the folder below to play videos.
@@ -3732,7 +3725,7 @@ Enjoy using Veritas Pro!
               </div>
             )}
 
-            {OFFLINE_REVIEW_ONLY && appMode !== 'vnl' && appMode !== 'touch' && (
+            {OFFLINE_REVIEW_ONLY && appMode !== 'vnl' && appMode !== 'touch' && appMode !== 'ball' && (
               <div
                 style={{
                   marginBottom: '1.5rem',
@@ -3766,7 +3759,26 @@ Enjoy using Veritas Pro!
                   lineHeight: 1.5,
                 }}
               >
-                Manual skill annotation on GitHub — open your rally MP4 folder. XML/JSON is optional (use it only if you already have predictions to review).
+                Manual skill annotation — open rally <strong>MP4</strong> files or a folder. XML/JSON is optional.
+              </div>
+            )}
+
+            {OFFLINE_REVIEW_ONLY && appMode === 'ball' && (
+              <div
+                style={{
+                  marginBottom: '1.5rem',
+                  maxWidth: '720px',
+                  padding: '0.85rem 1rem',
+                  borderRadius: '10px',
+                  background: 'rgba(251, 191, 36, 0.12)',
+                  border: '1px solid rgba(251, 191, 36, 0.35)',
+                  color: '#fde68a',
+                  textAlign: 'center',
+                  fontSize: '0.9rem',
+                  lineHeight: 1.5,
+                }}
+              >
+                Manual ball annotation — open rally <strong>MP4</strong> files directly. Prediction ZIP/XML/JSON is optional.
               </div>
             )}
 
@@ -3972,44 +3984,66 @@ Enjoy using Veritas Pro!
             <Upload size={18} />
           </div>
           <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: '0 0 0.25rem 0', color: 'white' }}>
-            {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch')
-              ? 'Open Video Folder'
+            {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball')
+              ? 'Open MP4 Videos'
               : OFFLINE_REVIEW_ONLY
                 ? 'Upload Prediction ZIP'
                 : 'Upload Local Files'}
           </h2>
           <p style={{ color: 'var(--text-muted)', margin: 0, fontSize: '0.8rem' }}>
             {OFFLINE_REVIEW_ONLY && appMode === 'vnl'
-              ? <>Select the <strong>same folder</strong> of rally MP4s. Skills you label are kept in browser storage across refresh.</>
+              ? <>Drag & drop <strong>MP4</strong> files, or choose files / a folder. Labels stay in this browser after refresh.</>
               : OFFLINE_REVIEW_ONLY && appMode === 'touch'
-                ? <>Select a folder of rally <strong>MP4s</strong> to annotate skills manually. XML/JSON not required.</>
+                ? <>Drag & drop <strong>MP4</strong> files, or choose files / a folder. XML/JSON not required.</>
+              : OFFLINE_REVIEW_ONLY && appMode === 'ball'
+                ? <>Drag & drop <strong>MP4</strong> files for manual ball annotation. Prediction ZIP is optional.</>
               : OFFLINE_REVIEW_ONLY
                 ? <>Drag & drop a <strong>ZIP</strong> containing matching <strong>video + XML/JSON</strong> files.</>
                 : <>Drag & drop your <strong>MP4</strong>, <strong>ZIP</strong>, <strong>XML</strong>, or <strong>JSON</strong> files here to start annotating.</>}
           </p>
-          {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch') ? (
+          {OFFLINE_REVIEW_ONLY && (appMode === 'vnl' || appMode === 'touch' || appMode === 'ball') ? (
             <>
+              <input
+                id="manual-mp4-input"
+                type="file"
+                multiple
+                accept="video/mp4,video/*,.mp4,.mov,.m4v"
+                onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
+                style={{ display: 'none' }}
+              />
               <input
                 id="manual-folder-input"
                 type="file"
                 multiple
-                accept="video/mp4,.mp4"
+                accept="video/mp4,video/*,.mp4"
                 onChange={(e) => { void handlePlaylistFiles(e.target.files); e.target.value = ''; }}
                 style={{ display: 'none' }}
                 {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
               />
-              <button
-                type="button"
-                className="btn"
-                style={{ marginTop: '0.75rem' }}
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  document.getElementById('manual-folder-input')?.click();
-                }}
-              >
-                Choose video folder
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', flexWrap: 'wrap', marginTop: '0.75rem' }}>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    document.getElementById('manual-mp4-input')?.click();
+                  }}
+                >
+                  Choose MP4 files
+                </button>
+                <button
+                  type="button"
+                  className="btn outline"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    document.getElementById('manual-folder-input')?.click();
+                  }}
+                >
+                  Choose folder
+                </button>
+              </div>
             </>
           ) : (
           <input
